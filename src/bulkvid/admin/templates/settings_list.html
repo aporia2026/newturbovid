@@ -1,0 +1,47 @@
+{% extends "_base.html" %}
+
+{% block title %}Settings · TurboVid Admin{% endblock %}
+
+{% block content %}
+<h2 style="margin-top:0">Runtime settings</h2>
+<p style="color:var(--muted); margin-top:0">
+  These values change without a redeploy. Edits take effect on the next row
+  processed (cache TTL ~30s).
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Setting</th>
+      <th>Status</th>
+      <th>Preview</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>
+        <strong>{{ item.label }}</strong>
+        {% if item.description %}
+          <div style="font-size:11px; color:var(--muted)">{{ item.description }}</div>
+        {% endif %}
+      </td>
+      <td>
+        {% if item.is_default %}
+          <span class="badge badge-queued">default</span>
+        {% else %}
+          <span class="badge badge-running">customized</span>
+        {% endif %}
+      </td>
+      <td style="max-width:380px; font-family: ui-monospace, monospace; font-size:11px; color:var(--muted)">
+        {{ item.value[:140] }}{% if item.value|length > 140 %}…{% endif %}
+      </td>
+      <td>
+        <a href="/admin/settings/{{ item.key }}">Edit →</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

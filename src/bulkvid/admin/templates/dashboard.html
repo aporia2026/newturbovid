@@ -1,0 +1,37 @@
+{% extends "_base.html" %}
+
+{% block title %}Jobs · TurboVid Admin{% endblock %}
+
+{% block content %}
+<h2 style="margin-top:0">Recent jobs</h2>
+{% if not jobs %}
+  <div class="empty">No jobs yet.</div>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Job</th>
+        <th>User</th>
+        <th>Tab</th>
+        <th>Status</th>
+        <th>Progress</th>
+        <th>Cost</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for j in jobs %}
+      <tr>
+        <td><a class="job-id" href="/admin/jobs/{{ j.job_id }}">{{ j.job_id }}</a></td>
+        <td>{{ j.user_email }}</td>
+        <td>{{ j.tab_type }}</td>
+        <td><span class="badge badge-{{ j.status|lower }}">{{ j.status }}</span></td>
+        <td>{{ j.completed_rows }} ✓ · {{ j.failed_rows }} ✗ / {{ j.row_count }}</td>
+        <td>${{ "%.4f"|format(j.cost_usd) }}</td>
+        <td>{{ j.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

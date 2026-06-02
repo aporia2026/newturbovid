@@ -1,0 +1,73 @@
+# Secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+credentials.json
+client_secret*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.installed.cfg
+MANIFEST
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# Type checkers
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.dmypy.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local data / job state (production lives at /data/bulkvid/)
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Build artifacts / scratch
+tmp/
+scratch/
+*.log
+
+# OS
+desktop.ini
+
+refs/
