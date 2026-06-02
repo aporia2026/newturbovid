@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   "Helvetica Neue", Arial, sans-serif;
+      padding: 12px;
+      color: #202124;
+      font-size: 13px;
+    }
+    h3 { margin: 0 0 8px 0; font-size: 14px; }
+    .job {
+      border: 1px solid #dadce0;
+      padding: 10px;
+      border-radius: 6px;
+      background: #fff;
+    }
+    .job-id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: #5f6368;
+      word-break: break-all;
+    }
+    .row { display: flex; justify-content: space-between; margin: 4px 0; }
+    .label { color: #5f6368; }
+    .value { font-weight: 500; }
+    .status-queued     { color: #5f6368; }
+    .status-running    { color: #1a73e8; font-weight: 600; }
+    .status-completed  { color: #1e8e3e; font-weight: 600; }
+    .status-failed     { color: #d93025; font-weight: 600; }
+    .status-killed     { color: #5f6368; font-weight: 600; }
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #e8eaed;
+      border-radius: 3px;
+      margin: 6px 0;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: #1a73e8;
+      transition: width 0.3s ease;
+    }
+    .empty { color: #5f6368; font-style: italic; padding: 12px 0; }
+    .error { color: #d93025; padding: 8px; border: 1px solid #fce8e6; border-radius: 4px; }
+    button {
+      margin-top: 8px;
+      padding: 6px 10px;
+      border: 1px solid #dadce0;
+      background: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #1a73e8;
+    }
+    button:hover { background: #f8f9fa; }
+    button.danger { color: #d93025; }
+    .small { font-size: 11px; color: #5f6368; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h3>Active Job</h3>
+  <div id="container">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <div style="margin-top: 12px;">
+    <button onclick="refresh()">Refresh now</button>
+    <button class="danger" onclick="killJob()">Kill job</button>
+  </div>
+
+  <div class="small" id="last-update"></div>
+
+  <script>
+    function refresh() {
+      google.script.run
+        .withSuccessHandler(render)
+        .withFailureHandler(renderError)
+        .getLastJobStatus();
+    }
+
+    function killJob() {
+      if (!confirm('Kill the active job?')) return;
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (r && r.ok) {
+            refresh();
+          } else {
+            alert('Could not kill: ' + (r && r.error || 'unknown error'));
+          }
+        })
+        .withFailureHandler(renderError)
+        .killLastJob();
+    }
+
+    function render(job) {
+      var now = new Date().toLocaleTimeString();
+      document.getElementById('last-update').textContent = 'Updated ' + now;
+
+      if (!job) {
+        document.getElementById('container').innerHTML =
+          '<div class="empty">No active job. Submit one from the menu.</div>';
+        return;
+      }
+      var total = job.row_count || 0;
+      var done = (job.completed_rows || 0) + (job.failed_rows || 0);
+      var pct = total ? Math.round((done / total) * 100) : 0;
+      var statusClass = 'status-' + String(job.status || '').toLowerCase();
+
+      var html =
+        '<div class="job">' +
+          '<div class="job-id">' + job.job_id + '</div>' +
+          '<div class="row">' +
+            '<span class="label">Status</span>' +
+            '<span class="value ' + statusClass + '">' + job.status + '</span>' +
+          '</div>' +
+          '<div class="progress-bar"><div class="progress-bar-fill" style="width:' + pct + '%"></div></div>' +
+          '<div class="row">' +
+            '<span class="label">Progress</span>' +
+            '<span class="value">' + done + ' / ' + total + ' (' + pct + '%)</span>' +
+          '</div>' +
+          '<div class="row">' +
+            '<span class="label">Succeeded</span>' +
+            '<span class="value" style="color:#1e8e3e">' + (job.completed_rows || 0) + '</span>' +
+          '</div>' +
+          '<div class="row">' +
+            '<span class="label">Failed</span>' +
+            '<span class="value" style="color:#d93025">' + (job.failed_rows || 0) + '</span>' +
+          '</div>' +
+          '<div class="row">' +
+            '<span class="label">Cost</span>' +
+            '<span class="value">$' + (job.cost_usd || 0).toFixed(4) + '</span>' +
+          '</div>' +
+        '</div>';
+      document.getElementById('container').innerHTML = html;
+    }
+
+    function renderError(err) {
+      var msg = err && err.message ? err.message : String(err);
+      document.getElementById('container').innerHTML =
+        '<div class="error">Error: ' + msg + '</div>';
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

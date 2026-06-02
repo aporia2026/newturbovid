@@ -1,0 +1,80 @@
+{% extends "_base.html" %}
+
+{% block title %}{{ setting.label }} · Settings · TurboVid Admin{% endblock %}
+
+{% block content %}
+<p><a href="/admin/settings">← All settings</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">{{ setting.label }}</h2>
+  {% if setting.description %}
+    <p style="color:var(--muted)">{{ setting.description }}</p>
+  {% endif %}
+
+  <div style="margin: 10px 0 16px 0;">
+    {% if is_default %}
+      <span class="badge badge-queued">currently using default</span>
+    {% else %}
+      <span class="badge badge-running">customized</span>
+    {% endif %}
+    <span style="font-family: ui-monospace, monospace; font-size:11px; color:var(--muted); margin-left:8px;">key: {{ setting.key }}</span>
+  </div>
+
+  <form method="post" action="/admin/settings/{{ setting.key }}">
+    {% if setting.multiline %}
+      <textarea
+        name="value"
+        rows="24"
+        style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; line-height:1.5; padding:10px; border:1px solid var(--border); border-radius:4px;"
+      >{{ current_value }}</textarea>
+    {% else %}
+      <input
+        type="text"
+        name="value"
+        value="{{ current_value }}"
+        style="width:100%; padding:8px; font-family: ui-monospace, monospace; font-size:13px; border:1px solid var(--border); border-radius:4px;"
+      >
+    {% endif %}
+
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button type="submit">Save</button>
+      <button
+        type="submit"
+        formaction="/admin/settings/{{ setting.key }}/reset"
+        formmethod="post"
+        formnovalidate
+        class="danger"
+        onclick="return confirm('Reset {{ setting.label }} to the built-in default?')"
+      >Reset to default</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Change history</h3>
+  {% if not audit %}
+    <p style="color:var(--muted)">No edits yet.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>When</th>
+          <th>By</th>
+          <th>Preview</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for entry in audit %}
+        <tr>
+          <td style="white-space:nowrap; font-size:12px;">{{ entry.updated_at }}</td>
+          <td>{{ entry.updated_by }}</td>
+          <td style="font-family: ui-monospace, monospace; font-size:11px; color:var(--muted)">
+            {{ entry.new_value[:100] }}{% if entry.new_value|length > 100 %}…{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+{% endblock %}

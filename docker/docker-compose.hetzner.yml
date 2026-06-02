@@ -1,0 +1,40 @@
+# Hetzner deployment — sibling to cb-remote-runner.
+# Plan: _plans/2026-06-02-aporia-bulk-video-tool.md §5 (deployment topology), Phase 7.
+
+services:
+  bulkvid-web:
+    container_name: bulkvid-web
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: bulkvid:latest
+    command: ["uvicorn", "bulkvid.main:app", "--host", "0.0.0.0", "--port", "8788"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8788"     # Cloudflare tunnel terminates locally
+    env_file:
+      - ../.env                    # production .env on the host, NEVER committed
+    volumes:
+      - bulkvid_data:/data/bulkvid
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  bulkvid-worker:
+    container_name: bulkvid-worker
+    image: bulkvid:latest                  # built by bulkvid-web above
+    command: ["python", "-m", "bulkvid.worker"]
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - bulkvid_data:/data/bulkvid
+    depends_on:
+      - bulkvid-web
+
+volumes:
+  bulkvid_data:
+    name: bulkvid_runner_data
