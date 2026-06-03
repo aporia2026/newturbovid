@@ -21,11 +21,12 @@ Plan §5 ("Concurrency model"), §13 Phase 3.
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
 
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_INTERNAL_ERROR,
+    CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
@@ -34,6 +35,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
+from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
 from bulkvid.orchestrator.sheet_writer import PendingWrite
@@ -95,7 +97,7 @@ class BatchRunner:
                         await asyncio.wait_for(
                             self._shutdown.wait(), timeout=self._poll_idle
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                     continue
 
@@ -129,6 +131,10 @@ class BatchRunner:
                 )
             elif isinstance(row, FourImagesVO2Row):
                 result = await process_4images_vo2_row(
+                    row, self._clients, job_id=queued.job_id
+                )
+            elif isinstance(row, CartoonRow):
+                result = await process_cartoon_row(
                     row, self._clients, job_id=queued.job_id
                 )
             else:    # defensive

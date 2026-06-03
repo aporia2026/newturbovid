@@ -19,16 +19,14 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from bulkvid.adapters.sheets import FOUR_IMAGES_COLS, IMAGE_VO_COLS, SheetsClient
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow
+from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
 from bulkvid.orchestrator.queue import TAB_FOUR_IMAGES, TAB_IMAGE_VO
 from bulkvid.orchestrator.sheet_writer import PendingWrite
-
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -103,6 +101,45 @@ async def test_read_image_vo_parses_row_with_defaults() -> None:
     assert r.aspect_ratio == "9:16"        # default
     assert r.script_pattern == "How To"
     assert r.open_comments == "urgent"
+
+
+async def test_read_cartoon_ignores_manual_image_and_needs_only_article() -> None:
+    sheet_data = {
+        ("sheet-C", "cartoon"): [
+            ["Country", "Vertical", "Article", "Manual Image",
+             "Voice Over", "ZapCap", "Change Size",
+             "Script Pattern", "Open Comments",
+             "Ready Video 1", "Ready Video 2"],
+            # Manual Image column is blank — cartoon doesn't need it.
+            ["MX", "automotive", "https://example.com/a", "",
+             "", "", "9:16", "How To", "", "", ""],
+        ]
+    }
+    client, _ = _make_fake_client(sheet_data)
+    sc = SheetsClient(client=client)
+
+    rows = await sc.read_cartoon_rows("sheet-C", "cartoon")
+    assert len(rows) == 1
+    r = rows[0]
+    assert isinstance(r, CartoonRow)
+    assert r.row_num == 2
+    assert r.article_url == "https://example.com/a"
+    assert r.voice_over is True            # default
+    assert r.aspect_ratio == "9:16"
+    assert not hasattr(r, "manual_image_url")
+
+
+async def test_read_cartoon_skips_rows_without_article() -> None:
+    sheet_data = {
+        ("sheet-C", "cartoon"): [
+            ["h"] * 11,
+            ["MX", "automotive", "", "", "", "", "9:16", "", "", "", ""],
+        ]
+    }
+    client, _ = _make_fake_client(sheet_data)
+    sc = SheetsClient(client=client)
+    rows = await sc.read_cartoon_rows("sheet-C", "cartoon")
+    assert rows == []
 
 
 async def test_read_image_vo_honors_explicit_yes_no_values() -> None:

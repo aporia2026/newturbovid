@@ -278,6 +278,53 @@ def render_music_mix_command() -> str:
     return _MUSIC_MIX_TEMPLATE
 
 
+def render_cartoon_concat_command(
+    num_clips: int,
+    per_clip_seconds: float,
+    width: int = 1080,
+    height: int = 1920,
+    *,
+    audio: bool = True,
+    tempo: float = SPEECH_ATEMPO,
+) -> str:
+    """Build the cartoon-mode stitch command for a VARIABLE number of clips.
+
+    Each of ``num_clips`` input clips is trimmed to ``per_clip_seconds``, forced
+    to ``width`` x ``height`` (cover + center-crop), and concatenated in order.
+    When ``audio`` is True the voiceover is the LAST input (``in_{num_clips+1}``),
+    sped up via ``atempo`` and muxed in with ``-shortest`` so the video matches
+    the (sped-up) voiceover length. ``{{in_N}}`` / ``{{out_1}}`` stay literal for
+    Rendi to substitute.
+    """
+    if num_clips < 1:
+        raise ValueError("render_cartoon_concat_command needs at least one clip")
+    per = f"{per_clip_seconds:.3f}"
+    inputs = "".join(f"-i {{{{in_{i + 1}}}}} " for i in range(num_clips))
+    if audio:
+        inputs += f"-i {{{{in_{num_clips + 1}}}}} "
+
+    trims = "".join(
+        f"[{i}:v]trim=start=0:duration={per},setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1[v{i}];"
+        for i in range(num_clips)
+    )
+    concat_inputs = "".join(f"[v{i}]" for i in range(num_clips))
+    graph = f"{trims}{concat_inputs}concat=n={num_clips}:v=1:a=0[outv]"
+    if audio:
+        graph += f";[{num_clips}:a]atempo={tempo}[outa]"
+
+    maps = '-map "[outv]" '
+    codecs = "-c:v libx264 -pix_fmt yuv420p "
+    if audio:
+        maps += '-map "[outa]" '
+        codecs += "-c:a aac -b:a 192k -shortest "
+    else:
+        codecs += "-an "
+
+    return f'{inputs}-filter_complex "{graph}" {maps}{codecs}{{{{out_1}}}}'
+
+
 # ── Result ───────────────────────────────────────────────────────────────────
 
 
@@ -595,6 +642,43 @@ class RendiClient:
         url, command_id = await self._submit_and_poll(
             render_music_mix_command(),
             {"in_1": video_url, "in_2": music_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def concat_clips_with_audio(
+        self,
+        clip_urls: list[str],
+        audio_url: str | None,
+        per_clip_seconds: float,
+        output_filename: str = "out.mp4",
+        *,
+        aspect_ratio: str = "9:16",
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Stitch N clips (each trimmed to ``per_clip_seconds``) into one video.
+
+        Used by the cartoon pipeline: each Seedance clip is trimmed and forced to
+        the target aspect, the clips are concatenated in order, and — when
+        ``audio_url`` is given — the voiceover is sped up and muxed in with
+        ``-shortest`` so the video tracks the voiceover length. ``audio_url=None``
+        yields a silent stitch. Auto-retried.
+        """
+        if not clip_urls:
+            raise ValueError("concat_clips_with_audio requires at least one clip")
+        width, height = dimensions_for_ratio(aspect_ratio)
+        command = render_cartoon_concat_command(
+            len(clip_urls), per_clip_seconds, width, height, audio=audio_url is not None
+        )
+        inputs = {f"in_{i + 1}": url for i, url in enumerate(clip_urls)}
+        if audio_url is not None:
+            inputs[f"in_{len(clip_urls) + 1}"] = audio_url
+        url, command_id = await self._submit_and_poll(
+            command,
+            inputs,
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,

@@ -40,14 +40,17 @@ _log = get_logger("kie")
 # via the admin panel once it ships (Phase 5).
 COST_NANO_BANANA_EDIT_USD = 0.04
 COST_NANO_BANANA_2_USD = 0.06        # nano-banana-2 @ 2K (kie: $0.04/1K, $0.06/2K)
+COST_NANO_BANANA_2_1K_USD = 0.04     # nano-banana-2 @ 1K (cartoon mode default)
 COST_GPT_IMAGE_2_USD = 0.08          # gpt-image-2 fallback, rough mid-tier estimate
 COST_RECRAFT_UPSCALE_USD = 0.04
+COST_SEEDANCE_PRO_720P_4S_USD = 0.07  # Seedance 1.5 Pro i2v @ 720p, 4s, no audio
 
 # Production model identifiers.
 MODEL_NANO_BANANA_EDIT = "google/nano-banana-edit"
 MODEL_NANO_BANANA_2 = "nano-banana-2"
 MODEL_GPT_IMAGE_2 = "gpt-image-2-image-to-image"
 MODEL_RECRAFT_UPSCALE = "recraft/crisp-upscale"
+MODEL_SEEDANCE_PRO = "bytedance/seedance-1.5-pro"
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -425,6 +428,99 @@ async def recraft_crisp_upscale(
         task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
     )
     return urls[0], COST_RECRAFT_UPSCALE_USD
+
+
+def _nano_banana_2_cost(resolution: str) -> float:
+    """Per-image cost for nano-banana-2 by resolution (kie: $0.04/1K, $0.06/2K)."""
+    return COST_NANO_BANANA_2_1K_USD if resolution.strip().upper() == "1K" else COST_NANO_BANANA_2_USD
+
+
+async def nano_banana_2_text_to_image(
+    client: KieClient,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str = "1K",
+    output_format: str = "png",
+    max_attempts: int = 60,
+    delay_seconds: float = 5.0,
+) -> tuple[str, float]:
+    """Generate an image from text only (NO seed) with Nano Banana 2.
+
+    Used by the cartoon pipeline for the first scene of each video. Returns
+    ``(url, cost_usd)``.
+    """
+    input_params: dict[str, Any] = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "output_format": output_format,
+    }
+    task_id = await client.create_task(MODEL_NANO_BANANA_2, input_params)
+    urls = await client.poll_task(
+        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
+    return urls[0], _nano_banana_2_cost(resolution)
+
+
+async def nano_banana_2_image_to_image(
+    client: KieClient,
+    source_image_url: str,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str = "1K",
+    output_format: str = "png",
+    max_attempts: int = 60,
+    delay_seconds: float = 5.0,
+) -> tuple[str, float]:
+    """Generate a new image conditioned on ``source_image_url`` with Nano Banana 2.
+
+    The cartoon pipeline uses this to chain later scenes off the first one so
+    the character, palette, and style carry across the cut. Returns
+    ``(url, cost_usd)``.
+    """
+    input_params: dict[str, Any] = {
+        "prompt": prompt,
+        "image_input": [source_image_url],
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "output_format": output_format,
+    }
+    task_id = await client.create_task(MODEL_NANO_BANANA_2, input_params)
+    urls = await client.poll_task(
+        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
+    return urls[0], _nano_banana_2_cost(resolution)
+
+
+async def seedance_image_to_video(
+    client: KieClient,
+    image_url: str,
+    prompt: str,
+    aspect_ratio: str,
+    duration: int = 4,
+    resolution: str = "720p",
+    max_attempts: int = 120,
+    delay_seconds: float = 5.0,
+) -> tuple[str, float]:
+    """Animate one still image into a short clip with Seedance 1.5 Pro.
+
+    ``duration`` must be 4, 8, or 12 (the only values the model accepts) and is
+    sent as a STRING — the API rejects an integer ("duration it must be a
+    string"). Audio generation is left off (VO is added downstream). Returns
+    ``(video_url, cost_usd)``.
+    """
+    input_params: dict[str, Any] = {
+        "prompt": prompt,
+        "input_urls": [image_url],
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "duration": str(duration),
+    }
+    task_id = await client.create_task(MODEL_SEEDANCE_PRO, input_params)
+    urls = await client.poll_task(
+        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
+    return urls[0], COST_SEEDANCE_PRO_720P_4S_USD
 
 
 # ── Construction from settings ───────────────────────────────────────────────

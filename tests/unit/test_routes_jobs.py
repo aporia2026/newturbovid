@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from bulkvid.auth import AuthError, ForbiddenError, Identity
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
+    TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
@@ -153,6 +154,27 @@ def _simple_payload() -> dict:
     }
 
 
+def _cartoon_payload() -> dict:
+    return {
+        "sheet_id": "sheet-C",
+        "worksheet": "cartoon",
+        "tab_type": TAB_CARTOON,
+        "rows_cartoon": [
+            {
+                "row_num": 2,
+                "country": "MX",
+                "vertical": "automotive",
+                "article_url": "https://example.com/article",
+                "voice_over": True,
+                "zapcap": False,
+                "aspect_ratio": "9:16",
+                "script_pattern": "How To",
+                "open_comments": "",
+            }
+        ],
+    }
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -205,6 +227,21 @@ def test_submit_simple_returns_job_id(client: TestClient) -> None:
     body = r.json()
     assert body["status"] == "queued"
     assert body["row_count"] == 1
+
+
+def test_submit_cartoon_returns_job_id(client: TestClient) -> None:
+    r = client.post("/jobs", json=_cartoon_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["row_count"] == 1
+
+
+def test_submit_cartoon_without_rows_returns_400(client: TestClient) -> None:
+    payload = _cartoon_payload()
+    payload["rows_cartoon"] = []
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
 
 
 def test_submit_simple_without_rows_returns_400(client: TestClient) -> None:

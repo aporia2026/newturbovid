@@ -22,13 +22,16 @@ import respx
 
 from bulkvid.adapters.kie import (
     COST_GPT_IMAGE_2_USD,
+    COST_NANO_BANANA_2_1K_USD,
     COST_NANO_BANANA_2_USD,
     COST_NANO_BANANA_EDIT_USD,
     COST_RECRAFT_UPSCALE_USD,
+    COST_SEEDANCE_PRO_720P_4S_USD,
     MODEL_GPT_IMAGE_2,
     MODEL_NANO_BANANA_2,
     MODEL_NANO_BANANA_EDIT,
     MODEL_RECRAFT_UPSCALE,
+    MODEL_SEEDANCE_PRO,
     KieAuthError,
     KieClient,
     KiePool,
@@ -39,8 +42,11 @@ from bulkvid.adapters.kie import (
     _unpin_task_id,
     gpt_image_2,
     nano_banana_2,
+    nano_banana_2_image_to_image,
+    nano_banana_2_text_to_image,
     nano_banana_edit,
     recraft_crisp_upscale,
+    seedance_image_to_video,
 )
 
 # 24-char test keys → last-12 suffixes are deterministic and distinct.
@@ -398,14 +404,99 @@ async def test_recraft_crisp_upscale_returns_url_and_cost() -> None:
     assert cost == COST_RECRAFT_UPSCALE_USD
 
 
+# ── Cartoon-mode wrappers ────────────────────────────────────────────────────
+
+
+def _capture_submit_then_succeed(result_url: str) -> list[dict]:
+    """Mock createTask (capturing the body) + a successful recordInfo. Returns the
+    list the request bodies are appended to."""
+    captured: list[dict] = []
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "t1"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "state": "success",
+                    "resultJson": json.dumps({"resultUrls": [result_url]}),
+                },
+            },
+        )
+    )
+    return captured
+
+
+@respx.mock
+async def test_nano_banana_2_text_to_image_has_no_seed() -> None:
+    captured = _capture_submit_then_succeed("https://cdn/t2i.png")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await nano_banana_2_text_to_image(
+            client, prompt="A cartoon scene", aspect_ratio="9:16",
+            resolution="1K", max_attempts=2, delay_seconds=0.0,
+        )
+    assert url == "https://cdn/t2i.png"
+    assert cost == COST_NANO_BANANA_2_1K_USD
+    body = captured[0]
+    assert body["model"] == MODEL_NANO_BANANA_2
+    assert "image_input" not in body["input"]    # text-to-image: no seed
+    assert body["input"]["aspect_ratio"] == "9:16"
+    assert body["input"]["resolution"] == "1K"
+
+
+@respx.mock
+async def test_nano_banana_2_image_to_image_chains_on_source() -> None:
+    captured = _capture_submit_then_succeed("https://cdn/i2i.png")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await nano_banana_2_image_to_image(
+            client, source_image_url="https://cdn/shot1.png",
+            prompt="Same character, new scene", aspect_ratio="9:16",
+            resolution="1K", max_attempts=2, delay_seconds=0.0,
+        )
+    assert url == "https://cdn/i2i.png"
+    assert cost == COST_NANO_BANANA_2_1K_USD
+    body = captured[0]
+    assert body["input"]["image_input"] == ["https://cdn/shot1.png"]
+
+
+@respx.mock
+async def test_seedance_sends_duration_as_string() -> None:
+    captured = _capture_submit_then_succeed("https://cdn/clip.mp4")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=4, resolution="720p",
+            max_attempts=2, delay_seconds=0.0,
+        )
+    assert url == "https://cdn/clip.mp4"
+    assert cost == COST_SEEDANCE_PRO_720P_4S_USD
+    body = captured[0]
+    assert body["model"] == MODEL_SEEDANCE_PRO
+    assert body["input"]["input_urls"] == ["https://cdn/shot1.png"]
+    # The API rejects an integer duration — it MUST be a string.
+    assert body["input"]["duration"] == "4"
+    assert isinstance(body["input"]["duration"], str)
+
+
 # ── Sanity on the model names + cost constants (catch accidental renames) ────
 
 
 def test_model_names_pinned() -> None:
     assert MODEL_NANO_BANANA_EDIT == "google/nano-banana-edit"
     assert MODEL_RECRAFT_UPSCALE == "recraft/crisp-upscale"
+    assert MODEL_SEEDANCE_PRO == "bytedance/seedance-1.5-pro"
 
 
 def test_cost_constants_are_positive() -> None:
     assert COST_NANO_BANANA_EDIT_USD > 0
     assert COST_RECRAFT_UPSCALE_USD > 0
+    assert COST_NANO_BANANA_2_1K_USD > 0
+    assert COST_SEEDANCE_PRO_720P_4S_USD > 0
