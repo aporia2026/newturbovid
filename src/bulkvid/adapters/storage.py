@@ -1,4 +1,4 @@
-"""Storage adapter — S3 primary (``aporia-creative``), GCS fallback (``aporia-unleash``).
+"""Storage adapter — GCS primary (``aporia-unleash``), S3 fallback (``aporia-creative``).
 
 The underlying SDKs (``boto3`` for S3, ``google-cloud-storage`` for GCS) are
 blocking. We wrap each call in ``asyncio.to_thread`` so the orchestrator's

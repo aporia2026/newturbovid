@@ -94,6 +94,35 @@ def test_deep_health_admin_returns_full_status(client: TestClient) -> None:
     assert body["queue"]["recent_jobs"] == []
 
 
+def test_deep_health_recognizes_inline_google_credentials(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GCS + Vertex are configured via inline env vars (no file path).
+
+    Regression: the deep check used to look only at the file-path credential
+    vars and reported these as unconfigured even when the inline GOOGLE_* /
+    VERTEX_AI_* vars (the path actually used in deploy) were set.
+    """
+    from bulkvid.config import Settings
+
+    pem = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+    s = Settings(
+        _env_file=None,    # hermetic: ignore any local .env
+        GCS_BUCKET_NAME="aporia-unleash",
+        GOOGLE_PRIVATE_KEY=pem,
+        GOOGLE_CLIENT_EMAIL="storage@proj.iam.gserviceaccount.com",
+        VERTEX_AI_PRIVATE_KEY=pem,
+        VERTEX_AI_CLIENT_EMAIL="tts@amit-tts.iam.gserviceaccount.com",
+    )
+    monkeypatch.setattr(health_routes, "get_settings", lambda: s)
+
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    vendors = r.json()["vendors"]
+    assert vendors["gcs"]["configured"] is True
+    assert vendors["vertex_ai"]["credentials_configured"] is True
+
+
 def test_deep_health_does_not_leak_api_keys(client: TestClient) -> None:
     r = client.get("/health/deep", headers=_auth("tok-admin"))
     assert r.status_code == 200

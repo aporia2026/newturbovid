@@ -1,0 +1,25 @@
+{% extends "_base.html" %}
+
+{% block title %}Logs {{ job_id }}{% if row is not none %} row {{ row }}{% endif %} · TurboVid Admin{% endblock %}
+
+{% block content %}
+<p><a href="/admin/jobs/{{ job_id }}">← Back to job</a></p>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h3 style="margin:0">
+      Logs — <span class="job-id">{{ job_id }}</span>{% if row is not none %} · row {{ row }}{% endif %}
+    </h3>
+    <a href="/admin/jobs/{{ job_id }}/logs{% if row is not none %}?row={{ row }}{% endif %}">↻ Refresh</a>
+  </div>
+
+  {% if not exists %}
+    <p class="label">No log file for this job yet — logs are written as its rows run.</p>
+  {% elif not lines %}
+    <p class="label">No log lines{% if row is not none %} for row {{ row }}{% endif %} yet.</p>
+  {% else %}
+    <pre class="logs">{% for l in lines %}{{ l }}
+{% endfor %}</pre>
+  {% endif %}
+</div>
+{% endblock %}

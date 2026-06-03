@@ -25,13 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import time
 from dataclasses import dataclass
 
 import httpx
+from PIL import Image
 
 from bulkvid.adapters.kie import recraft_crisp_upscale
-from bulkvid.pipeline.image_gen import edit_with_fallback
+from bulkvid.adapters.rendi import normalize_aspect_ratio
 from bulkvid.image_ops import (
     DEFAULT_EDGE_CROP_PIXELS,
     optimize_image_for_size,
@@ -52,12 +54,11 @@ from bulkvid.models.row import (
     RowResult,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.pipeline.image_gen import edit_with_fallback
 from bulkvid.pipeline.image_prompt import build_collage_prompt, describe_source_image
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.script_gen import generate_script
-from PIL import Image  # noqa: E402  (used inside optimizer helper)
-import io
 
 _log = get_logger("row")
 
@@ -215,7 +216,7 @@ async def process_image_vo_row(
                     atlas=clients.atlas,
                     source_image_url=source_url,
                     prompt=collage_prompt,
-                    aspect_ratio=row.aspect_ratio,
+                    aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
                 )
                 costs.image_gen += c3
 
@@ -299,7 +300,8 @@ async def process_image_vo_row(
         if row.voice_over:
             try:
                 tts_result = await clients.tts.synthesize(
-                    text=script_text, language=language, style_prompt=style_direction
+                    text=script_text, language=language, style_prompt=style_direction,
+                    country=row.country,
                 )
                 costs.tts += tts_result.cost_usd
                 vo_upload = await clients.storage.upload_bytes(
@@ -318,25 +320,33 @@ async def process_image_vo_row(
 
         # ─── Stage 10 (parallel): Rendi stills_to_video x 4 ───
 
-        async def _make_video(idx: int, image_url: str) -> str:
+        async def _make_video(idx: int, image_url: str) -> tuple[str, str]:
+            aspect = normalize_aspect_ratio(row.aspect_ratio)
             if vo_url is None:
-                # Silent video: pass a 0-length audio? For Phase 3, skip when VO=No.
-                # The 4Images path will handle this; Image-VO with VO=No is rare.
-                raise RuntimeError("VO=No on Image-VO not yet supported (Phase 3 limitation)")
-            url, cost = await clients.rendi.stills_to_video(
-                image_url=image_url,
-                audio_url=vo_url,
-                output_filename=f"v{idx + 1}.mp4",
-            )
-            costs.rendi += cost
-            return url
+                # Voice Over = No -> silent video (image only), no voiceover.
+                out = await clients.rendi.image_to_silent_video(
+                    image_url=image_url,
+                    output_filename=f"v{idx + 1}.mp4",
+                    aspect_ratio=aspect,
+                )
+            else:
+                out = await clients.rendi.stills_to_video(
+                    image_url=image_url,
+                    audio_url=vo_url,
+                    output_filename=f"v{idx + 1}.mp4",
+                    aspect_ratio=aspect,
+                )
+            costs.rendi += out.cost_usd
+            return out.url, out.command_id
 
         try:
-            rendi_video_urls = await asyncio.gather(
+            rendi_results = await asyncio.gather(
                 *[_make_video(i, u) for i, u in enumerate(quadrant_urls)]
             )
         except Exception as e:
             return _fail(row, STATUS_VIDEO_ASSEMBLY_FAILED, str(e), t0, costs, metadata)
+        rendi_video_urls = [url for url, _ in rendi_results]
+        rendi_command_ids = [cid for _, cid in rendi_results]
 
         # ─── Stage 11 (parallel): persist videos to OUR storage ───
 
@@ -356,6 +366,11 @@ async def process_image_vo_row(
             )
         except Exception as e:
             return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
+
+        # ─── Stage 11b: free Rendi storage (best-effort) ───
+        # The finished videos now live in our own storage, so the Rendi copies
+        # are dead weight against the account quota. Drop them. Never fails the row.
+        await clients.rendi.cleanup_commands(rendi_command_ids)
 
         # ─── Stage 12 (optional): ZapCap ───
 

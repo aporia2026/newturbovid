@@ -36,13 +36,17 @@ from bulkvid.logging import get_logger
 _log = get_logger("kie")
 
 
-# Cost estimates (USD). Verified plan §11 2026-06-02. Override per-model
+# Cost estimates (USD). Verified live on kie.ai 2026-06-03. Override per-model
 # via the admin panel once it ships (Phase 5).
 COST_NANO_BANANA_EDIT_USD = 0.04
+COST_NANO_BANANA_2_USD = 0.06        # nano-banana-2 @ 2K (kie: $0.04/1K, $0.06/2K)
+COST_GPT_IMAGE_2_USD = 0.08          # gpt-image-2 fallback, rough mid-tier estimate
 COST_RECRAFT_UPSCALE_USD = 0.04
 
 # Production model identifiers.
 MODEL_NANO_BANANA_EDIT = "google/nano-banana-edit"
+MODEL_NANO_BANANA_2 = "nano-banana-2"
+MODEL_GPT_IMAGE_2 = "gpt-image-2-image-to-image"
 MODEL_RECRAFT_UPSCALE = "recraft/crisp-upscale"
 
 
@@ -349,6 +353,63 @@ async def nano_banana_edit(
         task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
     )
     return urls[0], COST_NANO_BANANA_EDIT_USD
+
+
+async def nano_banana_2(
+    client: KieClient,
+    source_image_url: str,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str = "2K",
+    output_format: str = "png",
+    max_attempts: int = 60,
+    delay_seconds: float = 5.0,
+) -> tuple[str, float]:
+    """Generate a 2x2 collage with Nano Banana 2 (Gemini 3.1 Flash Image).
+
+    Honors ``aspect_ratio`` natively and renders legible text, so the collage
+    comes out at the target shape with the marketing copy intact. Returns
+    ``(url, cost_usd)``.
+    """
+    input_params: dict[str, Any] = {
+        "prompt": prompt,
+        "image_input": [source_image_url],
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "output_format": output_format,
+    }
+    task_id = await client.create_task(MODEL_NANO_BANANA_2, input_params)
+    urls = await client.poll_task(
+        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
+    return urls[0], COST_NANO_BANANA_2_USD
+
+
+async def gpt_image_2(
+    client: KieClient,
+    source_image_url: str,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str = "2K",
+    max_attempts: int = 60,
+    delay_seconds: float = 5.0,
+) -> tuple[str, float]:
+    """Fallback collage generation with GPT Image 2 (image-to-image).
+
+    Different input-field name (``input_urls``) and no ``output_format`` —
+    per the kie GPT Image 2 image-to-image schema. Returns ``(url, cost_usd)``.
+    """
+    input_params: dict[str, Any] = {
+        "prompt": prompt,
+        "input_urls": [source_image_url],
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+    }
+    task_id = await client.create_task(MODEL_GPT_IMAGE_2, input_params)
+    urls = await client.poll_task(
+        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+    )
+    return urls[0], COST_GPT_IMAGE_2_USD
 
 
 async def recraft_crisp_upscale(

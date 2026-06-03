@@ -393,5 +393,5 @@ async def test_word_count_is_computed() -> None:
 
 
 def test_default_target_words_sensible() -> None:
-    # ~10s spoken = ~30-40 words.
-    assert 25 <= DEFAULT_TARGET_WORDS <= 50
+    # Target ~10-12s spoken ≈ ~15-20 words at the observed (~1.5 words/sec) TTS rate.
+    assert 14 <= DEFAULT_TARGET_WORDS <= 24

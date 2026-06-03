@@ -19,6 +19,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from bulkvid.adapters.google_credentials import (
+    build_vertex_credentials_info,
+    have_credentials_configured,
+)
 from bulkvid.auth import Identity
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger
@@ -64,7 +68,10 @@ async def deep_health(
                 "suffixes": [k[-4:] for k in settings.kie_key_list],
             },
             "vertex_ai": {
-                "credentials_configured": bool(settings.GOOGLE_APPLICATION_CREDENTIALS),
+                # Recognise BOTH credential modes the TTS client actually uses:
+                # a file path OR inline VERTEX_AI_* / GOOGLE_* env vars.
+                "credentials_configured": build_vertex_credentials_info(settings)
+                is not None,
                 "project": settings.VERTEX_AI_PROJECT_ID,
                 "location": settings.VERTEX_AI_LOCATION,
             },
@@ -80,8 +87,15 @@ async def deep_health(
                 "region": settings.AWS_REGION,
             },
             "gcs": {
+                # Mirror build_client_from_settings: a bucket plus credentials
+                # via a GCS file path, the shared GOOGLE_* inline vars, or a
+                # GOOGLE_APPLICATION_CREDENTIALS file path.
                 "configured": bool(
-                    settings.GCS_CREDENTIALS_FILE or settings.GOOGLE_APPLICATION_CREDENTIALS
+                    settings.GCS_BUCKET_NAME
+                    and (
+                        settings.GCS_CREDENTIALS_FILE
+                        or have_credentials_configured(settings)
+                    )
                 ),
                 "bucket": settings.GCS_BUCKET_NAME,
             },

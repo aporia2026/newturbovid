@@ -83,7 +83,7 @@ def test_settings_detail_renders_current_value(client: TestClient) -> None:
     body = r.text
     assert "Script generator system prompt" in body
     # Some recognizable line from the default prompt.
-    assert "Maximum length: 40 words" in body
+    assert "Hard maximum: 20 words" in body
 
 
 def test_settings_detail_unknown_key_returns_404(client: TestClient) -> None:
@@ -152,7 +152,7 @@ def test_reset_restores_default(client: TestClient) -> None:
     )
     body = detail.text
     # The full default prompt is back.
-    assert "Maximum length: 40 words" in body
+    assert "Hard maximum: 20 words" in body
 
 
 # ── Auth gating + audit log visibility ──────────────────────────────────────

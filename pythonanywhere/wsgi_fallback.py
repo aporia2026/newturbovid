@@ -1,18 +1,28 @@
-"""WSGI shim — only used if ASGI beta on PA stops working.
+"""WSGI entrypoint for PythonAnywhere (Manual-configuration web app).
 
-If/when PythonAnywhere yanks ASGI support or changes the deploy model, point
-the PA Web tab WSGI file at this module. It runs the FastAPI app through
-``a2wsgi.ASGIMiddleware``, sacrificing streaming endpoints and WebSockets
-(we don't use either) for a stable WSGI surface.
+PythonAnywhere's native ASGI support is still beta, so we run the FastAPI
+(ASGI) app under WSGI via ``a2wsgi.ASGIMiddleware``. Our web endpoints are
+light (enqueue + status + admin) and we use no streaming/WebSockets, so the
+WSGI surface is a clean, stable fit.
 
-Phase 0: stub. Not wired by default. Enable only if `pa website` ASGI fails.
+How to use on PythonAnywhere (Web tab -> WSGI configuration file): replace the
+file's contents with the snippet below, adjusting USERNAME. (We keep the logic
+here too, but PA loads its own ``/var/www/..._wsgi.py``.)
 
-Plan: _plans/2026-06-02-aporia-bulk-video-tool.md §5 (migration triggers).
+    import os
+    os.chdir("/home/USERNAME/bulkvid")          # so .env and ./data resolve
+    from a2wsgi import ASGIMiddleware
+    from bulkvid.main import app
+    application = ASGIMiddleware(app)
+
+Plan: _plans/2026-06-02-aporia-bulk-video-tool.md §5 (deploy).
 """
 
-# Uncomment if/when needed (also add `a2wsgi>=1.10` to pyproject):
-#
-# from a2wsgi import ASGIMiddleware
-# from bulkvid.main import app
-#
-# application = ASGIMiddleware(app)
+from __future__ import annotations
+
+from a2wsgi import ASGIMiddleware
+
+from bulkvid.main import app
+
+# WSGI servers look for a module-level ``application``.
+application = ASGIMiddleware(app)

@@ -9,7 +9,7 @@ Routes the four Open Comments modes (plan §15 Appendix B):
   - ``MIXED``    -> apply tone hints AND enforce directives
 
 Output:
-  - ``script``: ready-to-speak text in the detected language (~25-45 words)
+  - ``script``: ready-to-speak text in the detected language (~20-24 words, ~10-12s)
   - ``style_direction``: short delivery hint for the TTS step (Gemini reads it)
 
 Model: gpt-5.4-mini (Yoav directive, plan §5 "Models locked in").
@@ -35,11 +35,11 @@ _log = get_logger("script")
 # ── Constants ────────────────────────────────────────────────────────────────
 
 
-# Yoav's compliance prompt mandates 40 words max. We allow a generous floor
-# so the LLM can still hit a natural hook even on short articles.
-DEFAULT_TARGET_WORDS = 30
-MIN_WORDS = 10
-MAX_WORDS = 40
+# Target ~10-12 seconds of voiceover (video length == VO length). At the
+# observed Gemini TTS rate (~2 words/sec) that's ~20-24 words; hard cap 26.
+DEFAULT_TARGET_WORDS = 17
+MIN_WORDS = 12
+MAX_WORDS = 20
 ARTICLE_PROMPT_CHARS = 3_000
 DEFAULT_STYLE_DIRECTION = "Read warmly and clearly, like a friendly podcast host."
 

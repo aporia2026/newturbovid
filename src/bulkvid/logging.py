@@ -9,9 +9,12 @@ Rule 14: log values, not just events. Booleans without their value are useless.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import sys
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -47,6 +50,36 @@ def _inject_context(_: Any, __: Any, event_dict: dict[str, Any]) -> dict[str, An
     return event_dict
 
 
+class _JobLogFileHandler(logging.Handler):
+    """Append each JSON log line to ``<logs_dir>/<batch_id>.log`` (per job).
+
+    The line already carries ``row_num`` (from the context injector), so the
+    admin panel can show logs filtered to a single row. Non-JSON lines (e.g.
+    third-party libraries) and lines without a ``batch_id`` are ignored.
+    """
+
+    def __init__(self, logs_dir: Path) -> None:
+        super().__init__()
+        self._dir = logs_dir
+        with contextlib.suppress(Exception):
+            self._dir.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            batch_id = json.loads(msg).get("batch_id")
+        except Exception:
+            return
+        if not batch_id:
+            return
+        safe = str(batch_id).replace("/", "_").replace("\\", "_").replace("..", "_")
+        try:
+            with open(self._dir / f"{safe}.log", "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+
 def configure_logging() -> None:
     """Configure structlog + stdlib logging. Idempotent."""
     settings = get_settings()
@@ -57,6 +90,14 @@ def configure_logging() -> None:
         stream=sys.stdout,
         level=level,
     )
+
+    # Per-job log files (for the admin per-row log viewer). Replace any prior
+    # instance so repeated configure_logging() calls don't duplicate writes.
+    root = logging.getLogger()
+    root.handlers = [h for h in root.handlers if not isinstance(h, _JobLogFileHandler)]
+    job_handler = _JobLogFileHandler(Path(settings.BULKVID_DATA_DIR) / "logs")
+    job_handler.setLevel(level)
+    root.addHandler(job_handler)
 
     structlog.configure(
         processors=[

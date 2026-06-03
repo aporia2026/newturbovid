@@ -46,6 +46,9 @@ dependencies = [
     "jinja2>=3.1",
     "python-multipart>=0.0.17",
 
+    # ASGI -> WSGI shim (PythonAnywhere runs the FastAPI app under WSGI)
+    "a2wsgi>=1.10",
+
     # SQLite via stdlib; no driver dep
 
     # Logging

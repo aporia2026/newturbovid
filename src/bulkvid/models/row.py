@@ -42,6 +42,27 @@ class ImageVORow:
 
 
 @dataclass
+class SimpleRow:
+    """Simple tab input row — one video from the user's existing Manual Image.
+
+    Same input columns as Image-VO, but NO image generation: the supplied
+    ``manual_image_url`` is resized to the target aspect and turned into a
+    single voiceover video. Exactly one ``Ready Video`` is written back.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 

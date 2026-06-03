@@ -7,7 +7,8 @@ Covers:
   - render_*_command: W/H substitution, Rendi placeholders preserved literal
   - RendiClient.submit: success, 401, non-200, missing command_id
   - RendiClient.poll: SUCCESS, FAILED (with stderr surfaced), timeout, non-200 retry
-  - High-level helpers: resize_image, stills_to_video, mix_music
+  - High-level helpers: resize_image, stills_to_video, mix_music (return RendiOutput)
+  - Cleanup: delete_command_files (200/404/error), cleanup_commands best-effort
   - Auth header is X-API-KEY (not Authorization: Bearer)
 """
 
@@ -26,6 +27,7 @@ from bulkvid.adapters.rendi import (
     RendiError,
     RendiTimeoutError,
     dimensions_for_ratio,
+    normalize_aspect_ratio,
     render_music_mix_command,
     render_resize_command,
     render_stills_to_video_command,
@@ -272,15 +274,16 @@ async def test_resize_image_returns_url_and_cost() -> None:
     )
 
     async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
-        url, cost = await client.resize_image(
+        out = await client.resize_image(
             source_url="https://src/in.png",
             aspect_ratio="9:16",
             max_attempts=2,
             delay_seconds=0.0,
         )
 
-    assert url == "https://r.dev/resized.png"
-    assert cost == COST_RENDI_COMMAND_USD
+    assert out.url == "https://r.dev/resized.png"
+    assert out.cost_usd == COST_RENDI_COMMAND_USD
+    assert out.command_id == "cmd-resize"
     # The submitted command must carry the resolved 1080x1920 dimensions.
     cmd_str = captured_payload[0]["ffmpeg_command"]
     assert "1080" in cmd_str
@@ -305,14 +308,15 @@ async def test_stills_to_video_returns_url_and_cost() -> None:
         )
     )
     async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
-        url, cost = await client.stills_to_video(
+        out = await client.stills_to_video(
             image_url="https://src/i.png",
             audio_url="https://src/a.mp3",
             max_attempts=2,
             delay_seconds=0.0,
         )
-    assert url == "https://r.dev/v.mp4"
-    assert cost == COST_RENDI_COMMAND_USD
+    assert out.url == "https://r.dev/v.mp4"
+    assert out.cost_usd == COST_RENDI_COMMAND_USD
+    assert out.command_id == "cmd-stitch"
 
 
 @respx.mock
@@ -330,14 +334,146 @@ async def test_mix_music_returns_url_and_cost() -> None:
         )
     )
     async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
-        url, cost = await client.mix_music(
+        out = await client.mix_music(
             video_url="https://src/v.mp4",
             music_url="https://src/m.mp3",
             max_attempts=2,
             delay_seconds=0.0,
         )
-    assert url == "https://r.dev/mixed.mp4"
-    assert cost == COST_RENDI_COMMAND_USD
+    assert out.url == "https://r.dev/mixed.mp4"
+    assert out.cost_usd == COST_RENDI_COMMAND_USD
+    assert out.command_id == "cmd-mix"
+
+
+# ── normalize_aspect_ratio (kie image-model aspect strings) ──────────────────
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("9:16", "9:16"),
+        ("09:16", "9:16"),          # Sheets time-cast
+        ("16:9", "16:9"),
+        ("1:1", "1:1"),
+        ("4:5", "4:5"),
+        ("1080x1920", "9:16"),      # WxH reduced via GCD
+        ("1080x1080", "1:1"),
+        ("", "9:16"),               # empty -> default
+        ("auto", "9:16"),
+        ("garbage", "9:16"),
+        ("7:13", "9:16"),           # valid format but not an allowed ratio -> default
+    ],
+)
+def test_normalize_aspect_ratio(raw: str, expected: str) -> None:
+    assert normalize_aspect_ratio(raw) == expected
+
+
+def test_normalize_aspect_ratio_custom_default() -> None:
+    assert normalize_aspect_ratio("nonsense", default="1:1") == "1:1"
+
+
+# ── Auto-retry (_submit_and_poll) ────────────────────────────────────────────
+
+
+@respx.mock
+async def test_submit_and_poll_retries_on_timeout_then_succeeds() -> None:
+    counter = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        return httpx.Response(200, json={"command_id": f"cmd-{counter['n']}"})
+
+    def _poll(request: httpx.Request) -> httpx.Response:
+        cid = str(request.url).rsplit("/", 1)[-1]
+        if cid == "cmd-1":
+            return httpx.Response(200, json={"status": "QUEUED"})    # never completes
+        return httpx.Response(
+            200,
+            json={"status": "SUCCESS", "output_files": {"out_1": {"storage_url": "https://r.dev/ok.mp4"}}},
+        )
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
+    respx.get(url__regex=rf"{BASE}/v1/commands/.+").mock(side_effect=_poll)
+
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        url, cid = await client._submit_and_poll(
+            "cmd", {"in_1": "x"}, {"out_1": "o.mp4"},
+            max_attempts=2, delay_seconds=0.0, retry_backoff_seconds=0.0,
+        )
+    assert url == "https://r.dev/ok.mp4"
+    assert cid == "cmd-2"      # first command timed out, retry produced cmd-2
+    assert counter["n"] == 2   # exactly one retry
+
+
+@respx.mock
+async def test_submit_and_poll_does_not_retry_command_failed() -> None:
+    counter = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        return httpx.Response(200, json={"command_id": "cmd-x"})
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
+    respx.get(url__regex=rf"{BASE}/v1/commands/.+").mock(
+        return_value=httpx.Response(
+            200, json={"status": "FAILED", "error": {"message": "bad input"}}
+        )
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        with pytest.raises(RendiCommandFailedError):
+            await client._submit_and_poll(
+                "cmd", {"in_1": "x"}, {"out_1": "o.mp4"},
+                max_attempts=2, delay_seconds=0.0, retry_backoff_seconds=0.0,
+            )
+    assert counter["n"] == 1   # genuine ffmpeg failure is NOT retried
+
+
+# ── Cleanup: delete_command_files / cleanup_commands ─────────────────────────
+
+
+@respx.mock
+async def test_delete_command_files_calls_delete_endpoint() -> None:
+    route = respx.delete(f"{BASE}/v1/commands/cmd-9/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        await client.delete_command_files("cmd-9")
+    assert route.called
+
+
+@respx.mock
+async def test_delete_command_files_treats_404_as_gone() -> None:
+    respx.delete(f"{BASE}/v1/commands/missing/files").mock(
+        return_value=httpx.Response(404, json={"detail": "not found"})
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        await client.delete_command_files("missing")  # must not raise
+
+
+@respx.mock
+async def test_delete_command_files_raises_on_500() -> None:
+    respx.delete(f"{BASE}/v1/commands/boom/files").mock(
+        return_value=httpx.Response(500, text="server error")
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        with pytest.raises(RendiError):
+            await client.delete_command_files("boom")
+
+
+@respx.mock
+async def test_cleanup_commands_is_best_effort() -> None:
+    # cmd-ok deletes fine; cmd-bad 500s. cleanup_commands must attempt both and
+    # swallow the failure rather than propagate it.
+    ok = respx.delete(f"{BASE}/v1/commands/cmd-ok/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    bad = respx.delete(f"{BASE}/v1/commands/cmd-bad/files").mock(
+        return_value=httpx.Response(500, text="nope")
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        await client.cleanup_commands(["cmd-ok", "cmd-bad"])  # must not raise
+    assert ok.called
+    assert bad.called
 
 
 # ── Cost constant sanity ────────────────────────────────────────────────────
