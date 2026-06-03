@@ -216,15 +216,64 @@ def _enforce_word_cap(text: str, max_words: int) -> str:
     return truncated.rstrip(",;:- ").rstrip() + "."
 
 
+def _first_nonempty(d: dict, *keys: str) -> str:
+    """Return the first present-and-nonblank string value across ``keys``.
+
+    Lets the coercer accept shape drift from the model (``voice_over`` instead
+    of ``voiceover``, ``description`` instead of ``scene``, etc.) without
+    rewriting the same defensive lookup at every call site.
+    """
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
+_DEFAULT_MOTION = "Subtle, natural movement."
+
+
 def _coerce_ideas(
     raw_ideas: list[Any], num_ideas: int, num_shots: int
 ) -> list[CartoonIdea]:
-    """Normalize the parsed JSON into exactly ``num_ideas`` ideas of ``num_shots`` shots."""
+    """Normalize parsed JSON into exactly ``num_ideas`` ideas of ``num_shots`` shots.
+
+    Defensive against the gpt-5.4-mini planner's shape drift (live runs have
+    seen alternate key names and short/long shot lists):
+      - voiceover may be under voiceover / voice_over / vo / line / script /
+        narration
+      - shots may be under shots / scenes / sequence (and shots can be bare
+        strings instead of {scene, motion} dicts)
+      - scene may be under scene / description / visual / image / prompt
+      - motion may be under motion / action / animation / movement
+      - shot lists too short are padded by repeating the last valid shot
+      - shot lists too long are trimmed to ``num_shots``
+
+    Anything that still can't yield a voiceover + at least one valid scene is
+    rejected, with the reason logged at debug for diagnosis.
+    """
     ideas: list[CartoonIdea] = []
     for raw_idx, raw in enumerate(raw_ideas[:num_ideas]):
         if not isinstance(raw, dict):
+            _log.debug(
+                "cartoon_idea_rejected",
+                idea_index=raw_idx, reason="not_a_dict",
+                type=type(raw).__name__,
+            )
             continue
-        voiceover_raw = str(raw.get("voiceover") or "").strip()
+        voiceover_raw = _first_nonempty(
+            raw, "voiceover", "voice_over", "vo", "line", "script", "narration"
+        )
+        if not voiceover_raw:
+            _log.debug(
+                "cartoon_idea_rejected",
+                idea_index=raw_idx, reason="no_voiceover",
+                keys=list(raw.keys())[:10],
+            )
+            continue
         original_words = len(voiceover_raw.split())
         voiceover = _enforce_word_cap(voiceover_raw, CARTOON_MAX_WORDS)
         if original_words > CARTOON_MAX_WORDS:
@@ -235,18 +284,45 @@ def _coerce_ideas(
                 max_words=CARTOON_MAX_WORDS,
                 capped_words=len(voiceover.split()),
             )
-        style = str(raw.get("style_direction") or "").strip() or DEFAULT_STYLE_DIRECTION
-        raw_shots = raw.get("shots") or []
+        style = (
+            _first_nonempty(raw, "style_direction", "style", "tone", "delivery")
+            or DEFAULT_STYLE_DIRECTION
+        )
+
+        raw_shots = raw.get("shots") or raw.get("scenes") or raw.get("sequence") or []
+        if not isinstance(raw_shots, list):
+            raw_shots = []
         shots: list[CartoonShot] = []
-        for rs in raw_shots[:num_shots]:
+        for rs in raw_shots:
+            if isinstance(rs, str):
+                scene = rs.strip()
+                if scene:
+                    shots.append(CartoonShot(scene=scene, motion=_DEFAULT_MOTION))
+                continue
             if not isinstance(rs, dict):
                 continue
-            scene = str(rs.get("scene") or "").strip()
-            motion = str(rs.get("motion") or "").strip() or "Subtle, natural movement."
+            scene = _first_nonempty(rs, "scene", "description", "visual", "image", "prompt")
+            motion = (
+                _first_nonempty(rs, "motion", "action", "animation", "movement")
+                or _DEFAULT_MOTION
+            )
             if scene:
                 shots.append(CartoonShot(scene=scene, motion=motion))
-        if voiceover and len(shots) == num_shots:
-            ideas.append(CartoonIdea(voiceover=voiceover, style_direction=style, shots=shots))
+
+        if not shots:
+            _log.debug(
+                "cartoon_idea_rejected",
+                idea_index=raw_idx, reason="no_valid_shots",
+                keys=list(raw.keys())[:10],
+            )
+            continue
+        # Pad short lists by repeating the last valid shot (image-to-image
+        # chaining keeps the visual cohesive even when the scenes are similar),
+        # and trim long lists down to the requested count.
+        while len(shots) < num_shots:
+            shots.append(shots[-1])
+        shots = shots[:num_shots]
+        ideas.append(CartoonIdea(voiceover=voiceover, style_direction=style, shots=shots))
     return ideas
 
 
@@ -309,6 +385,7 @@ async def generate_cartoon_plan(
             "cartoon_plan_incomplete_filled",
             got=len(ideas),
             wanted=num_ideas,
+            raw_preview=result.text[:300],
         )
         ideas += _fallback_plan(vertical, num_ideas - len(ideas), num_shots)
 
