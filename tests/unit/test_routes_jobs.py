@@ -36,7 +36,6 @@ from bulkvid.orchestrator.queue import (
 )
 from bulkvid.routes import jobs as jobs_routes
 
-
 # ── Fake verifier ───────────────────────────────────────────────────────────
 
 
@@ -390,3 +389,28 @@ def test_get_job_log_non_owner_returns_403(client: TestClient) -> None:
 def test_get_job_log_unknown_id_returns_404(client: TestClient) -> None:
     r = client.get("/jobs/job-bogus/log", headers=_auth("tok-bulk1"))
     assert r.status_code == 404
+
+
+# ── POST /jobs/kill-all ─────────────────────────────────────────────────────
+
+
+def test_kill_all_clears_callers_queue(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    assert r.json()["killed"] == 1
+
+
+def test_kill_all_is_scoped_to_caller_for_bulk_user(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    # bulk2 clears their own (empty) queue — bulk1's job is untouched.
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk2"))
+    assert r.status_code == 200
+    assert r.json()["killed"] == 0
+
+
+def test_kill_all_as_admin_kills_everyones(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    r = client.post("/jobs/kill-all", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    assert r.json()["killed"] >= 1

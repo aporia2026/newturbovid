@@ -187,6 +187,36 @@ _STILLS_TO_VIDEO_TEMPLATE = (
 )
 
 
+# One-shot "fit" video: the blurred-background-fit composition (whole image
+# visible, NOTHING cropped) PLUS optional voiceover, in a single ffmpeg command.
+# Replaces the old resize-then-stills two-call path for the simple/4Images tabs,
+# where the source image carries marketing text/CTA that must not be cropped.
+# (Image-VO keeps the cover-crop stills template — its quadrants are generated
+# to fill the frame.) Halves the Rendi round-trips: one queue wait, not two.
+_FIT_VIDEO_FILTER = (
+    "[0:v]split=2[bg][fg];"
+    "[bg]scale=__W__:__H__:force_original_aspect_ratio=increase,"
+    "crop=__W__:__H__,boxblur=30:5[bg2];"
+    "[fg]scale=__W__:__H__:force_original_aspect_ratio=decrease[fg2];"
+    "[bg2][fg2]overlay=(W-w)/2:(H-h)/2[v]"
+)
+
+_FIT_VIDEO_TEMPLATE = (
+    "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
+    '-filter_complex "' + _FIT_VIDEO_FILTER + ';[1:a]atempo=__TEMPO__[a]" '
+    '-map "[v]" -map "[a]" '
+    "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
+    "-c:a aac -b:a 192k -t 15 -shortest {{out_1}}"
+)
+
+_FIT_SILENT_TEMPLATE = (
+    "-loop 1 -framerate 30 -t __SECS__ -i {{in_1}} "
+    '-filter_complex "' + _FIT_VIDEO_FILTER + '" '
+    '-map "[v]" '
+    "-c:v libx264 -tune stillimage -pix_fmt yuv420p -an {{out_1}}"
+)
+
+
 # Voice at 100%, background music at 30% — lifted from stage_5_add_music.
 _MUSIC_MIX_TEMPLATE = (
     "-i {{in_1}} -i {{in_2}} "
@@ -216,6 +246,28 @@ def render_silent_video_command(
 ) -> str:
     return (
         _SILENT_VIDEO_TEMPLATE
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
+        .replace("__SECS__", str(seconds))
+    )
+
+
+def render_fit_video_command(
+    width: int = 1080, height: int = 1920, tempo: float = SPEECH_ATEMPO
+) -> str:
+    return (
+        _FIT_VIDEO_TEMPLATE
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
+        .replace("__TEMPO__", str(tempo))
+    )
+
+
+def render_fit_silent_command(
+    width: int = 1080, height: int = 1920, seconds: int = NO_VO_VIDEO_SECONDS
+) -> str:
+    return (
+        _FIT_SILENT_TEMPLATE
         .replace("__W__", str(width))
         .replace("__H__", str(height))
         .replace("__SECS__", str(seconds))
@@ -489,6 +541,41 @@ class RendiClient:
         url, command_id = await self._submit_and_poll(
             render_silent_video_command(width, height, seconds),
             {"in_1": image_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def image_to_video_fit(
+        self,
+        image_url: str,
+        audio_url: str | None = None,
+        output_filename: str = "out.mp4",
+        *,
+        aspect_ratio: str = "9:16",
+        seconds: int = NO_VO_VIDEO_SECONDS,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """One-shot image -> video with blurred-background fit (no cropping).
+
+        Scales the whole image to fit the target aspect over a blurred, zoomed
+        copy of itself, then (if ``audio_url`` is given) muxes the voiceover
+        sped up via atempo; ``audio_url=None`` yields a silent ``seconds`` clip.
+        Replaces the resize-then-stills two-call path — one Rendi command, one
+        queue wait. Auto-retried.
+        """
+        width, height = dimensions_for_ratio(aspect_ratio)
+        if audio_url is None:
+            command = render_fit_silent_command(width, height, seconds)
+            inputs = {"in_1": image_url}
+        else:
+            command = render_fit_video_command(width, height)
+            inputs = {"in_1": image_url, "in_2": audio_url}
+        url, command_id = await self._submit_and_poll(
+            command,
+            inputs,
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,

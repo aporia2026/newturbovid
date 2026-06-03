@@ -297,6 +297,19 @@ async def list_jobs(
     return [_job_to_out(j) for j in jobs]
 
 
+@router.post("/kill-all")
+async def kill_all_jobs(
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> dict[str, Any]:
+    """Clear the queue: kill all active jobs. Bulk users clear their own;
+    admins clear everyone's. In-flight rows finish; pending rows stop."""
+    scope = None if identity.is_admin else identity.email
+    killed = await queue.kill_all_jobs(user_email=scope)
+    _log.info("jobs_kill_all", by=identity.email, scope=scope or "ALL", killed=killed)
+    return {"killed": killed}
+
+
 @router.post("/{job_id}/kill")
 async def kill_job(
     job_id: str,
