@@ -5,15 +5,16 @@ PythonAnywhere's native ASGI support is still beta, so we run the FastAPI
 light (enqueue + status + admin) and we use no streaming/WebSockets, so the
 WSGI surface is a clean, stable fit.
 
-How to use on PythonAnywhere (Web tab -> WSGI configuration file): replace the
-file's contents with the snippet below, adjusting USERNAME. (We keep the logic
-here too, but PA loads its own ``/var/www/..._wsgi.py``.)
+``init_wsgi()`` builds ``app.state`` (queue, verifier, settings store) because
+FastAPI's ASGI ``lifespan`` does NOT run under WSGI.
+
+On PythonAnywhere, set the Web tab's WSGI configuration file to:
 
     import os
     os.chdir("/home/USERNAME/bulkvid")          # so .env and ./data resolve
     from a2wsgi import ASGIMiddleware
-    from bulkvid.main import app
-    application = ASGIMiddleware(app)
+    from bulkvid.main import init_wsgi
+    application = ASGIMiddleware(init_wsgi())
 
 Plan: _plans/2026-06-02-aporia-bulk-video-tool.md §5 (deploy).
 """
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 from a2wsgi import ASGIMiddleware
 
-from bulkvid.main import app
+from bulkvid.main import init_wsgi
 
 # WSGI servers look for a module-level ``application``.
-application = ASGIMiddleware(app)
+application = ASGIMiddleware(init_wsgi())
