@@ -331,3 +331,62 @@ def test_admin_can_kill_any_job(client: TestClient) -> None:
     r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-admin"))
     assert r.status_code == 200
     assert r.json()["killed"] is True
+
+
+# ── GET /jobs/{id}/rows ─────────────────────────────────────────────────────
+
+
+def test_get_job_rows_returns_per_row_status(client: TestClient) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+
+    r = client.get(f"/jobs/{job_id}/rows", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert len(body["rows"]) == 1
+    row = body["rows"][0]
+    assert row["row_num"] == 2
+    assert row["status"] == "pending"        # freshly queued, not yet claimed
+    assert row["video_urls"] == []
+    assert row["error"] is None
+
+
+def test_get_job_rows_unknown_id_returns_404(client: TestClient) -> None:
+    r = client.get("/jobs/job-bogus/rows", headers=_auth("tok-bulk1"))
+    assert r.status_code == 404
+
+
+def test_get_job_rows_non_owner_returns_403(client: TestClient) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    r = client.get(f"/jobs/{job_id}/rows", headers=_auth("tok-bulk2"))
+    assert r.status_code == 403
+
+
+# ── GET /jobs/{id}/log ──────────────────────────────────────────────────────
+
+
+def test_get_job_log_returns_empty_when_no_file(client: TestClient) -> None:
+    # No logging handler runs in this test app, so the per-job file never exists.
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+
+    r = client.get(f"/jobs/{job_id}/log", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["job_id"] == job_id
+    assert body["exists"] is False
+    assert body["lines"] == []
+
+
+def test_get_job_log_non_owner_returns_403(client: TestClient) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    r = client.get(f"/jobs/{job_id}/log", headers=_auth("tok-bulk2"))
+    assert r.status_code == 403
+
+
+def test_get_job_log_unknown_id_returns_404(client: TestClient) -> None:
+    r = client.get("/jobs/job-bogus/log", headers=_auth("tok-bulk1"))
+    assert r.status_code == 404

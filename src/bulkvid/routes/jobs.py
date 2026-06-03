@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from bulkvid.auth import AuthError, ForbiddenError, GoogleIdentityVerifier, Identity
 from bulkvid.config import get_settings
-from bulkvid.logging import get_logger
+from bulkvid.logging import get_logger, read_job_log_lines
 from bulkvid.models.row import FourImagesVO2Row, ImageVORow, SimpleRow
 from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
@@ -100,6 +100,24 @@ class JobOut(BaseModel):
     error: str | None
 
 
+class JobRowOut(BaseModel):
+    row_num: int
+    status: str
+    error: str | None = None
+    video_urls: list[str] = []
+
+
+class JobRowsOut(BaseModel):
+    job_id: str
+    rows: list[JobRowOut]
+
+
+class JobLogOut(BaseModel):
+    job_id: str
+    exists: bool
+    lines: list[str]
+
+
 def _job_to_out(job: Job) -> JobOut:
     return JobOut(
         job_id=job.job_id,
@@ -169,6 +187,17 @@ def get_queue(request: Request) -> JobQueue:
     return queue
 
 
+async def _require_owned_job(job_id: str, identity: Identity, queue: JobQueue) -> Job:
+    """Fetch a job or raise 404; raise 403 unless the caller owns it (admins see
+    all). Shared by every per-job route."""
+    job = await queue.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not identity.is_admin and job.user_email != identity.email:
+        raise HTTPException(403, "not your job")
+    return job
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
@@ -223,12 +252,36 @@ async def get_one_job(
     identity: Identity = Depends(get_identity),
     queue: JobQueue = Depends(get_queue),
 ) -> JobOut:
-    job = await queue.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "job not found")
-    if not identity.is_admin and job.user_email != identity.email:
-        raise HTTPException(403, "not your job")
+    job = await _require_owned_job(job_id, identity, queue)
     return _job_to_out(job)
+
+
+@router.get("/{job_id}/rows", response_model=JobRowsOut)
+async def get_job_rows(
+    job_id: str,
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> JobRowsOut:
+    """Per-row status for one job: row_num, status, error, video URLs. Lets the
+    sidebar show live per-row progress instead of a single job-level counter."""
+    await _require_owned_job(job_id, identity, queue)
+    rows = await queue.list_rows(job_id)
+    return JobRowsOut(job_id=job_id, rows=[JobRowOut(**r) for r in rows])
+
+
+@router.get("/{job_id}/log", response_model=JobLogOut)
+async def get_job_log(
+    job_id: str,
+    row: int | None = None,
+    tail: int = 200,
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> JobLogOut:
+    """Tail of a job's log (optionally one row), token-gated for the sidebar.
+    Mirrors the admin log viewer without needing an admin session cookie."""
+    await _require_owned_job(job_id, identity, queue)
+    lines, exists = read_job_log_lines(job_id, row=row, tail=tail)
+    return JobLogOut(job_id=job_id, exists=exists, lines=lines)
 
 
 @router.get("", response_model=list[JobOut])
@@ -250,11 +303,7 @@ async def kill_job(
     identity: Identity = Depends(get_identity),
     queue: JobQueue = Depends(get_queue),
 ) -> dict[str, Any]:
-    job = await queue.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "job not found")
-    if not identity.is_admin and job.user_email != identity.email:
-        raise HTTPException(403, "not your job")
+    await _require_owned_job(job_id, identity, queue)
     killed = await queue.kill_job(job_id)
     _log.info("job_kill", job_id=job_id, by=identity.email, killed=killed)
     return {"job_id": job_id, "killed": killed}
