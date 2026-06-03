@@ -158,9 +158,33 @@ async def test_build_collage_asks_for_text_cta_and_forbids_real_brands() -> None
     assert "headline" in user_msg.lower()
     assert "cta" in user_msg.lower() or "call-to-action" in user_msg.lower()
     assert "same language" in user_msg.lower()
+    # Keep the inspiration's text/CTA verbatim; change only the photo.
+    assert "verbatim" in user_msg.lower()
+    assert "change only the photo" in user_msg.lower()
     # Real brands are forbidden in the generated panels (legal requirement).
     assert "no real brands" in user_msg.lower()
     assert "trademark" in user_msg.lower()
     # Regression: the old no-text rule is gone (text/CTA are now required).
     assert "NO text" not in user_msg
     assert "AUTOMOTIVE RULE" not in user_msg
+
+
+@respx.mock
+async def test_build_collage_grounds_new_photo_in_article() -> None:
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_response("Create a 2x2 grid collage."))
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await build_collage_prompt(
+            client,
+            description="A street scene.",
+            article_excerpt="Modern prefab granny pods for backyards in 2026.",
+        )
+
+    user_msg = captured[0]["messages"][1]["content"]
+    assert "ARTICLE CONTEXT" in user_msg
+    assert "granny pods" in user_msg.lower()

@@ -56,39 +56,52 @@ _COLLAGE_SYSTEM = (
 )
 
 
-def _collage_user_message(description: str) -> str:
+def _collage_user_message(description: str, article_excerpt: str = "") -> str:
+    article_block = (
+        "ARTICLE CONTEXT (the new photos must depict subjects relevant to THIS "
+        "article — not necessarily whatever the inspiration photo happened to "
+        f"show):\n{article_excerpt.strip()}\n\n"
+        if article_excerpt.strip()
+        else ""
+    )
     return (
         f"Inspiration ad analysis:\n{description}\n\n"
+        f"{article_block}"
         "Create ONE image that is a 2x2 GRID of exactly 4 equal-sized panels:\n"
         "  TOP-LEFT = Panel 1 | TOP-RIGHT = Panel 2\n"
         "  BOTTOM-LEFT = Panel 3 | BOTTOM-RIGHT = Panel 4\n\n"
-        "Each panel is a COMPLETE, standalone vertical ad frame inspired by the "
-        "analysis above — same subject, style, palette and mood — showing the "
-        "product/subject in a slightly different scene or angle so the 4 panels "
-        "feel like a varied ad set.\n\n"
-        "TEXT & CTA (important):\n"
-        "- Render a SHORT marketing headline plus a clear call-to-action on EACH "
-        "panel, in the SAME LANGUAGE as the inspiration's text.\n"
-        "- Do NOT copy the inspiration's wording verbatim — write SIMILAR, natural "
-        "marketing copy with the same intent and angle, varied across the 4 panels.\n"
-        "- Use only generic, unbranded copy — NEVER put a real brand or company "
-        "name in the headline or CTA.\n"
-        "- Text must be crisp, correctly spelled, and legible: large headline, smaller CTA.\n\n"
+        "GOAL: keep the inspiration ad's TEXT and layout, change ONLY the photo.\n\n"
+        "KEEP THE TEXT (do NOT rewrite):\n"
+        "- Reuse the inspiration's headline and call-to-action EXACTLY as written "
+        "(verbatim, same language), keeping the SAME text layout, banner/label "
+        "style, and placement. Use the SAME headline and CTA on all 4 panels.\n"
+        "- The ONLY change allowed to the text is replacing a real brand or company "
+        "name with a generic term.\n"
+        "- Text must stay crisp, correctly spelled and legible.\n\n"
+        "CHANGE ONLY THE PHOTO:\n"
+        "- Replace the inspiration's photo/visual with a NEW, realistic photo that "
+        "fits the article context above (or, with no article context, the same "
+        "product/subject as the inspiration). Vary the photo across the 4 panels "
+        "(different scenes / angles / examples) so they read as a varied ad set.\n"
+        "- Keep the overall ad design, colours and mood consistent with the inspiration.\n\n"
         "NO REAL BRANDS (strict — legal requirement):\n"
-        "- The panels must contain NO real brand logos, trademarks, brand names, "
+        "- The imagery must contain NO real brand logos, trademarks, brand names, "
         "badges, or recognisable branding — not even if the inspiration shows them.\n"
-        "- Replace any branding from the inspiration with generic, unbranded "
-        "equivalents; show the product as a generic, unbranded item.\n\n"
+        "- Show any product as a generic, unbranded item.\n\n"
         "LAYOUT RULES (must follow):\n"
         "- ONE image, 2 columns x 2 rows, 4 equal panels, thin neutral divider between them.\n"
         "- Do NOT stack panels into a single column. Do NOT repeat the same panel.\n\n"
         "FORMAT your response exactly like this and nothing else:\n"
-        "Create a 2x2 grid collage (2 columns, 2 rows, 4 equal panels), each a vertical ad frame.\n"
-        'TOP-LEFT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
-        'TOP-RIGHT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
-        'BOTTOM-LEFT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
-        'BOTTOM-RIGHT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
-        "All panels: same style and quality as the inspiration; text legible and correctly spelled."
+        "Create a 2x2 grid collage (2 columns, 2 rows, 4 equal panels), each a vertical "
+        "ad frame that REUSES the inspiration's exact headline and CTA and only changes the photo.\n"
+        'Headline on every panel (verbatim from the inspiration): "[exact headline]".\n'
+        'CTA on every panel (verbatim from the inspiration): "[exact cta]".\n'
+        "TOP-LEFT panel photo: [new article-relevant scene].\n"
+        "TOP-RIGHT panel photo: [new article-relevant scene].\n"
+        "BOTTOM-LEFT panel photo: [new article-relevant scene].\n"
+        "BOTTOM-RIGHT panel photo: [new article-relevant scene].\n"
+        "All panels: keep the inspiration's text, banner style and overall look; only the "
+        "photo changes; text legible and correctly spelled; no real brands."
     )
 
 
@@ -125,14 +138,23 @@ async def build_collage_prompt(
     client: OpenAIClient,
     description: str,
     model: str = MODEL_COLLAGE_PROMPT,
+    article_excerpt: str = "",
 ) -> tuple[str, float]:
-    """gpt-5.4-mini builds the 2x2 collage prompt. Returns ``(prompt, cost_usd)``."""
-    _log.info("collage_prompt_submit", description_chars=len(description))
+    """gpt-5.4-mini builds the 2x2 collage prompt. Returns ``(prompt, cost_usd)``.
+
+    Keeps the inspiration's headline + CTA + layout verbatim and changes ONLY the
+    photo; ``article_excerpt`` (when given) grounds the new photo in the article
+    topic rather than whatever the inspiration photo happened to show."""
+    _log.info(
+        "collage_prompt_submit",
+        description_chars=len(description),
+        article_chars=len(article_excerpt),
+    )
     result = await client.chat(
         model=model,
         messages=[
             {"role": "system", "content": _COLLAGE_SYSTEM},
-            {"role": "user", "content": _collage_user_message(description)},
+            {"role": "user", "content": _collage_user_message(description, article_excerpt)},
         ],
         max_tokens=800,
         temperature=0.7,
