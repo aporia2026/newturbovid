@@ -66,8 +66,18 @@ CARTOON_NUM_SHOTS = 2          # shots stitched per video
 SEEDANCE_DURATION = 4          # seconds per Seedance clip (4/8/12 only)
 SEEDANCE_RESOLUTION = "720p"
 IMAGE_RESOLUTION = "1K"        # nano-banana-2 resolution (animated -> 720p)
-NO_VO_PER_SHOT_SECONDS = 3.5   # per-shot length when Voice Over = No
+NO_VO_PER_SHOT_SECONDS = 3.5   # per-shot length when Voice Over = No (gives 7s, in band)
 MIN_PER_SHOT_SECONDS = 1.5     # floor so a short VO never yields micro-cuts
+
+# Every cartoon video lands in this band regardless of the VO's natural length:
+# short VOs extend with held video + a brief trailing silence (= VO_TAIL),
+# long VOs are cut with a 0.3s audio fade. Set in Rendi via -t + afade (see
+# render_cartoon_concat_command). The floor is 4s — anything tighter feels
+# rushed — and the soft tail (rather than a 6s hard floor) keeps short VOs
+# from sitting in 2-3 seconds of dead air at the end.
+TARGET_VIDEO_MIN_SECONDS = 4.0
+TARGET_VIDEO_MAX_SECONDS = 8.0
+VO_TAIL_SECONDS = 0.8          # silence dwell after VO ends, before the cap
 
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:
@@ -183,8 +193,13 @@ async def process_cartoon_row(
             """Build one stitched, voiced, optionally-captioned video. None on failure."""
             nonlocal zapcap_failed
             try:
-                # 4a. Voiceover (optional) — measure real duration to size the cut.
+                # 4a. Voiceover (optional). The video's *output* length is clamped
+                # to [TARGET_VIDEO_MIN, TARGET_VIDEO_MAX] regardless of VO length:
+                # short VOs leave trailing silence, long VOs are cut with a fade
+                # in the Rendi concat (-t + afade). per_shot is then derived from
+                # the clamped target so the two video clips fill it exactly.
                 vo_url: str | None = None
+                target_video_seconds = NO_VO_PER_SHOT_SECONDS * CARTOON_NUM_SHOTS
                 per_shot = NO_VO_PER_SHOT_SECONDS
                 if row.voice_over:
                     tts = await clients.tts.synthesize(
@@ -202,11 +217,25 @@ async def process_cartoon_row(
                     costs.storage += vo_up.cost_usd
                     vo_url = vo_up.url
                     # The concat command speeds the VO up by SPEECH_ATEMPO, so the
-                    # effective played length is shorter than the raw WAV.
-                    effective = max(tts.duration_seconds / SPEECH_ATEMPO, MIN_PER_SHOT_SECONDS)
+                    # effective played length is shorter than the raw WAV. Target
+                    # = effective VO + a small dwell, clamped into the band.
+                    effective = tts.duration_seconds / SPEECH_ATEMPO
+                    target_video_seconds = min(
+                        max(effective + VO_TAIL_SECONDS, TARGET_VIDEO_MIN_SECONDS),
+                        TARGET_VIDEO_MAX_SECONDS,
+                    )
                     per_shot = min(
-                        max(effective / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
+                        max(target_video_seconds / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
                         float(SEEDANCE_DURATION),
+                    )
+                    _log.info(
+                        "cartoon_vo_sized",
+                        idea=idx + 1,
+                        vo_raw_seconds=round(tts.duration_seconds, 3),
+                        vo_effective_seconds=round(effective, 3),
+                        target_video_seconds=round(target_video_seconds, 3),
+                        per_shot_seconds=round(per_shot, 3),
+                        clamped=(effective < TARGET_VIDEO_MIN_SECONDS) or (effective > TARGET_VIDEO_MAX_SECONDS),
                     )
 
                 # 4b. Scene images — shot 1 from text, shots 2+ chained on shot 1.
@@ -277,13 +306,16 @@ async def process_cartoon_row(
                     _log.error("cartoon_idea_no_clips", idea=idx + 1)
                     return None
 
-                # 4d. Stitch + overlay VO.
+                # 4d. Stitch + overlay VO. ``total_video_seconds`` clamps the
+                # output to the [6, 8]s band — the row processor sized per_shot
+                # to fill that exactly.
                 stitched = await clients.rendi.concat_clips_with_audio(
                     clip_urls,
                     vo_url,
                     per_clip_seconds=per_shot,
                     output_filename=f"v{idx + 1}.mp4",
                     aspect_ratio=aspect,
+                    total_video_seconds=target_video_seconds,
                 )
                 costs.rendi += stitched.cost_usd
 

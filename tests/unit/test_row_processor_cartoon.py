@@ -103,7 +103,8 @@ class _FakeRendi:
 
     async def concat_clips_with_audio(
         self, clip_urls, audio_url, per_clip_seconds,
-        output_filename="out.mp4", *, aspect_ratio="9:16", **_,
+        output_filename="out.mp4", *, aspect_ratio="9:16",
+        total_video_seconds=None, **_,
     ) -> RendiOutput:
         self.concat_calls.append(
             {
@@ -111,6 +112,7 @@ class _FakeRendi:
                 "audio": audio_url,
                 "per_clip": per_clip_seconds,
                 "out": output_filename,
+                "total_video_seconds": total_video_seconds,
             }
         )
         return RendiOutput(
@@ -251,17 +253,67 @@ async def test_cartoon_happy_path_two_videos(monkeypatch) -> None:
 
 
 @respx.mock
-async def test_cartoon_vo_split_caps_per_shot(monkeypatch) -> None:
-    # 6s VO sped up by 1.3x ≈ 4.6s effective / 2 shots ≈ 2.3s per shot, under the 4s cap.
+async def test_cartoon_vo_short_clamped_to_floor(monkeypatch) -> None:
+    # Raw 3.5s VO -> effective 2.69s. Soft tail (+0.8s) gives 3.49s, BELOW the
+    # 4s floor → clamps UP to 4.0s. Tail silence ≈ 1.3s, not the prior 3s.
     _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
-    clients.tts = _FakeTTS(duration=6.0)    # type: ignore[assignment]
+    clients.tts = _FakeTTS(duration=3.5)    # type: ignore[assignment]
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    per = clients.rendi.concat_calls[0]["per_clip"]
-    assert 1.5 <= per <= 4.0
+    call = clients.rendi.concat_calls[0]
+    assert call["total_video_seconds"] == pytest.approx(4.0, abs=0.01)
+    assert call["per_clip"] == pytest.approx(2.0, abs=0.01)
+
+
+@respx.mock
+async def test_cartoon_vo_long_clamped_to_ceiling(monkeypatch) -> None:
+    # Raw 13s -> effective 10s + 0.8s tail = 10.8s, above the 8s ceiling. Clamps
+    # DOWN to 8.0 (regression: pre-fix live runs overshot here).
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    clients.tts = _FakeTTS(duration=13.0)    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    call = clients.rendi.concat_calls[0]
+    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+    assert call["per_clip"] == pytest.approx(4.0, abs=0.01)
+
+
+@respx.mock
+async def test_cartoon_vo_in_band_keeps_tail(monkeypatch) -> None:
+    # Raw 7s -> effective ~5.38s + 0.8s tail = 6.18s, in the [4, 8]s band.
+    # Target follows the VO with the dwell, no clamping either side.
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    clients.tts = _FakeTTS(duration=7.0)    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    call = clients.rendi.concat_calls[0]
+    expected = 7.0 / 1.3 + 0.8
+    assert call["total_video_seconds"] == pytest.approx(expected, abs=0.01)
+    assert 4.0 <= call["total_video_seconds"] <= 8.0
+
+
+@respx.mock
+async def test_cartoon_no_vo_uses_default_target(monkeypatch) -> None:
+    # No-VO rows keep the existing 3.5s per shot * 2 = 7s default target (in band).
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+
+    result = await process_cartoon_row(_row(vo=False), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    call = clients.rendi.concat_calls[0]
+    assert call["audio"] is None
+    assert call["total_video_seconds"] == pytest.approx(7.0, abs=0.01)
+    assert call["per_clip"] == pytest.approx(3.5, abs=0.01)
 
 
 @respx.mock
