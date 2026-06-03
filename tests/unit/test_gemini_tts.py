@@ -29,9 +29,10 @@ from bulkvid.adapters.gemini_tts import (
     GEMINI_TTS_CHANNELS,
     GEMINI_TTS_SAMPLE_RATE_HZ,
     GEMINI_TTS_SAMPLE_WIDTH_BYTES,
+    VOICE_BY_LANGUAGE,
     GeminiTTSClient,
     GeminiTTSNoAudioError,
-    VOICE_BY_LANGUAGE,
+    accent_directive,
     pcm_duration_seconds,
     pick_voice,
     wrap_pcm_to_wav,
@@ -169,6 +170,42 @@ async def test_synthesize_prepends_style_prompt() -> None:
     assert "The actual script body." in contents_arg
     # Style must appear before the script body.
     assert contents_arg.index("Say warmly") < contents_arg.index("The actual script body.")
+
+
+def test_accent_directive_english_by_country() -> None:
+    assert accent_directive("en", "UK") == "Speak in a natural British English accent."
+    assert accent_directive("en", "United Kingdom") == "Speak in a natural British English accent."
+    assert accent_directive("en", "US") == "Speak in a natural American English accent."
+    assert accent_directive("en", "australia") == "Speak in a natural Australian English accent."
+
+
+def test_accent_directive_empty_or_unknown() -> None:
+    assert accent_directive("en", "") == ""
+    assert accent_directive("en", "Atlantis") == ""    # unknown -> no forced accent
+
+
+def test_accent_directive_non_english_uses_country_dialect() -> None:
+    d = accent_directive("es", "Mexico")
+    assert "Mexico" in d
+    assert "accent" in d.lower()
+
+
+def test_accent_directive_expands_country_code() -> None:
+    # A bare country code is expanded to a readable name in the directive.
+    assert "Poland" in accent_directive("pl", "PL")
+    assert "PL" not in accent_directive("pl", "PL")
+
+
+async def test_synthesize_prepends_accent_for_country() -> None:
+    pcm = b"\x00" * 2000
+    fake_client = _make_fake_client(_make_fake_response(pcm))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    await tts.synthesize(text="The script body.", language="en", country="UK")
+
+    contents = fake_client.aio.models.generate_content.await_args.kwargs["contents"]
+    assert "British English accent" in contents
+    assert contents.index("British") < contents.index("The script body.")
 
 
 async def test_synthesize_honors_voice_override() -> None:

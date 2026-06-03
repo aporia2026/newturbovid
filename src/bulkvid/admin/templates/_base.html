@@ -49,6 +49,12 @@
     .badge-completed { background: #ceead6; color: var(--success); }
     .badge-failed { background: #fadbd8; color: var(--danger); }
     .badge-killed { background: #e8eaed; color: var(--muted); }
+    .badge-done { background: #ceead6; color: var(--success); }
+    .badge-processing { background: #d2e3fc; color: var(--accent); }
+    .badge-pending { background: #e8eaed; color: var(--muted); }
+    pre.logs { background: #1e1e1e; color: #e6e6e6; padding: 12px; border-radius: 6px; overflow: auto; max-height: 460px; font-size: 12px; line-height: 1.45; }
+    .htmx-indicator { opacity: 0; }
+    .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
     .grid { display: grid; grid-template-columns: 200px 1fr; gap: 8px 16px; }
     .label { color: var(--muted); }
@@ -65,6 +71,7 @@
     <div>
       <a href="/admin/">Dashboard</a>
       <a href="/admin/settings">Settings</a>
+      <a href="/admin/tunnel">Tunnel</a>
       <a href="/health/deep" target="_blank">/health/deep</a>
     </div>
   </header>

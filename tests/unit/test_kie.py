@@ -21,8 +21,12 @@ import pytest
 import respx
 
 from bulkvid.adapters.kie import (
+    COST_GPT_IMAGE_2_USD,
+    COST_NANO_BANANA_2_USD,
     COST_NANO_BANANA_EDIT_USD,
     COST_RECRAFT_UPSCALE_USD,
+    MODEL_GPT_IMAGE_2,
+    MODEL_NANO_BANANA_2,
     MODEL_NANO_BANANA_EDIT,
     MODEL_RECRAFT_UPSCALE,
     KieAuthError,
@@ -33,6 +37,8 @@ from bulkvid.adapters.kie import (
     KieTimeoutError,
     _pin_task_id,
     _unpin_task_id,
+    gpt_image_2,
+    nano_banana_2,
     nano_banana_edit,
     recraft_crisp_upscale,
 )
@@ -277,6 +283,88 @@ async def test_nano_banana_edit_returns_url_and_cost() -> None:
         )
     assert url == "https://cdn/x.png"
     assert cost == COST_NANO_BANANA_EDIT_USD
+
+
+@respx.mock
+async def test_nano_banana_2_sends_correct_model_and_fields() -> None:
+    captured: list[dict] = []
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "t1"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "state": "success",
+                    "resultJson": json.dumps({"resultUrls": ["https://cdn/nb2.png"]}),
+                },
+            },
+        )
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await nano_banana_2(
+            client,
+            source_image_url="https://src/seed.png",
+            prompt="2x2 ad collage with CTA",
+            aspect_ratio="9:16",
+            resolution="2K",
+            max_attempts=2,
+            delay_seconds=0.0,
+        )
+    assert url == "https://cdn/nb2.png"
+    assert cost == COST_NANO_BANANA_2_USD
+    body = captured[0]
+    assert body["model"] == MODEL_NANO_BANANA_2
+    # Nano Banana 2 uses image_input (array) + aspect_ratio + resolution.
+    assert body["input"]["image_input"] == ["https://src/seed.png"]
+    assert body["input"]["aspect_ratio"] == "9:16"
+    assert body["input"]["resolution"] == "2K"
+
+
+@respx.mock
+async def test_gpt_image_2_sends_correct_model_and_input_urls() -> None:
+    captured: list[dict] = []
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "t1"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "state": "success",
+                    "resultJson": json.dumps({"resultUrls": ["https://cdn/gpt.png"]}),
+                },
+            },
+        )
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await gpt_image_2(
+            client,
+            source_image_url="https://src/seed.png",
+            prompt="2x2 ad collage with CTA",
+            aspect_ratio="9:16",
+            max_attempts=2,
+            delay_seconds=0.0,
+        )
+    assert url == "https://cdn/gpt.png"
+    assert cost == COST_GPT_IMAGE_2_USD
+    body = captured[0]
+    assert body["model"] == MODEL_GPT_IMAGE_2
+    # GPT Image 2 image-to-image uses input_urls (NOT image_input).
+    assert body["input"]["input_urls"] == ["https://src/seed.png"]
+    assert body["input"]["aspect_ratio"] == "9:16"
 
 
 @respx.mock

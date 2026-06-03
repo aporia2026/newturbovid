@@ -29,11 +29,13 @@ from bulkvid.models.row import (
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
+    SimpleRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
+from bulkvid.orchestrator.row_processor_simple import process_simple_row
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 _log = get_logger("runner")
@@ -117,7 +119,11 @@ class BatchRunner:
         result: RowResult
         try:
             row = payload_to_row(dict(queued.payload))
-            if isinstance(row, ImageVORow):
+            if isinstance(row, SimpleRow):
+                result = await process_simple_row(
+                    row, self._clients, job_id=queued.job_id
+                )
+            elif isinstance(row, ImageVORow):
                 result = await process_image_vo_row(
                     row, self._clients, job_id=queued.job_id
                 )

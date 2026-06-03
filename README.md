@@ -2,7 +2,7 @@
 
 Simple bulk video creation for Facebook campaigns. Resized image + voiceover, optional ZapCap subtitles. Up to 4 videos per row, 200+ rows per batch in 12–20 minutes.
 
-**Status:** Phase 0 (scaffolding) — see [_plans/2026-06-02-aporia-bulk-video-tool.md](_plans/2026-06-02-aporia-bulk-video-tool.md) for the full plan.
+**Status:** Phases 0–7 complete; 399 tests passing; pipeline verified locally through TTS (video assembly pending a Rendi storage unblock). See [_plans/2026-06-02-aporia-bulk-video-tool.md](_plans/2026-06-02-aporia-bulk-video-tool.md) — §13a "Current status" for the live picture.
 
 ---
 
@@ -24,7 +24,7 @@ Every video = resized image + voiceover, optionally with burned-in subtitles. **
 - **Video assembly**: Rendi.dev (FFmpeg-as-a-service)
 - **Subtitles**: ZapCap
 - **Article fetch**: Tavily (primary) + ScrapingBee (fallback)
-- **Storage**: AWS S3 `aporia-creative` primary, GCS `aporia-unleash` fallback
+- **Storage**: GCS `aporia-unleash` primary, AWS S3 `aporia-creative` fallback
 - **Deploy (primary)**: PythonAnywhere — Developer plan, ASGI web app + 1 always-on task
 - **Deploy (migration target)**: Docker on Hetzner (sibling container next to `cb-remote-runner`)
 - **Admin panel**: HTMX + Tailwind, same FastAPI service

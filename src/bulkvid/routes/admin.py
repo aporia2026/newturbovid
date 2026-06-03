@@ -14,6 +14,7 @@ Plan §9 (Settings / Admin Panel — read-only MVP), Phase 5.
 
 from __future__ import annotations
 
+import json
 import secrets
 from pathlib import Path
 
@@ -102,8 +103,9 @@ async def job_detail(
     job = await queue.get_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
+    rows = await queue.list_rows(job_id)
     return templates.TemplateResponse(
-        request, "job_detail.html", {"job": job}
+        request, "job_detail.html", {"job": job, "rows": rows}
     )
 
 
@@ -213,4 +215,86 @@ async def settings_reset(
     _log.info("admin_setting_reset", key=key, updated_by=user)
     return RedirectResponse(
         url=f"/admin/settings/{key}", status_code=status.HTTP_303_SEE_OTHER
+    )
+
+
+# ── Tunnel (local-dev: regenerate the cloudflared public URL) ─────────────────
+
+
+@router.get("/tunnel", response_class=HTMLResponse)
+async def tunnel_page(
+    request: Request, _user: str = Depends(_check_admin)
+) -> HTMLResponse:
+    mgr = getattr(request.app.state, "tunnel", None)
+    available = bool(mgr and mgr.available())
+    return templates.TemplateResponse(
+        request,
+        "tunnel.html",
+        {"available": available, "url": mgr.current_url() if mgr else None, "error": None},
+    )
+
+
+@router.post("/tunnel/regenerate", response_class=HTMLResponse)
+async def tunnel_regenerate(
+    request: Request, _user: str = Depends(_check_admin)
+) -> HTMLResponse:
+    mgr = getattr(request.app.state, "tunnel", None)
+    available = bool(mgr and mgr.available())
+    url = mgr.current_url() if mgr else None
+    error = None
+    if not available:
+        error = "cloudflared is not available on this host — nothing to regenerate."
+    else:
+        try:
+            url = await mgr.regenerate()
+        except Exception as e:    # surface the failure in the page
+            error = str(e)
+    _log.info("admin_tunnel_regenerate", ok=bool(error is None), error=error)
+    return templates.TemplateResponse(
+        request, "tunnel.html", {"available": available, "url": url, "error": error}
+    )
+
+
+# ── Per-row logs ──────────────────────────────────────────────────────────────
+
+
+def _format_log_line(raw: str) -> str:
+    """Turn one stored JSON log line into a compact readable string."""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return raw
+    ts = str(d.get("timestamp", ""))[11:19]
+    lvl = str(d.get("level", "")).upper()[:4]
+    event = d.get("event", "")
+    skip = {"timestamp", "level", "event", "ns", "batch_id", "row_num", "user_email"}
+    kv = " ".join(f"{k}={v}" for k, v in d.items() if k not in skip)
+    return f"{ts} {lvl:<4} {event} {kv}".rstrip()
+
+
+@router.get("/jobs/{job_id}/logs", response_class=HTMLResponse)
+async def job_logs(
+    request: Request,
+    job_id: str,
+    row: int | None = None,
+    tail: int = 300,
+    _user: str = Depends(_check_admin),
+) -> HTMLResponse:
+    safe = job_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+    path = Path(get_settings().BULKVID_DATA_DIR) / "logs" / f"{safe}.log"
+    lines: list[str] = []
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if row is not None:
+                try:
+                    if int(json.loads(raw).get("row_num", -1)) != row:
+                        continue
+                except Exception:
+                    continue
+            lines.append(_format_log_line(raw))
+    tail = max(1, min(tail, 2000))
+    return templates.TemplateResponse(
+        request,
+        "logs.html",
+        {"job_id": job_id, "row": row, "lines": lines[-tail:], "exists": path.exists()},
     )

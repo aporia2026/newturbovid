@@ -1,0 +1,38 @@
+{% extends "_base.html" %}
+
+{% block title %}Tunnel · TurboVid Admin{% endblock %}
+
+{% block content %}
+<p><a href="/admin/">← Back to dashboard</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">Cloudflare tunnel (local testing)</h2>
+  <div id="tunnel-body">
+    {% if not available %}
+      <p class="label">
+        cloudflared isn't available on this host, so there's no tunnel to manage.
+        This is normal in production — the host has its own permanent public URL.
+      </p>
+    {% else %}
+      {% if error %}<p style="color:var(--danger)">⚠ {{ error }}</p>{% endif %}
+      <div class="grid">
+        <div class="label">Current public URL</div>
+        <div>
+          {% if url %}<code style="font-size:13px">{{ url }}</code>
+          {% else %}<span class="label">none yet — click Regenerate</span>{% endif %}
+        </div>
+      </div>
+      <p class="label" style="margin-top:12px">
+        After regenerating, paste the new URL into the Sheet:
+        <b>Aporia Bulk Video → Configure backend URL</b>.
+      </p>
+      <form hx-post="/admin/tunnel/regenerate"
+            hx-select="#tunnel-body" hx-target="#tunnel-body" hx-swap="outerHTML"
+            hx-indicator="#spin">
+        <button type="submit">Regenerate URL</button>
+        <span id="spin" class="htmx-indicator label">&nbsp; working… (~15s)</span>
+      </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

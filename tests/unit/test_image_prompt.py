@@ -3,10 +3,10 @@
 Covers:
   - describe_source_image: vision call, returns text + cost
   - describe_source_image: empty response gets a sensible fallback
+  - describe_source_image: reads on-image marketing text + CTA (prompt intent)
   - build_collage_prompt: returns text + cost, strips wrapping quotes
-  - automotive rule auto-injects when vehicles are present in description
-  - automotive rule absent otherwise (no false positives on "carrot" etc)
-  - All required layout / brand / content rules end up in the user message
+  - collage prompt now asks for SIMILAR marketing text + CTA per panel,
+    keeps branding/logos, and no longer strips text
 """
 
 from __future__ import annotations
@@ -14,12 +14,11 @@ from __future__ import annotations
 import json
 
 import httpx
-import pytest
 import respx
 
 from bulkvid.adapters.openai_client import OpenAIClient
 from bulkvid.pipeline.image_prompt import (
-    _automotive_rule_for,
+    _DESCRIBE_PROMPT,
     build_collage_prompt,
     describe_source_image,
 )
@@ -79,6 +78,14 @@ async def test_describe_empty_response_gets_fallback() -> None:
     assert "advertising" in desc.lower() or "photograph" in desc.lower()
 
 
+def test_describe_prompt_reads_marketing_text_and_cta() -> None:
+    # The vision prompt must now capture the on-image text + CTA, not ignore it.
+    lower = _DESCRIBE_PROMPT.lower()
+    assert "marketing text" in lower
+    assert "call-to-action" in lower or "cta" in lower
+    assert "ignore all text" not in lower
+
+
 @respx.mock
 async def test_describe_sends_image_in_user_content() -> None:
     captured: list[dict] = []
@@ -93,7 +100,6 @@ async def test_describe_sends_image_in_user_content() -> None:
 
     user_content = captured[0]["messages"][0]["content"]
     assert isinstance(user_content, list)
-    # text + image_url parts.
     types = [p["type"] for p in user_content]
     assert "text" in types
     assert "image_url" in types
@@ -126,15 +132,13 @@ async def test_build_collage_strips_wrapping_quotes() -> None:
         return_value=httpx.Response(200, json=_chat_response(quoted_response))
     )
     async with OpenAIClient(api_key=API_KEY) as client:
-        prompt, _ = await build_collage_prompt(
-            client, description="A simple scene."
-        )
+        prompt, _ = await build_collage_prompt(client, description="A simple scene.")
     assert not prompt.startswith('"')
     assert not prompt.endswith('"')
 
 
 @respx.mock
-async def test_build_collage_includes_layout_brand_content_rules() -> None:
+async def test_build_collage_asks_for_text_cta_and_keeps_logos() -> None:
     captured: list[dict] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -146,64 +150,16 @@ async def test_build_collage_includes_layout_brand_content_rules() -> None:
         await build_collage_prompt(client, description="A street scene.")
 
     user_msg = captured[0]["messages"][1]["content"]
-    # Layout
-    assert "2x2" in user_msg or "2-column" in user_msg
+    # Layout still enforced.
+    assert "2x2" in user_msg or "2 columns" in user_msg
     assert "TOP-LEFT" in user_msg
     assert "BOTTOM-RIGHT" in user_msg
-    # Brand
-    assert "NO car brand logos" in user_msg or "NO brand names" in user_msg
-    # Content (NO text inside panels)
-    assert "NO text" in user_msg
-    assert "NO logos" in user_msg
-
-
-# ── Automotive rule ─────────────────────────────────────────────────────────
-
-
-def test_automotive_rule_fires_on_vehicle_descriptions() -> None:
-    rule = _automotive_rule_for("A red sports car parked on a coastal road")
-    assert rule != ""
-    assert "aerial" in rule.lower() or "overhead" in rule.lower()
-
-
-def test_automotive_rule_silent_on_non_vehicle_descriptions() -> None:
-    rule = _automotive_rule_for("A bouquet of red flowers on a wooden table")
-    assert rule == ""
-
-
-def test_automotive_rule_catches_brand_names() -> None:
-    rule = _automotive_rule_for("A BMW sedan in a parking lot")
-    assert rule != ""
-
-
-@respx.mock
-async def test_build_collage_injects_automotive_rule_when_relevant() -> None:
-    captured: list[dict] = []
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content))
-        return httpx.Response(200, json=_chat_response("Create..."))
-
-    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
-    async with OpenAIClient(api_key=API_KEY) as client:
-        await build_collage_prompt(
-            client, description="A Toyota sedan parked outside a dealership."
-        )
-    user_msg = captured[0]["messages"][1]["content"]
-    assert "AUTOMOTIVE RULE" in user_msg
-    assert "aerial" in user_msg.lower() or "bird's-eye" in user_msg.lower()
-
-
-@respx.mock
-async def test_build_collage_skips_automotive_rule_when_irrelevant() -> None:
-    captured: list[dict] = []
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content))
-        return httpx.Response(200, json=_chat_response("Create..."))
-
-    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
-    async with OpenAIClient(api_key=API_KEY) as client:
-        await build_collage_prompt(client, description="A bowl of fresh fruit.")
-    user_msg = captured[0]["messages"][1]["content"]
+    # NEW: marketing text + CTA, in the source language.
+    assert "headline" in user_msg.lower()
+    assert "cta" in user_msg.lower() or "call-to-action" in user_msg.lower()
+    assert "same language" in user_msg.lower()
+    # NEW: branding is kept, not stripped.
+    assert "keep" in user_msg.lower()
+    # Regression: the old no-text / logo-stripping rules are gone.
+    assert "NO text" not in user_msg
     assert "AUTOMOTIVE RULE" not in user_msg

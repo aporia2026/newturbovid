@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from bulkvid.logging import get_logger
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow, RowResult
+from bulkvid.models.row import FourImagesVO2Row, ImageVORow, RowResult, SimpleRow
 
 _log = get_logger("queue")
 
@@ -46,6 +46,7 @@ ROW_FAILED = "failed"
 # Tab discriminators
 TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
+TAB_SIMPLE = "simple"
 
 
 _SCHEMA = """
@@ -119,17 +120,19 @@ def _new_job_id() -> str:
     return f"job-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
-def _row_to_payload(row: ImageVORow | FourImagesVO2Row, tab: str) -> str:
+def _row_to_payload(row: ImageVORow | FourImagesVO2Row | SimpleRow, tab: str) -> str:
     data = asdict(row)
     data["__tab__"] = tab
     return json.dumps(data, ensure_ascii=False)
 
 
-def _payload_to_row(payload_json: str) -> ImageVORow | FourImagesVO2Row:
+def _payload_to_row(payload_json: str) -> ImageVORow | FourImagesVO2Row | SimpleRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**data)
+    if tab == TAB_SIMPLE:
+        return SimpleRow(**data)
     return ImageVORow(**data)
 
 
@@ -281,6 +284,25 @@ class JobQueue:
             )
         return [Job(**{k: row[k] for k in row.keys()}) for row in cur.fetchall()]
 
+    def _list_rows_sync(self, job_id: str) -> list[dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT row_num, status, result FROM row_queue "
+            "WHERE job_id = ? ORDER BY row_num",
+            (job_id,),
+        )
+        out: list[dict[str, Any]] = []
+        for r in cur.fetchall():
+            result = json.loads(r["result"]) if r["result"] else {}
+            out.append(
+                {
+                    "row_num": r["row_num"],
+                    "status": r["status"],
+                    "error": result.get("error"),
+                    "video_urls": result.get("video_urls", []),
+                }
+            )
+        return out
+
     def _kill_job_sync(self, job_id: str) -> bool:
         with self._conn:
             cur = self._conn.execute(
@@ -351,6 +373,9 @@ class JobQueue:
     ) -> list[Job]:
         return await asyncio.to_thread(self._list_jobs_sync, user_email=user_email, limit=limit)
 
+    async def list_rows(self, job_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_rows_sync, job_id)
+
     async def kill_job(self, job_id: str) -> bool:
         async with self._lock:
             return await asyncio.to_thread(self._kill_job_sync, job_id)
@@ -364,9 +389,11 @@ class JobQueue:
         return n
 
 
-def payload_to_row(payload: dict[str, Any]) -> ImageVORow | FourImagesVO2Row:
+def payload_to_row(payload: dict[str, Any]) -> ImageVORow | FourImagesVO2Row | SimpleRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**payload)
+    if tab == TAB_SIMPLE:
+        return SimpleRow(**payload)
     return ImageVORow(**payload)

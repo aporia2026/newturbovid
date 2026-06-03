@@ -13,6 +13,7 @@
 
 const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
+const TAB_SIMPLE = 'simple';
 
 /** Column maps — MUST match src/bulkvid/adapters/sheets.py (1-indexed for Sheets). */
 const IMAGE_VO_COLS = {
@@ -81,6 +82,15 @@ function configureBackendUrl() {
 // ─── Tab detection ───────────────────────────────────────────────────────────
 
 function _detectTabType(sheet) {
+  // Detect by sheet NAME first (these tabs share the Image-VO columns).
+  const name = String(sheet.getName() || '').toLowerCase().trim();
+  // "simple x4" -> the 4-video GENERATION flow (Manual Image as inspiration ->
+  // generate 4 new images -> 4 videos). Must be checked BEFORE plain "simple",
+  // since the name also contains "simple".
+  if (name.indexOf('x4') !== -1) return TAB_IMAGE_VO;
+  // "simple" -> ONE video from the existing Manual Image, NO image generation.
+  if (name.indexOf('simple') !== -1) return TAB_SIMPLE;
+
   const lastCol = sheet.getLastColumn();
   if (lastCol === 0) return null;
   const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
@@ -226,7 +236,7 @@ function generateAllUnprocessed() {
     );
     return;
   }
-  const cols = tabType === TAB_IMAGE_VO ? IMAGE_VO_COLS : FOUR_IMAGES_COLS;
+  const cols = tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS : IMAGE_VO_COLS;
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1);
   if (rowNums.length === 0) {
     SpreadsheetApp.getUi().alert('No unprocessed rows found.');
@@ -243,8 +253,9 @@ function generateAllUnprocessed() {
 
 
 function _submitJobForRowNums(sheet, tabType, rowNums) {
-  const readRow = tabType === TAB_IMAGE_VO ? _readImageVORow : _readFourImagesRow;
-  const validate = tabType === TAB_IMAGE_VO ? _validateImageVO : _validateFourImages;
+  // Simple + Image-VO share the same input columns/readers; only 4Images differs.
+  const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow : _readImageVORow;
+  const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages : _validateImageVO;
 
   const rows = [];
   const skipped = [];
@@ -278,8 +289,9 @@ function _submitJobForRowNums(sheet, tabType, rowNums) {
     worksheet: sheet.getName(),
     tab_type: tabType,
   };
-  if (tabType === TAB_IMAGE_VO) payload.rows_image_vo = rows;
-  else payload.rows_four_images = rows;
+  if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
+  else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
+  else payload.rows_image_vo = rows;
 
   const backendUrl = _getBackendUrl();
   const resp = UrlFetchApp.fetch(backendUrl + '/jobs', {
@@ -322,18 +334,13 @@ function showJobsSidebar() {
 }
 
 
-/** Called from Sidebar.html via google.script.run. */
-function getLastJobStatus() {
-  const jobId = PropertiesService.getDocumentProperties().getProperty('LAST_JOB_ID');
-  if (!jobId) return null;
-  return _getJobStatus(jobId);
-}
-
-
-function _getJobStatus(jobId) {
+/** Called from Sidebar.html: list this user's jobs (active + finished archive).
+ *  Backed by GET /jobs, which returns the full job history. The sidebar splits
+ *  them into Active (queued/running) and Archive (completed/failed/killed). */
+function listJobs() {
   const backendUrl = _getBackendUrl();
   const idToken = ScriptApp.getIdentityToken();
-  const resp = UrlFetchApp.fetch(backendUrl + '/jobs/' + jobId, {
+  const resp = UrlFetchApp.fetch(backendUrl + '/jobs?limit=100', {
     headers: { 'Authorization': 'Bearer ' + idToken },
     muteHttpExceptions: true,
   });
@@ -345,10 +352,10 @@ function _getJobStatus(jobId) {
 }
 
 
-/** Called from Sidebar.html when the user clicks "Kill". */
-function killLastJob() {
-  const jobId = PropertiesService.getDocumentProperties().getProperty('LAST_JOB_ID');
-  if (!jobId) return { ok: false, error: 'no active job' };
+/** Called from Sidebar.html: kill ONE specific job. Other jobs keep running —
+ *  killing one never cancels another. */
+function killJob(jobId) {
+  if (!jobId) return { ok: false, error: 'no job id' };
   const backendUrl = _getBackendUrl();
   const idToken = ScriptApp.getIdentityToken();
   const resp = UrlFetchApp.fetch(backendUrl + '/jobs/' + jobId + '/kill', {
@@ -357,8 +364,5 @@ function killLastJob() {
     muteHttpExceptions: true,
   });
   const code = resp.getResponseCode();
-  if (code < 200 || code >= 300) {
-    return { ok: false, error: 'HTTP ' + code };
-  }
-  return { ok: true };
+  return (code >= 200 && code < 300) ? { ok: true } : { ok: false, error: 'HTTP ' + code };
 }

@@ -72,6 +72,51 @@ def pick_voice(language: str, override: str | None = None) -> str:
     return VOICE_BY_LANGUAGE.get((language or "").lower(), DEFAULT_VOICE)
 
 
+# Target-market country -> English accent. The article drives LANGUAGE
+# (plan goal #4); the campaign COUNTRY drives the accent/dialect. Gemini TTS
+# has no locale parameter, so accent is steered via the prompt.
+_ENGLISH_ACCENT_BY_COUNTRY: dict[str, str] = {
+    "gb": "British", "uk": "British", "united kingdom": "British",
+    "britain": "British", "great britain": "British", "england": "British",
+    "scotland": "Scottish", "wales": "Welsh",
+    "us": "American", "usa": "American", "united states": "American", "america": "American",
+    "au": "Australian", "australia": "Australian",
+    "ca": "Canadian", "canada": "Canadian",
+    "ie": "Irish", "ireland": "Irish",
+    "nz": "New Zealand", "new zealand": "New Zealand",
+    "in": "Indian", "india": "Indian",
+    "za": "South African", "south africa": "South African",
+}
+
+
+# Common country codes -> full names, so the directive reads "spoken in Poland"
+# rather than "spoken in PL". Full-name inputs pass through unchanged.
+_COUNTRY_NAME: dict[str, str] = {
+    "pl": "Poland", "mx": "Mexico", "es": "Spain", "fr": "France",
+    "de": "Germany", "it": "Italy", "pt": "Portugal", "br": "Brazil",
+    "il": "Israel", "sa": "Saudi Arabia", "ae": "the UAE", "nl": "the Netherlands",
+    "se": "Sweden", "no": "Norway", "dk": "Denmark", "fi": "Finland",
+    "tr": "Turkey", "gr": "Greece", "ro": "Romania", "cz": "Czechia",
+}
+
+
+def accent_directive(language: str, country: str) -> str:
+    """Return a prompt directive steering the accent to the target market.
+
+    English maps the country to a specific accent (British for the UK, etc.).
+    Other languages get a generic "regional dialect of <country>" nudge, with
+    country codes expanded to names. Returns "" when there's nothing useful.
+    """
+    c = (country or "").strip().lower()
+    if not c:
+        return ""
+    if (language or "").lower().startswith("en"):
+        accent = _ENGLISH_ACCENT_BY_COUNTRY.get(c)
+        return f"Speak in a natural {accent} English accent." if accent else ""
+    label = _COUNTRY_NAME.get(c, country.strip())
+    return f"Use the natural regional accent and dialect spoken in {label}."
+
+
 # ── Errors ───────────────────────────────────────────────────────────────────
 
 
@@ -187,21 +232,24 @@ class GeminiTTSClient:
         language: str,
         voice: str | None = None,
         style_prompt: str | None = None,
+        country: str = "",
     ) -> TTSResult:
-        """Generate speech audio. Returns a WAV-wrapped ``TTSResult``."""
+        """Generate speech audio. Returns a WAV-wrapped ``TTSResult``.
+
+        ``country`` steers the accent to the target market (e.g. UK -> British
+        English) — the article still determines ``language``.
+        """
         if not text or not text.strip():
             raise ValueError("synthesize requires non-empty text")
 
         chosen_voice = pick_voice(language, override=voice)
         client = self._ensure_client()
 
-        # Style direction (e.g. "say warmly" / "[excited]") can be prepended
-        # as a soft instruction. Gemini TTS will pick it up from the prompt.
-        prompt_text = (
-            f"{style_prompt.strip()}\n\n{text.strip()}"
-            if style_prompt and style_prompt.strip()
-            else text.strip()
-        )
+        # Prepend an accent directive (from country) then the per-row style
+        # direction, as soft instructions Gemini TTS picks up from the prompt.
+        accent = accent_directive(language, country)
+        prefix = " ".join(p for p in (accent, (style_prompt or "").strip()) if p)
+        prompt_text = f"{prefix}\n\n{text.strip()}" if prefix else text.strip()
 
         config = gtypes.GenerateContentConfig(
             response_modalities=["audio"],
@@ -219,6 +267,8 @@ class GeminiTTSClient:
             model=self._model,
             voice=chosen_voice,
             language=language,
+            country=country or "",
+            accent=accent or "default",
             text_chars=len(text),
             has_style=bool(style_prompt),
         )

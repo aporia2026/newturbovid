@@ -39,8 +39,8 @@ Language and Tone:
 - Maintain a neutral, informative tone — not emotional, persuasive, or urgent.
 
 Length and Structure:
-- Maximum length: 40 words.
-- Begin with a concise and interesting hook within the first 5–8 words.
+- Target length: about 16-18 words (roughly 10-15 seconds when read aloud). Hard maximum: 20 words.
+- Begin with a concise and interesting hook within the first 5-8 words.
 - Keep sentences short and easy to follow.
 - The text must sound natural when spoken aloud.
 - Suitable for realistic visuals or narration (no abstract or exaggerated phrases).

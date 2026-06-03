@@ -91,7 +91,8 @@ class _FakeTTS:
         self._fail = fail
 
     async def synthesize(
-        self, text: str, language: str, voice: str | None = None, style_prompt: str | None = None
+        self, text: str, language: str, voice: str | None = None,
+        style_prompt: str | None = None, country: str = ""
     ) -> TTSResult:
         if self._fail:
             from bulkvid.adapters.gemini_tts import GeminiTTSNoAudioError
@@ -176,6 +177,10 @@ def _register_rendi_routes() -> None:
         )
 
     respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(side_effect=_poll)
+    # Best-effort storage cleanup fired after videos are persisted.
+    respx.delete(url__regex=r"https://api\.rendi\.dev/v1/commands/.+/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
 
 
 def _register_video_downloads() -> None:

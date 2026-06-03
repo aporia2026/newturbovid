@@ -22,10 +22,11 @@ from pydantic import BaseModel, Field
 from bulkvid.auth import AuthError, ForbiddenError, GoogleIdentityVerifier, Identity
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow
+from bulkvid.models.row import FourImagesVO2Row, ImageVORow, SimpleRow
 from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
+    TAB_SIMPLE,
     Job,
     JobQueue,
 )
@@ -72,6 +73,8 @@ class SubmitJobIn(BaseModel):
     tab_type: str
     rows_image_vo: list[ImageVORowIn] | None = None
     rows_four_images: list[FourImagesVO2RowIn] | None = None
+    # The simple tab reuses the Image-VO input shape (one video, no image gen).
+    rows_simple: list[ImageVORowIn] | None = None
 
 
 class SubmitJobOut(BaseModel):
@@ -187,6 +190,10 @@ async def submit_job(
                 400, "rows_four_images is required for tab_type=four_images_vo2"
             )
         rows = [FourImagesVO2Row(**r.model_dump()) for r in payload.rows_four_images]
+    elif payload.tab_type == TAB_SIMPLE:
+        if not payload.rows_simple:
+            raise HTTPException(400, "rows_simple is required for tab_type=simple")
+        rows = [SimpleRow(**r.model_dump()) for r in payload.rows_simple]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

@@ -29,83 +29,61 @@ from bulkvid.logging import get_logger
 _log = get_logger("imageprompt")
 
 
-# Heuristic for the aerial-view rule from CBImageNoText (hides car brand badges).
-_AUTOMOTIVE_KEYWORDS = (
-    "car", "vehicle", "automobile", "sedan", "suv", "truck", "dealership",
-    "parking", "automotive", "bmw", "mercedes", "toyota", "honda", "ford",
-    "audi", "volkswagen", "hyundai", "kia", "nissan", "chevrolet", "tesla",
-)
-
-
 _DESCRIBE_PROMPT = (
-    "Analyse this advertising image as a creative director. "
-    "Ignore ALL text, logos, and branding completely. Describe only the visual content.\n\n"
+    "You are a senior advertising creative director analysing an inspiration ad "
+    "image so another model can create NEW ad images in the same spirit.\n\n"
     "Cover these points concisely:\n"
-    "1. SUBJECT: What is the main subject or product?\n"
-    "2. SETTING: Where is the scene taking place?\n"
-    "3. STYLE: Is it photographic, illustrated, cartoon, realistic, etc?\n"
-    "4. COLORS: What is the dominant color palette and mood?\n"
-    "5. COMPOSITION: How is the scene framed?\n"
-    "6. STORY POTENTIAL: In one sentence, what visual story could 4 panels tell about this subject?\n\n"
+    "1. SUBJECT: the main subject or product.\n"
+    "2. SETTING: where the scene takes place.\n"
+    "3. STYLE: photographic, illustrated, realistic, etc., plus the dominant color "
+    "palette and mood.\n"
+    "4. COMPOSITION: how the scene is framed and where any on-image text sits.\n"
+    "5. MARKETING TEXT: read ALL on-image text precisely — the headline, any "
+    "sub-text, and the call-to-action (CTA). Quote it verbatim and state the language.\n"
+    "6. MESSAGE: in one line, what the ad is selling and its persuasion angle.\n"
+    "7. BRANDING: note any logos, badges, signage, or brand marks present "
+    "(these are kept, not removed).\n\n"
     "Return only the structured description, no preamble, no commentary."
 )
 
 
 _COLLAGE_SYSTEM = (
-    "You are a world-class advertising creative director specializing in "
-    "image-editing prompts. You write ultra-precise prompts for "
-    "google/nano-banana-edit that produce perfect 2x2 grid collages. "
-    "Your prompts are always obeyed exactly because you are extremely "
-    "specific about layout and content."
+    "You are a world-class advertising creative director who writes ultra-precise "
+    "image prompts for text-capable models (Nano Banana 2 / GPT Image 2). You "
+    "produce 2x2 grid collages where each panel is a finished, scroll-stopping "
+    "vertical ad frame with a legible marketing headline and call-to-action."
 )
-
-
-def _automotive_rule_for(description: str) -> str:
-    lower = description.lower()
-    if not any(word in lower for word in _AUTOMOTIVE_KEYWORDS):
-        return ""
-    return (
-        "AUTOMOTIVE RULE: Since this image contains vehicles, use aerial/"
-        "bird's-eye view or elevated overhead angles for all panels. This "
-        "naturally hides brand badges, grilles, and logos that appear on the "
-        "front/rear of cars. Show cars from above or at a high angle looking "
-        "down — like drone photography.\n"
-    )
 
 
 def _collage_user_message(description: str) -> str:
     return (
-        f"Image description:\n{description}\n\n"
-        "Write a prompt for google/nano-banana-edit. "
-        "The output must be a SINGLE IMAGE that is a 2x2 GRID of exactly 4 equal-sized panels arranged as follows:\n"
+        f"Inspiration ad analysis:\n{description}\n\n"
+        "Create ONE image that is a 2x2 GRID of exactly 4 equal-sized panels:\n"
         "  TOP-LEFT = Panel 1 | TOP-RIGHT = Panel 2\n"
         "  BOTTOM-LEFT = Panel 3 | BOTTOM-RIGHT = Panel 4\n\n"
-        "The 4 panels tell a short visual story based on the image description above. "
-        "Each panel is a distinct scene or moment in a natural progression "
-        "(e.g. wide establishing shot → closer view → key action moment → outcome/resolution).\n\n"
-        "CRITICAL LAYOUT RULES — the model MUST follow these:\n"
-        "- The result is ONE image divided into a 2-column × 2-row grid.\n"
-        "- All 4 panels are exactly the same width and height.\n"
-        "- There is a thin neutral dividing line between panels.\n"
-        "- Do NOT stack all panels vertically. Do NOT make a single-column layout.\n"
-        "- Do NOT repeat the same image across panels.\n\n"
-        f"{_automotive_rule_for(description)}"
-        "BRAND & LOGO RULES — strictly enforced:\n"
-        "- NO car brand logos, badges, emblems, or grille designs (no BMW, Mercedes, Toyota, etc.).\n"
-        "- NO brand names on any vehicle, product, or surface.\n"
-        "- If showing vehicles, use generic unnamed car shapes with no identifying brand marks.\n"
-        "- NO license plates, NO dealership signs, NO branded clothing or accessories.\n\n"
-        "CONTENT RULES for every panel:\n"
-        "- Absolutely NO text, NO words, NO letters, NO numbers, NO logos, NO watermarks, NO labels.\n"
-        "- Same visual style, color palette, and lighting quality across all 4 panels.\n"
-        "- Each panel must look like a professional advertising photo or illustration.\n\n"
+        "Each panel is a COMPLETE, standalone vertical ad frame inspired by the "
+        "analysis above — same subject, style, palette and mood — showing the "
+        "product/subject in a slightly different scene or angle so the 4 panels "
+        "feel like a varied ad set.\n\n"
+        "TEXT & CTA (important):\n"
+        "- Render a SHORT marketing headline plus a clear call-to-action on EACH "
+        "panel, in the SAME LANGUAGE as the inspiration's text.\n"
+        "- Do NOT copy the inspiration's wording verbatim — write SIMILAR, natural "
+        "marketing copy with the same intent and angle, varied across the 4 panels.\n"
+        "- Text must be crisp, correctly spelled, and legible: large headline, smaller CTA.\n\n"
+        "FAITHFUL RENDERING:\n"
+        "- Match the inspiration's look. If it shows brand logos, badges, signage or "
+        "branding, KEEP them naturally — do NOT remove, hide, or obscure branding.\n\n"
+        "LAYOUT RULES (must follow):\n"
+        "- ONE image, 2 columns x 2 rows, 4 equal panels, thin neutral divider between them.\n"
+        "- Do NOT stack panels into a single column. Do NOT repeat the same panel.\n\n"
         "FORMAT your response exactly like this and nothing else:\n"
-        "Create a 2x2 grid collage (2 columns, 2 rows, 4 equal panels).\n"
-        "TOP-LEFT panel: [vivid scene description for panel 1].\n"
-        "TOP-RIGHT panel: [vivid scene description for panel 2].\n"
-        "BOTTOM-LEFT panel: [vivid scene description for panel 3].\n"
-        "BOTTOM-RIGHT panel: [vivid scene description for panel 4].\n"
-        "All panels: same style, same quality, NO text, NO logos, NO brand marks anywhere."
+        "Create a 2x2 grid collage (2 columns, 2 rows, 4 equal panels), each a vertical ad frame.\n"
+        'TOP-LEFT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
+        'TOP-RIGHT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
+        'BOTTOM-LEFT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
+        'BOTTOM-RIGHT panel: [scene] with headline "[short headline]" and CTA "[short cta]".\n'
+        "All panels: same style and quality as the inspiration; text legible and correctly spelled."
     )
 
 

@@ -28,7 +28,7 @@ from google.oauth2.service_account import Credentials
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
 from bulkvid.models.row import FourImagesVO2Row, ImageVORow
-from bulkvid.orchestrator.queue import TAB_FOUR_IMAGES, TAB_IMAGE_VO
+from bulkvid.orchestrator.queue import TAB_FOUR_IMAGES, TAB_IMAGE_VO, TAB_SIMPLE
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 _log = get_logger("sheets")
@@ -283,7 +283,7 @@ class SheetsClient:
         for (sheet_id, worksheet, tab_type), batch in grouped.items():
             ready_start = (
                 IMAGE_VO_COLS.ready_video_start
-                if tab_type == TAB_IMAGE_VO
+                if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
                 else FOUR_IMAGES_COLS.ready_video_start
                 if tab_type == TAB_FOUR_IMAGES
                 else None

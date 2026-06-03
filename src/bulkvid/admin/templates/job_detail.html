@@ -58,4 +58,29 @@
   </form>
   {% endif %}
 </div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h3 style="margin:0">Rows</h3>
+    <a href="/admin/jobs/{{ job.job_id }}/logs" target="_blank">View all logs →</a>
+  </div>
+  <table style="margin-top:12px">
+    <thead><tr><th>Row</th><th>Status</th><th>Videos</th><th>Logs</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.row_num }}</td>
+        <td>
+          <span class="badge badge-{{ r.status }}">{{ r.status }}</span>
+          {% if r.error %}<div class="label" style="font-size:11px">{{ r.error[:140] }}</div>{% endif %}
+        </td>
+        <td>{{ r.video_urls|length }}</td>
+        <td><a href="/admin/jobs/{{ job.job_id }}/logs?row={{ r.row_num }}" target="_blank">logs →</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="4" class="empty">No rows recorded.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endblock %}

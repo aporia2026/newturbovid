@@ -28,6 +28,7 @@ from bulkvid.logging import configure_logging, get_logger
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runtime_settings import registry_defaults
 from bulkvid.orchestrator.settings_store import SettingsStore
+from bulkvid.tunnel import TunnelManager
 from bulkvid.routes import admin as admin_routes
 from bulkvid.routes import health as health_routes
 from bulkvid.routes import jobs as jobs_routes
@@ -51,6 +52,9 @@ async def lifespan(app: FastAPI) -> Any:
     app.state.queue = queue
     app.state.settings_store = settings_store
     app.state.verifier = build_verifier_from_settings(settings)
+    # Local-dev only: manages the cloudflared quick tunnel for the admin panel.
+    # No-op in production (no cloudflared installed).
+    app.state.tunnel = TunnelManager(settings.BULKVID_PORT, data_dir)
 
     _log.info(
         "service_start",

@@ -23,6 +23,8 @@ Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5, §11, §15 Appendix C
 from __future__ import annotations
 
 import asyncio
+import math
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -37,6 +39,10 @@ _log = get_logger("rendi")
 # cost is small. This is the rough amortized estimate for one ~10s job
 # (plan §11; refresh before each release).
 COST_RENDI_COMMAND_USD = 0.01
+
+# Auto-retry transient Rendi failures (timeouts / network) this many extra times.
+# Genuine ffmpeg failures and auth errors are NOT retried.
+RENDI_RETRIES = 2
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -104,6 +110,41 @@ def dimensions_for_ratio(aspect_ratio: str) -> tuple[int, int]:
     return DEFAULT_DIMENSIONS_BY_RATIO["9:16"]
 
 
+# Aspect-ratio strings accepted by the kie image models (nano-banana-2 / gpt-image-2).
+VALID_RATIO_STRINGS: frozenset[str] = frozenset(
+    {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+)
+
+
+def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
+    """Map a sheet-entered size to a valid model ``aspect_ratio`` string.
+
+    Handles ``09:16`` (Sheets time-cast), ``9:16``, and ``WxH`` pixel inputs
+    (reduced via GCD). Falls back to ``default`` for anything unrecognised, so
+    the image model never receives a value it would reject or treat as ``auto``.
+    """
+    s = (aspect_ratio or "").strip().lower()
+    if not s or s == "auto":
+        return default
+
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            norm = f"{int(parts[0])}:{int(parts[1])}"
+            return norm if norm in VALID_RATIO_STRINGS else default
+
+    if "x" in s:
+        parts = s.split("x")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            w, h = int(parts[0]), int(parts[1])
+            if w > 0 and h > 0:
+                g = math.gcd(w, h)
+                norm = f"{w // g}:{h // g}"
+                return norm if norm in VALID_RATIO_STRINGS else default
+
+    return default
+
+
 # ── FFmpeg command templates ─────────────────────────────────────────────────
 # ``__W__`` / ``__H__`` are OUR placeholders (substituted before send).
 # ``{{in_N}}`` / ``{{out_N}}`` are Rendi's (kept literal so Rendi can substitute).
@@ -119,10 +160,30 @@ _RESIZE_TEMPLATE = (
 )
 
 
+# Voiceover playback speed. Gemini TTS has no rate control and reads slowly, so
+# we speed the audio up (pitch-preserved via ffmpeg ``atempo``). 1.0 = original;
+# 1.3 ≈ 30% faster. Tune here (admin-surfaced later).
+SPEECH_ATEMPO = 1.3
+
+# Length of a video when Voice Over = No (silent image video). Tunable.
+NO_VO_VIDEO_SECONDS = 10
+
+# Image-only -> silent video of __SECS__ seconds at the target aspect. No audio
+# (-an), no atempo (nothing to speed up).
+_SILENT_VIDEO_TEMPLATE = (
+    "-loop 1 -framerate 30 -t __SECS__ -i {{in_1}} "
+    '-vf "scale=__W__:__H__:force_original_aspect_ratio=increase,crop=__W__:__H__" '
+    "-c:v libx264 -tune stillimage -pix_fmt yuv420p -an {{out_1}}"
+)
+
 _STILLS_TO_VIDEO_TEMPLATE = (
     "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
+    # Force the requested aspect (cover + center-crop to __W__x__H__) and cap
+    # the duration at 15s (trims trailing silence; -shortest stops earlier).
+    '-vf "scale=__W__:__H__:force_original_aspect_ratio=increase,crop=__W__:__H__" '
+    '-filter:a "atempo=__TEMPO__" '
     "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
-    "-c:a aac -b:a 192k -shortest {{out_1}}"
+    "-c:a aac -b:a 192k -t 15 -shortest {{out_1}}"
 )
 
 
@@ -139,12 +200,49 @@ def render_resize_command(width: int, height: int) -> str:
     return _RESIZE_TEMPLATE.replace("__W__", str(width)).replace("__H__", str(height))
 
 
-def render_stills_to_video_command() -> str:
-    return _STILLS_TO_VIDEO_TEMPLATE
+def render_stills_to_video_command(
+    width: int = 1080, height: int = 1920, tempo: float = SPEECH_ATEMPO
+) -> str:
+    return (
+        _STILLS_TO_VIDEO_TEMPLATE
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
+        .replace("__TEMPO__", str(tempo))
+    )
+
+
+def render_silent_video_command(
+    width: int = 1080, height: int = 1920, seconds: int = NO_VO_VIDEO_SECONDS
+) -> str:
+    return (
+        _SILENT_VIDEO_TEMPLATE
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
+        .replace("__SECS__", str(seconds))
+    )
 
 
 def render_music_mix_command() -> str:
     return _MUSIC_MIX_TEMPLATE
+
+
+# ── Result ───────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RendiOutput:
+    """Output of a high-level Rendi helper (``resize_image`` etc.).
+
+    ``command_id`` is exposed so callers can delete the command's stored files
+    once the output has been copied into our own storage. Rendi keeps outputs
+    indefinitely and counts them against the account storage quota, so the
+    Rendi copy is dead weight the moment a row is persisted (see
+    ``delete_command_files`` / ``cleanup_commands``).
+    """
+
+    url: str
+    cost_usd: float
+    command_id: str
 
 
 # ── Client ───────────────────────────────────────────────────────────────────
@@ -295,26 +393,65 @@ class RendiClient:
 
     # ── High-level helpers ─────────────────────────────────────────────────
 
+    async def _submit_and_poll(
+        self,
+        ffmpeg_command: str,
+        input_files: dict[str, str],
+        output_files: dict[str, str],
+        *,
+        max_attempts: int,
+        delay_seconds: float,
+        retries: int = RENDI_RETRIES,
+        retry_backoff_seconds: float = 5.0,
+    ) -> tuple[str, str]:
+        """Submit + poll one command, auto-retrying transient failures.
+
+        Re-submits a fresh command on timeouts / transient submit-poll errors.
+        Does NOT retry genuine ffmpeg failures or auth errors (a retry would
+        just repeat them). Returns ``(output_url, command_id)``.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                command_id = await self.submit(ffmpeg_command, input_files, output_files)
+                url = await self.poll(
+                    command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+                )
+                return url, command_id
+            except (RendiAuthError, RendiCommandFailedError):
+                raise
+            except (RendiTimeoutError, RendiError) as e:
+                last_exc = e
+                if attempt < retries:
+                    _log.warning(
+                        "rendi_retry", attempt=attempt + 1, total=retries + 1,
+                        error=str(e)[:200],
+                    )
+                    await asyncio.sleep(retry_backoff_seconds)
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
     async def resize_image(
         self,
         source_url: str,
         aspect_ratio: str,
         output_filename: str = "out.png",
         *,
-        max_attempts: int = 30,
+        max_attempts: int = 120,
         delay_seconds: float = 5.0,
-    ) -> tuple[str, float]:
-        """Apply blurred-background-fit resize to ``aspect_ratio``. Returns ``(url, cost_usd)``."""
+    ) -> RendiOutput:
+        """Apply blurred-background-fit resize to ``aspect_ratio`` (auto-retried)."""
         width, height = dimensions_for_ratio(aspect_ratio)
-        command_id = await self.submit(
-            ffmpeg_command=render_resize_command(width, height),
-            input_files={"in_1": source_url},
-            output_files={"out_1": output_filename},
+        url, command_id = await self._submit_and_poll(
+            render_resize_command(width, height),
+            {"in_1": source_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
         )
-        url = await self.poll(
-            command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
-        )
-        return url, COST_RENDI_COMMAND_USD
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
 
     async def stills_to_video(
         self,
@@ -322,19 +459,41 @@ class RendiClient:
         audio_url: str,
         output_filename: str = "out.mp4",
         *,
-        max_attempts: int = 30,
+        aspect_ratio: str = "9:16",
+        max_attempts: int = 120,
         delay_seconds: float = 5.0,
-    ) -> tuple[str, float]:
-        """Build an MP4 from one image + one audio file. Returns ``(url, cost_usd)``."""
-        command_id = await self.submit(
-            ffmpeg_command=render_stills_to_video_command(),
-            input_files={"in_1": image_url, "in_2": audio_url},
-            output_files={"out_1": output_filename},
+    ) -> RendiOutput:
+        """Build an MP4 from one image + one audio file, forced to ``aspect_ratio`` (auto-retried)."""
+        width, height = dimensions_for_ratio(aspect_ratio)
+        url, command_id = await self._submit_and_poll(
+            render_stills_to_video_command(width, height),
+            {"in_1": image_url, "in_2": audio_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
         )
-        url = await self.poll(
-            command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def image_to_silent_video(
+        self,
+        image_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        aspect_ratio: str = "9:16",
+        seconds: int = NO_VO_VIDEO_SECONDS,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Build a SILENT MP4 from one image (Voice Over = No), forced to ``aspect_ratio`` (auto-retried)."""
+        width, height = dimensions_for_ratio(aspect_ratio)
+        url, command_id = await self._submit_and_poll(
+            render_silent_video_command(width, height, seconds),
+            {"in_1": image_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
         )
-        return url, COST_RENDI_COMMAND_USD
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
 
     async def mix_music(
         self,
@@ -342,19 +501,60 @@ class RendiClient:
         music_url: str,
         output_filename: str = "out.mp4",
         *,
-        max_attempts: int = 30,
+        max_attempts: int = 120,
         delay_seconds: float = 5.0,
-    ) -> tuple[str, float]:
-        """Mix background music (30%) under existing video audio (100%). Returns ``(url, cost_usd)``."""
-        command_id = await self.submit(
-            ffmpeg_command=render_music_mix_command(),
-            input_files={"in_1": video_url, "in_2": music_url},
-            output_files={"out_1": output_filename},
+    ) -> RendiOutput:
+        """Mix background music (30%) under existing video audio (100%) (auto-retried)."""
+        url, command_id = await self._submit_and_poll(
+            render_music_mix_command(),
+            {"in_1": video_url, "in_2": music_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
         )
-        url = await self.poll(
-            command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    # ── Cleanup ────────────────────────────────────────────────────────────
+
+    async def delete_command_files(self, command_id: str) -> None:
+        """Delete all stored output files for one command.
+
+        Rendi keeps command outputs indefinitely and counts them against the
+        account storage quota (``DELETE /v1/commands/{id}/files``). We re-upload
+        every finished asset to our own storage, so the Rendi copy is dead
+        weight once a row is persisted. A 404 is treated as already-gone.
+        Raises ``RendiError`` on any other unexpected status.
+        """
+        url = f"{self._base_url}/v1/commands/{command_id}/files"
+        resp = await self._client.delete(url, headers=self._headers)
+        if resp.status_code in (200, 204, 404):
+            _log.info(
+                "rendi_files_deleted", command_id=command_id, status=resp.status_code
+            )
+            return
+        if resp.status_code == 401:
+            raise RendiAuthError("Rendi 401 — invalid X-API-KEY")
+        raise RendiError(
+            f"Rendi delete files HTTP {resp.status_code}: {resp.text[:200]}"
         )
-        return url, COST_RENDI_COMMAND_USD
+
+    async def cleanup_commands(self, command_ids: list[str]) -> None:
+        """Best-effort: free each command's stored files. Never raises.
+
+        Called by the row processors once a row's assets are safely in our own
+        storage. A cleanup failure must never fail an otherwise-successful row,
+        so every error here is logged and swallowed.
+        """
+
+        async def _one(command_id: str) -> None:
+            try:
+                await self.delete_command_files(command_id)
+            except Exception as e:    # best-effort — never propagate
+                _log.warning(
+                    "rendi_cleanup_failed", command_id=command_id, error=str(e)[:200]
+                )
+
+        await asyncio.gather(*[_one(c) for c in command_ids])
 
 
 def build_client_from_settings(settings: Settings | None = None) -> RendiClient:

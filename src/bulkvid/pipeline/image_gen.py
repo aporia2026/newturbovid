@@ -21,7 +21,8 @@ from bulkvid.adapters.atlascloud import (
 from bulkvid.adapters.kie import (
     KieClient,
     KieError,
-    nano_banana_edit,
+    gpt_image_2,
+    nano_banana_2,
 )
 from bulkvid.logging import get_logger
 
@@ -35,36 +36,51 @@ async def edit_with_fallback(
     source_image_url: str,
     prompt: str,
     aspect_ratio: str,
+    resolution: str = "2K",
 ) -> tuple[str, float]:
-    """Generate (or edit) an image. Try kie.ai first; on failure, AtlasCloud.
+    """Generate the 2x2 collage. Primary: Nano Banana 2. Fallback: GPT Image 2.
 
-    Returns ``(url, cost_usd)``. Raises if both fail.
+    Both run through kie.ai. Nano Banana 2 honors ``aspect_ratio`` and renders
+    legible marketing text; GPT Image 2 (image-to-image) is the fallback for
+    the same reasons. AtlasCloud stays as a last resort when configured.
+    Returns ``(url, cost_usd)``. Raises if every backend fails.
     """
     try:
-        url, cost = await nano_banana_edit(
+        return await nano_banana_2(
             kie,
             source_image_url=source_image_url,
             prompt=prompt,
             aspect_ratio=aspect_ratio,
+            resolution=resolution,
         )
+    except KieError as nb2_err:
+        _log.warning("nano_banana_2_failed_falling_back", error=str(nb2_err)[:200])
+
+    try:
+        url, cost = await gpt_image_2(
+            kie,
+            source_image_url=source_image_url,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+        _log.info("gpt_image_2_fallback_used", source="nano_banana_2_failure")
         return url, cost
-    except KieError as kie_err:
+    except KieError as gpt_err:
         if atlas is None:
             raise
-        _log.warning(
-            "kie_failed_falling_back_to_atlas",
-            error=str(kie_err)[:200],
-        )
+        _log.warning("gpt_image_2_failed_falling_back_to_atlas", error=str(gpt_err)[:200])
         try:
             url, cost = await atlas.edit_image(
                 source_image_url=source_image_url,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
             )
-            _log.info("atlas_fallback_used", source="kie_failure")
+            _log.info("atlas_fallback_used", source="gpt_image_2_failure")
             return url, cost
         except AtlasError as atlas_err:
             raise KieError(
-                f"kie.ai AND AtlasCloud both failed. "
-                f"kie={kie_err!s} | atlas={atlas_err!s}"
+                f"All image backends failed. "
+                f"nano-banana-2 + gpt-image-2 (kie) and AtlasCloud. "
+                f"gpt-image-2={gpt_err!s} | atlas={atlas_err!s}"
             ) from atlas_err

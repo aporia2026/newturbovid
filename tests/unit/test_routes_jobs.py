@@ -31,6 +31,7 @@ from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
+    TAB_SIMPLE,
     JobQueue,
 )
 from bulkvid.routes import jobs as jobs_routes
@@ -131,6 +132,28 @@ def _four_images_payload() -> dict:
     }
 
 
+def _simple_payload() -> dict:
+    return {
+        "sheet_id": "sheet-S",
+        "worksheet": "simple",
+        "tab_type": TAB_SIMPLE,
+        "rows_simple": [
+            {
+                "row_num": 2,
+                "country": "MX",
+                "vertical": "automotive",
+                "article_url": "https://example.com/article",
+                "manual_image_url": "https://example.com/ad.png",
+                "voice_over": True,
+                "zapcap": False,
+                "aspect_ratio": "9:16",
+                "script_pattern": "How To",
+                "open_comments": "",
+            }
+        ],
+    }
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -175,6 +198,21 @@ def test_submit_four_images_returns_job_id(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["row_count"] == 1
+
+
+def test_submit_simple_returns_job_id(client: TestClient) -> None:
+    r = client.post("/jobs", json=_simple_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["row_count"] == 1
+
+
+def test_submit_simple_without_rows_returns_400(client: TestClient) -> None:
+    payload = _simple_payload()
+    payload["rows_simple"] = []
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
 
 
 def test_submit_image_vo_without_rows_returns_400(client: TestClient) -> None:
