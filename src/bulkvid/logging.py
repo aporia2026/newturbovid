@@ -120,3 +120,46 @@ def get_logger(namespace: str) -> structlog.stdlib.BoundLogger:
     Use one namespace per stage. See the plan §8 for the canonical list.
     """
     return structlog.get_logger().bind(ns=f"bulkvid {namespace}")
+
+
+# ── Reading per-job logs ──────────────────────────────────────────────────────
+
+
+def _format_log_line(raw: str) -> str:
+    """Turn one stored JSON log line into a compact readable string."""
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return raw
+    ts = str(d.get("timestamp", ""))[11:19]
+    lvl = str(d.get("level", "")).upper()[:4]
+    event = d.get("event", "")
+    skip = {"timestamp", "level", "event", "ns", "batch_id", "row_num", "user_email"}
+    kv = " ".join(f"{k}={v}" for k, v in d.items() if k not in skip)
+    return f"{ts} {lvl:<4} {event} {kv}".rstrip()
+
+
+def read_job_log_lines(
+    job_id: str, *, row: int | None = None, tail: int = 300
+) -> tuple[list[str], bool]:
+    """Read a per-job log file, newest ``tail`` lines last, optionally filtered
+    to a single ``row``. Returns ``(formatted_lines, file_exists)``.
+
+    Shared by the admin log viewer and the token-gated sidebar log endpoint so
+    the path-sanitising and JSON formatting live in one place.
+    """
+    safe = str(job_id).replace("/", "_").replace("\\", "_").replace("..", "_")
+    path = Path(get_settings().BULKVID_DATA_DIR) / "logs" / f"{safe}.log"
+    if not path.exists():
+        return [], False
+    lines: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if row is not None:
+            try:
+                if int(json.loads(raw).get("row_num", -1)) != row:
+                    continue
+            except Exception:
+                continue
+        lines.append(_format_log_line(raw))
+    tail = max(1, min(tail, 2000))
+    return lines[-tail:], True

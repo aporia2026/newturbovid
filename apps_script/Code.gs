@@ -293,26 +293,18 @@ function _submitJobForRowNums(sheet, tabType, rowNums) {
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else payload.rows_image_vo = rows;
 
-  const backendUrl = _getBackendUrl();
-  const resp = UrlFetchApp.fetch(backendUrl + '/jobs', {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { 'Authorization': 'Bearer ' + idToken },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
-
-  const code = resp.getResponseCode();
-  const text = resp.getContentText();
-
-  if (code < 200 || code >= 300) {
-    SpreadsheetApp.getUi().alert(
-      'Submit failed (HTTP ' + code + '):\n' + text.substring(0, 500)
-    );
+  var body;
+  try {
+    body = _fetchJson('/jobs', {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+    });
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Submit failed:\n' + String((e && e.message) || e));
     return;
   }
 
-  const body = JSON.parse(text);
   PropertiesService.getDocumentProperties().setProperty('LAST_JOB_ID', body.job_id);
 
   var message = 'Job submitted: ' + body.job_id + '\n' +
@@ -334,21 +326,62 @@ function showJobsSidebar() {
 }
 
 
+/** Authenticated fetch with retry. Retries up to 3 times on 5xx / network
+ *  errors with a short backoff, so a transient backend blip self-heals instead
+ *  of surfacing in the sidebar as an error. 4xx are real (auth / not-found) and
+ *  are NOT retried. Returns parsed JSON (or null for an empty body); throws with
+ *  a readable message after exhausting retries. */
+function _fetchJson(path, options) {
+  const backendUrl = _getBackendUrl();
+  const opts = options || {};
+  opts.headers = opts.headers || {};
+  opts.headers['Authorization'] = 'Bearer ' + ScriptApp.getIdentityToken();
+  opts.muteHttpExceptions = true;
+
+  var lastErr = '';
+  for (var attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = UrlFetchApp.fetch(backendUrl + path, opts);
+      const code = resp.getResponseCode();
+      const text = resp.getContentText();
+      if (code >= 200 && code < 300) {
+        return text ? JSON.parse(text) : null;
+      }
+      if (code >= 400 && code < 500) {
+        throw new Error('HTTP ' + code + ': ' + text.substring(0, 200));
+      }
+      lastErr = 'HTTP ' + code + ': ' + text.substring(0, 200);
+    } catch (e) {
+      lastErr = String((e && e.message) || e);
+    }
+    if (attempt < 3) Utilities.sleep(600 * attempt);    // 0.6s, then 1.2s
+  }
+  throw new Error(lastErr || 'request failed');
+}
+
+
 /** Called from Sidebar.html: list this user's jobs (active + finished archive).
  *  Backed by GET /jobs, which returns the full job history. The sidebar splits
  *  them into Active (queued/running) and Archive (completed/failed/killed). */
 function listJobs() {
-  const backendUrl = _getBackendUrl();
-  const idToken = ScriptApp.getIdentityToken();
-  const resp = UrlFetchApp.fetch(backendUrl + '/jobs?limit=100', {
-    headers: { 'Authorization': 'Bearer ' + idToken },
-    muteHttpExceptions: true,
-  });
-  const code = resp.getResponseCode();
-  if (code < 200 || code >= 300) {
-    throw new Error('HTTP ' + code + ': ' + resp.getContentText().substring(0, 200));
-  }
-  return JSON.parse(resp.getContentText());
+  return _fetchJson('/jobs?limit=100', { method: 'get' });
+}
+
+
+/** Called from Sidebar.html: per-row status for one job (row_num, status,
+ *  video_urls, error) so the sidebar shows live per-row progress. */
+function getJobRows(jobId) {
+  if (!jobId) return { job_id: '', rows: [] };
+  return _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/rows', { method: 'get' });
+}
+
+
+/** Called from Sidebar.html: tail of a job's log (optionally one row). */
+function getJobLog(jobId, rowNum) {
+  if (!jobId) return { job_id: '', exists: false, lines: [] };
+  var path = '/jobs/' + encodeURIComponent(jobId) + '/log?tail=200';
+  if (rowNum) path += '&row=' + encodeURIComponent(rowNum);
+  return _fetchJson(path, { method: 'get' });
 }
 
 
@@ -356,13 +389,10 @@ function listJobs() {
  *  killing one never cancels another. */
 function killJob(jobId) {
   if (!jobId) return { ok: false, error: 'no job id' };
-  const backendUrl = _getBackendUrl();
-  const idToken = ScriptApp.getIdentityToken();
-  const resp = UrlFetchApp.fetch(backendUrl + '/jobs/' + jobId + '/kill', {
-    method: 'post',
-    headers: { 'Authorization': 'Bearer ' + idToken },
-    muteHttpExceptions: true,
-  });
-  const code = resp.getResponseCode();
-  return (code >= 200 && code < 300) ? { ok: true } : { ok: false, error: 'HTTP ' + code };
+  try {
+    _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/kill', { method: 'post' });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
 }

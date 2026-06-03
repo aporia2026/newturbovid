@@ -24,20 +24,33 @@
     .progress-bar { width: 100%; height: 6px; background: #e8eaed; border-radius: 3px; margin: 6px 0; overflow: hidden; }
     .progress-bar-fill { height: 100%; background: #1a73e8; transition: width 0.3s ease; }
     .empty { color: #5f6368; font-style: italic; padding: 8px 0; }
-    .error { color: #d93025; padding: 8px; border: 1px solid #fce8e6; border-radius: 4px; }
     .arch { border-bottom: 1px solid #eee; padding: 6px 0; font-size: 12px; }
     .arch .top { display: flex; justify-content: space-between; }
     button { padding: 5px 9px; border: 1px solid #dadce0; background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; color: #1a73e8; }
     button:hover { background: #f8f9fa; }
     button.danger { color: #d93025; }
-    .small { font-size: 11px; color: #5f6368; margin-top: 8px; }
+    .small { font-size: 11px; color: #5f6368; margin-top: 4px; }
+    .summary-line { font-size: 12px; color: #5f6368; margin: 2px 0 6px 0; }
+    .reconnect { color: #b06000; }
     details { margin-top: 6px; }
     summary { cursor: pointer; color: #1a73e8; font-size: 12px; }
+    .rows { margin: 6px 0 2px 0; border-top: 1px dashed #e8eaed; padding-top: 4px; }
+    .rowline { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0; font-size: 12px; }
+    .rowline a { color: #1e8e3e; }
+    .rs-done       { color: #1e8e3e; text-align: right; }
+    .rs-failed     { color: #d93025; text-align: right; word-break: break-word; }
+    .rs-processing { color: #1a73e8; }
+    .rs-pending    { color: #5f6368; }
+    .logwrap { margin-top: 6px; }
+    .logbar { margin-bottom: 4px; }
+    pre.log { background: #202124; color: #e8eaed; font-size: 11px; padding: 8px; border-radius: 4px;
+              max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
   </style>
 </head>
 <body>
   <h3>Aporia Bulk Video</h3>
   <div class="small" id="last-update"></div>
+  <div class="summary-line" id="summary"></div>
 
   <h4>Active</h4>
   <div id="active"><div class="empty">Loading…</div></div>
@@ -50,24 +63,20 @@
   <div style="margin-top: 12px;"><button onclick="refresh()">Refresh now</button></div>
 
   <script>
-    var ACTIVE = {queued: 1, running: 1};
+    var ACTIVE = { queued: 1, running: 1 };
 
-    function refresh() {
-      google.script.run.withSuccessHandler(render).withFailureHandler(renderError).listJobs();
-    }
+    // Caches so re-rendering on each poll never flashes empty: per-row status
+    // and log text persist between polls and refresh in place.
+    var _lastJobs = null;
+    var _rowsCache = {};
+    var _logCache = {};
+    var _openLogs = {};
+    var _failCount = 0;
+    var _timer = null;
 
-    function killJob(jobId) {
-      if (!confirm('Kill job ' + jobId + '?\n\nThis only stops THIS job — other running jobs are unaffected.')) return;
-      google.script.run
-        .withSuccessHandler(function (r) {
-          if (!(r && r.ok)) alert('Could not kill: ' + (r && r.error || 'unknown'));
-          refresh();
-        })
-        .withFailureHandler(renderError)
-        .killJob(jobId);
+    function _escape(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
-    // Exposed for inline onclick handlers.
-    window.killJob = killJob;
 
     function _pct(j) {
       var total = j.row_count || 0;
@@ -75,12 +84,109 @@
       return total ? Math.round((done / total) * 100) : 0;
     }
 
+    // ── Polling (adaptive, never blanks the panel on a transient failure) ──
+
+    function refresh() {
+      google.script.run.withSuccessHandler(onJobs).withFailureHandler(onFail).listJobs();
+    }
+
+    function onJobs(jobs) {
+      _failCount = 0;
+      _lastJobs = jobs || [];
+      render(_lastJobs, null);
+      scheduleNext();
+    }
+
+    function onFail(err) {
+      _failCount++;
+      // Keep the last good data on screen; just note we are reconnecting.
+      render(_lastJobs || [], err || true);
+      scheduleNext();
+    }
+
+    function scheduleNext() {
+      if (_timer) clearTimeout(_timer);
+      var active = (_lastJobs || []).some(function (j) { return ACTIVE[j.status]; });
+      _timer = setTimeout(refresh, active ? 3000 : 12000);
+    }
+
+    // ── Rendering ──────────────────────────────────────────────────────────
+
+    function render(jobs, err) {
+      jobs = jobs || [];
+      var active = jobs.filter(function (j) { return ACTIVE[j.status]; });
+      var archive = jobs.filter(function (j) { return !ACTIVE[j.status]; });
+
+      var now = new Date().toLocaleTimeString();
+      document.getElementById('last-update').innerHTML = err
+        ? '<span class="reconnect">' +
+            (_failCount >= 3 ? 'Connection problems, retrying…' : 'Reconnecting…') +
+          '</span> · last ' + now
+        : 'Updated ' + now;
+
+      var remaining = active.reduce(function (n, j) {
+        return n + Math.max(0, (j.row_count || 0) - (j.completed_rows || 0) - (j.failed_rows || 0));
+      }, 0);
+      document.getElementById('summary').textContent =
+        active.length ? (active.length + ' active · ' + remaining + ' rows remaining') : '';
+
+      document.getElementById('active').innerHTML = active.length
+        ? active.map(_activeCard).join('')
+        : '<div class="empty">No active jobs. Submit one from the menu.</div>';
+
+      document.getElementById('archive').innerHTML = archive.length
+        ? archive.map(_archRow).join('')
+        : '<div class="empty">No finished jobs yet.</div>';
+
+      // Pull live per-row status for running jobs; refresh any open log panes.
+      active.forEach(function (j) {
+        if (j.status === 'running') loadRowsFor(j.job_id);
+        if (_openLogs[j.job_id]) loadLogFor(j.job_id);
+      });
+    }
+
+    function _rowsHtml(rows) {
+      if (!rows) return '<div class="small">Loading rows…</div>';
+      if (!rows.length) return '<div class="small">No rows.</div>';
+      return rows.map(function (r) {
+        var st = r.status || 'pending';
+        var right;
+        if (st === 'done') {
+          right = (r.video_urls && r.video_urls.length)
+            ? r.video_urls.map(function (u, i) {
+                return '<a href="' + u + '" target="_blank">video' +
+                       (r.video_urls.length > 1 ? (i + 1) : '') + '</a>';
+              }).join(' ')
+            : 'done';
+        } else if (st === 'failed') {
+          right = _escape(r.error ? String(r.error).substring(0, 140) : 'failed');
+        } else if (st === 'processing') {
+          right = 'working…';
+        } else {
+          right = st;
+        }
+        return '<div class="rowline"><span class="value">Row ' + r.row_num + '</span>' +
+               '<span class="rs-' + st + '">' + right + '</span></div>';
+      }).join('');
+    }
+
+    function _logInner(jid) {
+      var bar = '<div class="logbar"><button onclick="loadLogFor(\'' + jid + '\')">Refresh logs</button></div>';
+      if (_logCache[jid] == null) return bar + '<div class="small">Loading logs…</div>';
+      return bar + '<pre class="log">' + _escape(_logCache[jid]) + '</pre>';
+    }
+
     function _activeCard(j) {
+      var jid = j.job_id;
       var pct = _pct(j);
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
+      var open = !!_openLogs[jid];
+      var rowsBlock = (j.status === 'running')
+        ? '<div class="rows" id="rows-' + jid + '">' + _rowsHtml(_rowsCache[jid]) + '</div>'
+        : '<div class="rows"><div class="small">Waiting in queue…</div></div>';
       return '' +
         '<div class="job">' +
-          '<div class="job-id">' + j.job_id + ' · ' + (j.worksheet || '') + '</div>' +
+          '<div class="job-id">' + jid + ' · ' + (j.worksheet || '') + '</div>' +
           '<div class="row"><span class="label">Status</span>' +
             '<span class="value status-' + j.status + '">' + j.status + '</span></div>' +
           '<div class="progress-bar"><div class="progress-bar-fill" style="width:' + pct + '%"></div></div>' +
@@ -88,14 +194,23 @@
           '<div class="row"><span class="label">Succeeded</span><span class="value" style="color:#1e8e3e">' + (j.completed_rows || 0) + '</span></div>' +
           '<div class="row"><span class="label">Failed</span><span class="value" style="color:#d93025">' + (j.failed_rows || 0) + '</span></div>' +
           '<div class="row"><span class="label">Cost</span><span class="value">$' + (j.cost_usd || 0).toFixed(4) + '</span></div>' +
-          '<div style="margin-top:6px"><button class="danger" onclick="killJob(\'' + j.job_id + '\')">Kill job</button></div>' +
+          rowsBlock +
+          '<div style="margin-top:6px">' +
+            '<button class="danger" onclick="killJob(\'' + jid + '\')">Kill job</button> ' +
+            '<button onclick="toggleLog(\'' + jid + '\')">' + (open ? 'Hide logs' : 'View logs') + '</button>' +
+          '</div>' +
+          '<div class="logwrap" id="log-' + jid + '" style="display:' + (open ? 'block' : 'none') + '">' +
+            (open ? _logInner(jid) : '') +
+          '</div>' +
         '</div>';
     }
 
     function _archRow(j) {
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
       var when = (j.finished_at || j.created_at || '').replace('T', ' ').substring(0, 19);
-      var err = j.error ? '<div class="row"><span class="label">Error</span><span class="value" style="color:#d93025">' + String(j.error).substring(0, 80) + '</span></div>' : '';
+      var err = j.error
+        ? '<div class="row"><span class="label">Error</span><span class="value" style="color:#d93025">' + _escape(String(j.error).substring(0, 80)) + '</span></div>'
+        : '';
       return '' +
         '<div class="arch">' +
           '<div class="top"><span class="status-' + j.status + '">' + j.status + '</span>' +
@@ -105,28 +220,65 @@
         '</div>';
     }
 
-    function render(jobs) {
-      document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
-      jobs = jobs || [];
-      var active = jobs.filter(function (j) { return ACTIVE[j.status]; });
-      var archive = jobs.filter(function (j) { return !ACTIVE[j.status]; });
+    // ── Async detail loaders (failures are silent; cached data stays) ────────
 
-      document.getElementById('active').innerHTML = active.length
-        ? active.map(_activeCard).join('')
-        : '<div class="empty">No active jobs. Submit one from the menu.</div>';
-
-      document.getElementById('archive').innerHTML = archive.length
-        ? archive.map(_archRow).join('')
-        : '<div class="empty">No finished jobs yet.</div>';
+    function loadRowsFor(jid) {
+      google.script.run
+        .withSuccessHandler(function (res) {
+          _rowsCache[jid] = (res && res.rows) || [];
+          var el = document.getElementById('rows-' + jid);
+          if (el) el.innerHTML = _rowsHtml(_rowsCache[jid]);
+        })
+        .withFailureHandler(function () { /* keep cached rows */ })
+        .getJobRows(jid);
     }
 
-    function renderError(err) {
-      document.getElementById('active').innerHTML =
-        '<div class="error">Error: ' + (err && err.message ? err.message : String(err)) + '</div>';
+    function loadLogFor(jid) {
+      google.script.run
+        .withSuccessHandler(function (res) {
+          var lines = (res && res.lines) || [];
+          _logCache[jid] = lines.length
+            ? lines.join('\n')
+            : (res && res.exists ? '(no log lines yet)' : '(no log file yet)');
+          var el = document.getElementById('log-' + jid);
+          if (el && _openLogs[jid]) {
+            el.innerHTML = _logInner(jid);
+            var pre = el.querySelector('pre');
+            if (pre) pre.scrollTop = pre.scrollHeight;
+          }
+        })
+        .withFailureHandler(function () { /* keep cached log */ })
+        .getJobLog(jid);
     }
+
+    function toggleLog(jid) {
+      _openLogs[jid] = !_openLogs[jid];
+      var el = document.getElementById('log-' + jid);
+      if (el) {
+        el.style.display = _openLogs[jid] ? 'block' : 'none';
+        el.innerHTML = _openLogs[jid] ? _logInner(jid) : '';
+      }
+      if (_openLogs[jid]) loadLogFor(jid);
+    }
+
+    function killJob(jobId) {
+      if (!confirm('Kill job ' + jobId + '?\n\nThis only stops THIS job — other running jobs are unaffected.')) return;
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (!(r && r.ok)) alert('Could not kill: ' + ((r && r.error) || 'unknown'));
+          refresh();
+        })
+        .withFailureHandler(function (e) { alert('Could not kill: ' + ((e && e.message) || e)); })
+        .killJob(jobId);
+    }
+
+    // Exposed for inline onclick handlers.
+    window.refresh = refresh;
+    window.killJob = killJob;
+    window.toggleLog = toggleLog;
+    window.loadLogFor = loadLogFor;
 
     refresh();
-    setInterval(refresh, 5000);
   </script>
 </body>
 </html>
