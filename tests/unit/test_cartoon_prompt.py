@@ -5,6 +5,8 @@ OpenAI is mocked via respx. Covers:
   - Malformed JSON -> generic fallback fills to num_ideas (row still ships)
   - Short plan (too few ideas) -> padded with fallback ideas
   - Voiceover word-cap backstop (deterministic, so VO never outruns the video)
+  - Permissive _coerce_ideas: alt key names, bare-string shots, shot padding
+  - Diagnostic raw_preview log when the planner returns an incomplete plan
   - image_prompt_for_shot composition (style preamble; consistency clause on chained)
 """
 
@@ -126,6 +128,113 @@ async def test_plan_drops_shot_short_ideas_then_pads() -> None:
     plan = await _run(bad_shape, num_ideas=2, num_shots=2)
     assert len(plan.ideas) == 2
     assert all(len(idea.shots) == 2 for idea in plan.ideas)
+
+
+@respx.mock
+async def test_plan_accepts_alt_voiceover_key() -> None:
+    # Live run 2026-06-03 #5 had _coerce_ideas reject all ideas, dropping the
+    # row to the generic fallback. Permissive shape accepts common alt key
+    # names so transient model drift doesn't trigger the cliff.
+    alt_shape = json.dumps(
+        {
+            "ideas": [
+                {
+                    "voice_over": "A short clean line about cars this spring.",
+                    "tone": "Warm.",
+                    "scenes": [
+                        {"description": "A person walks past a parked compact car.",
+                         "action": "slow pan left to right"},
+                        {"description": "Close-up of hands at a steering wheel.",
+                         "action": "subtle camera push-in"},
+                    ],
+                },
+                {
+                    "vo": "Buyers are checking prices before the weekend.",
+                    "delivery": "Calm.",
+                    "sequence": [
+                        {"visual": "A laptop on a kitchen table.", "movement": "static"},
+                        {"prompt": "A coffee mug beside the laptop.", "animation": "slow zoom"},
+                    ],
+                },
+            ]
+        }
+    )
+    plan = await _run(alt_shape)
+    assert len(plan.ideas) == 2
+    # Both ideas use alt keys but still produce real content (not fallback text).
+    assert "compact car" in plan.ideas[0].shots[0].scene
+    assert "kitchen table" in plan.ideas[1].shots[0].scene
+    # No idea ended up as the fallback ("Here's what you should know about ...").
+    assert all("you should know" not in idea.voiceover for idea in plan.ideas)
+
+
+@respx.mock
+async def test_plan_accepts_bare_string_shots() -> None:
+    # Some model outputs list scenes as bare strings instead of {scene, motion}.
+    # The permissive coercer should treat each string as a scene description
+    # and supply a default motion.
+    shape = json.dumps(
+        {
+            "ideas": [
+                {
+                    "voiceover": "A short line about cars.",
+                    "style_direction": "Warm.",
+                    "shots": [
+                        "A person walks past a compact car.",
+                        "Close-up of hands at a steering wheel.",
+                    ],
+                },
+                {
+                    "voiceover": "Another short line about cars.",
+                    "style_direction": "Calm.",
+                    "shots": [
+                        "A laptop on a kitchen table.",
+                        "A coffee mug beside the laptop.",
+                    ],
+                },
+            ]
+        }
+    )
+    plan = await _run(shape)
+    assert len(plan.ideas) == 2
+    assert plan.ideas[0].shots[0].scene == "A person walks past a compact car."
+    assert plan.ideas[0].shots[0].motion           # default motion supplied
+    assert all("you should know" not in idea.voiceover for idea in plan.ideas)
+
+
+@respx.mock
+async def test_plan_pads_short_shot_list_by_repeating_last() -> None:
+    # Model returned only 1 shot when 2 were requested. Old behavior: reject
+    # the whole idea -> fallback. New behavior: pad with a copy of the last
+    # valid shot so the idea ships with real content. (image-to-image chaining
+    # downstream keeps the visual cohesive.)
+    shape = json.dumps(
+        {
+            "ideas": [
+                {
+                    "voiceover": "Cars are cheaper this spring.",
+                    "style_direction": "Warm.",
+                    "shots": [
+                        {"scene": "A person walks past a compact car.",
+                         "motion": "slow pan"},
+                    ],
+                },
+                {
+                    "voiceover": "Buyers are checking prices.",
+                    "style_direction": "Calm.",
+                    "shots": [
+                        {"scene": "A laptop on a kitchen table.", "motion": "static"},
+                    ],
+                },
+            ]
+        }
+    )
+    plan = await _run(shape, num_ideas=2, num_shots=2)
+    assert len(plan.ideas) == 2
+    for idea in plan.ideas:
+        assert len(idea.shots) == 2
+        # Padded shot reuses the same scene as the previous (last-good) shot.
+        assert idea.shots[0].scene == idea.shots[1].scene
 
 
 @respx.mock

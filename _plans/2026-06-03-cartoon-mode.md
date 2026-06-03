@@ -302,3 +302,42 @@ Tests (12 cartoon-related, full suite 485 passing):
 Outstanding: live re-run to confirm the new tail feels like a dwell rather
 than dead air, and that the average video length now sits in the 5-7s range
 naturally rather than at the 6s floor.
+
+### 2026-06-04 — Planner robustness + log fix (pre-merge polish)
+
+Live run #6 confirmed the soft-tail / longer-VO change: 8.0s and 6.3s videos,
+both in band, ~0.3s audio fade on idea 1, ~0.8s dwell on idea 2. User
+confirmed both feel right. Two follow-ups landed before the merge to main:
+
+1. **`clamped` log field replaced with `clamp` ("floor" | "ceiling" | "none").**
+   The boolean only checked raw `effective` vs band; it read `False` even when
+   the `effective + tail` natural target hit the ceiling. The new tri-state
+   field reflects what actually happened to the natural target, so future
+   tuning has accurate signal.
+
+2. **`_coerce_ideas` made permissive (the 2026-06-03 run #5 fallback bug).**
+   That run hit `cartoon_plan_incomplete_filled got=0 wanted=2` — the planner
+   returned valid JSON but `_coerce_ideas` rejected every idea. Both ideas
+   fell through to the generic "Here's what you should know about X today"
+   fallback and shipped byte-identical VOs.
+
+   Fix: the coercer now tolerates common shape drift —
+   - voiceover under voiceover / voice_over / vo / line / script / narration
+   - shots under shots / scenes / sequence (and shots can be bare strings)
+   - scene under scene / description / visual / image / prompt
+   - motion under motion / action / animation / movement
+   - shot lists too short are padded by repeating the last valid shot
+     (image-to-image chaining downstream keeps the visual cohesive)
+   - shot lists too long are trimmed to num_shots
+   The generic fallback still fires when nothing usable can be salvaged.
+
+   New `cartoon_idea_rejected` debug log records the reason per rejected idea
+   (not_a_dict / no_voiceover / no_valid_shots) plus the model's top-level
+   keys, and `cartoon_plan_incomplete_filled` now carries a `raw_preview` of
+   the first 300 chars of the model response so the failure mode is visible
+   in production without re-running.
+
+Tests (+3, full suite 488):
+- alt voiceover/scene/motion keys round-trip cleanly (no fallback)
+- bare-string shots get default motion supplied
+- single-shot lists pad by repeating last shot (both shots == padded copy)

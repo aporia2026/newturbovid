@@ -220,22 +220,33 @@ async def process_cartoon_row(
                     # effective played length is shorter than the raw WAV. Target
                     # = effective VO + a small dwell, clamped into the band.
                     effective = tts.duration_seconds / SPEECH_ATEMPO
+                    natural_target = effective + VO_TAIL_SECONDS
                     target_video_seconds = min(
-                        max(effective + VO_TAIL_SECONDS, TARGET_VIDEO_MIN_SECONDS),
+                        max(natural_target, TARGET_VIDEO_MIN_SECONDS),
                         TARGET_VIDEO_MAX_SECONDS,
                     )
                     per_shot = min(
                         max(target_video_seconds / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
                         float(SEEDANCE_DURATION),
                     )
+                    # The flag reflects what actually happened to the natural
+                    # (effective + tail) target — "floor" means the dwell got
+                    # padded up, "ceiling" means the audio fade engaged.
+                    if natural_target < TARGET_VIDEO_MIN_SECONDS:
+                        clamp_state = "floor"
+                    elif natural_target > TARGET_VIDEO_MAX_SECONDS:
+                        clamp_state = "ceiling"
+                    else:
+                        clamp_state = "none"
                     _log.info(
                         "cartoon_vo_sized",
                         idea=idx + 1,
                         vo_raw_seconds=round(tts.duration_seconds, 3),
                         vo_effective_seconds=round(effective, 3),
+                        natural_target_seconds=round(natural_target, 3),
                         target_video_seconds=round(target_video_seconds, 3),
                         per_shot_seconds=round(per_shot, 3),
-                        clamped=(effective < TARGET_VIDEO_MIN_SECONDS) or (effective > TARGET_VIDEO_MAX_SECONDS),
+                        clamp=clamp_state,
                     )
 
                 # 4b. Scene images — shot 1 from text, shots 2+ chained on shot 1.
