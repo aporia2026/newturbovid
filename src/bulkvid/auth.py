@@ -137,8 +137,13 @@ class GoogleIdentityVerifier:
                 bearer_token,
                 signing_key,
                 algorithms=[signing_key.get("alg", "RS256")],
-                options={"verify_aud": False},      # plan §7: aud is the Apps Script project,
-                                                    # not a value the backend can pre-register
+                options={
+                    "verify_aud": False,        # plan §7: aud is the Apps Script project,
+                                                # not a value the backend can pre-register
+                    "verify_at_hash": False,    # Apps Script sends the ID token only (no
+                                                # access_token), so the at_hash binding check
+                                                # cannot run — signature + iss + allowlist stand.
+                },
                 issuer=list(GOOGLE_ISS_ALLOWED),
             )
         except JWTError as e:

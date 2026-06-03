@@ -160,6 +160,19 @@ async def test_admin_user_token_verifies(keys: _TestKeys) -> None:
     assert identity.is_admin is True
 
 
+async def test_id_token_with_at_hash_verifies(keys: _TestKeys) -> None:
+    # Apps Script's ScriptApp.getIdentityToken() mints an ID token carrying an
+    # at_hash claim but never sends the matching access_token. jose's default
+    # at_hash check would reject it ("No access_token provided ...") — verify we
+    # skip that binding and still accept on signature + iss + allowlist.
+    verifier = _build_verifier(keys)
+    token = _make_token(
+        keys.private_pem, email="bulk1@aporia.com", extra={"at_hash": "x7Hf9k2QmZ"}
+    )
+    identity = await verifier.verify(token)
+    assert identity.email == "bulk1@aporia.com"
+
+
 async def test_email_case_insensitive_match(keys: _TestKeys) -> None:
     verifier = _build_verifier(keys)
     token = _make_token(keys.private_pem, email="BULK1@APORIA.COM")
