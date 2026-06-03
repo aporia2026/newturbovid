@@ -7,10 +7,12 @@ is written back.
 
 Pipeline:
   1. Validate the manual image URL
-  2. Parallel: article fetch + resize the manual image to the aspect ratio
+  2. Article fetch
   3. language detect -> classify Open Comments -> script gen
   4. Gemini TTS -> upload VO
-  5. Rendi/ffmpeg stills_to_video (resized image + VO) -> 1 video
+  5. Rendi/ffmpeg image_to_video_fit (manual image + VO) -> 1 video, in ONE
+     command: blurred-background fit (no cropping of the ad's text/CTA) + the
+     voiceover muxed in. No separate resize call.
   6. Upload video to storage
   7. Free Rendi storage (best-effort)
   8. If ZapCap=Yes: caption the video
@@ -20,7 +22,6 @@ No kie.ai, no GPT-4o description, no collage method.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -32,7 +33,6 @@ from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
     STATUS_IMAGE_DOWNLOAD_FAILED,
-    STATUS_IMAGE_GEN_FAILED,
     STATUS_INTERNAL_ERROR,
     STATUS_STORAGE_FAILED,
     STATUS_SUCCESS,
@@ -127,45 +127,16 @@ async def process_simple_row(
         )
 
     try:
-        # ─── Stage 1+2 (parallel): article fetch + resize the manual image ───
+        # ─── Stage 2: article fetch ───
 
-        async def _fetch_article() -> str | Exception:
-            try:
-                art = await clients.article.fetch(row.article_url)
-                costs.article += art.cost_usd
-                metadata["article_chars"] = art.char_count
-                metadata["article_source"] = art.source
-                return art.content
-            except Exception as e:
-                return e
-
-        async def _resize() -> tuple[str, str] | Exception:
-            try:
-                out = await clients.rendi.resize_image(
-                    source_url=row.manual_image_url,
-                    aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
-                    output_filename="resized.png",
-                )
-                costs.resize += out.cost_usd
-                return out.url, out.command_id
-            except Exception as e:
-                return e
-
-        article_task = asyncio.create_task(_fetch_article())
-        resize_task = asyncio.create_task(_resize())
-
-        article_result = await article_task
-        if isinstance(article_result, Exception):
-            resize_task.cancel()
-            return _fail(
-                row, STATUS_ARTICLE_FETCH_FAILED, str(article_result), t0, costs, metadata
-            )
-        article_body: str = article_result
-
-        resize_result = await resize_task
-        if isinstance(resize_result, Exception):
-            return _fail(row, STATUS_IMAGE_GEN_FAILED, str(resize_result), t0, costs, metadata)
-        resized_url, resize_command_id = resize_result
+        try:
+            art = await clients.article.fetch(row.article_url)
+            costs.article += art.cost_usd
+            metadata["article_chars"] = art.char_count
+            metadata["article_source"] = art.source
+            article_body: str = art.content
+        except Exception as e:
+            return _fail(row, STATUS_ARTICLE_FETCH_FAILED, str(e), t0, costs, metadata)
 
         # ─── Stage 3: language detect -> classify -> script ───
 
@@ -218,19 +189,15 @@ async def process_simple_row(
             except Exception as e:
                 return _fail(row, STATUS_TTS_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 5: stills_to_video (resized image + VO) ───
+        # ─── Stage 5: one-shot image -> video (fit + VO in a single command) ───
 
         try:
-            aspect = normalize_aspect_ratio(row.aspect_ratio)
-            if vo_url is None:
-                video = await clients.rendi.image_to_silent_video(
-                    image_url=resized_url, output_filename="v1.mp4", aspect_ratio=aspect,
-                )
-            else:
-                video = await clients.rendi.stills_to_video(
-                    image_url=resized_url, audio_url=vo_url,
-                    output_filename="v1.mp4", aspect_ratio=aspect,
-                )
+            video = await clients.rendi.image_to_video_fit(
+                image_url=row.manual_image_url,
+                audio_url=vo_url,    # None -> silent clip
+                output_filename="v1.mp4",
+                aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+            )
             costs.rendi += video.cost_usd
         except Exception as e:
             return _fail(row, STATUS_VIDEO_ASSEMBLY_FAILED, str(e), t0, costs, metadata)
@@ -250,7 +217,7 @@ async def process_simple_row(
             return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
 
         # ─── Stage 6b: free Rendi storage (best-effort) ───
-        await clients.rendi.cleanup_commands([resize_command_id, video.command_id])
+        await clients.rendi.cleanup_commands([video.command_id])
 
         # ─── Stage 7 (optional): ZapCap ───
 

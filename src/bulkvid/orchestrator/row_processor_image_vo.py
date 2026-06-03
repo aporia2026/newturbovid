@@ -118,6 +118,16 @@ class _Costs:
         )
 
 
+class _StageError(Exception):
+    """Carries the RowResult status to report for a failed pipeline stage, so a
+    coroutine can fail with the right status (e.g. TTS vs script) and the caller
+    just reads ``.status``."""
+
+    def __init__(self, status: str, message: str) -> None:
+        self.status = status
+        super().__init__(message)
+
+
 # ── Public entrypoint ────────────────────────────────────────────────────────
 
 
@@ -236,8 +246,10 @@ async def process_image_vo_row(
             except Exception as e:
                 return e
 
-        async def _script_side() -> tuple[str, str, str] | Exception:
-            """Returns (script_text, style_direction, language)."""
+        async def _script_side() -> tuple[str, str, str, str | None] | _StageError:
+            """Script + TTS, run concurrently with image generation. Returns
+            (script_text, style_direction, language, vo_url). TTS overlaps the
+            (slower) image side instead of waiting for it to finish."""
             try:
                 lang = await detect_language(clients.openai, article_body)
                 costs.language += lang.cost_usd
@@ -260,9 +272,29 @@ async def process_image_vo_row(
                 metadata["open_comments_mode"] = analysis.mode.value
                 metadata["script_word_count"] = script.word_count
                 metadata["script_used_override"] = script.used_override
-                return script.script, script.style_direction, lang.language
             except Exception as e:
-                return e
+                return _StageError(STATUS_INTERNAL_ERROR, str(e))
+
+            if not row.voice_over:
+                return script.script, script.style_direction, lang.language, None
+
+            try:
+                tts_result = await clients.tts.synthesize(
+                    text=script.script, language=lang.language,
+                    style_prompt=script.style_direction, country=row.country,
+                )
+                costs.tts += tts_result.cost_usd
+                vo_upload = await clients.storage.upload_bytes(
+                    tts_result.wav_bytes,
+                    key=f"bulkvid/vo/{slug}/vo.wav",
+                    content_type="audio/wav",
+                )
+                costs.storage += vo_upload.cost_usd
+                metadata["vo_voice"] = tts_result.voice
+                metadata["vo_duration_seconds"] = round(tts_result.duration_seconds, 2)
+                return script.script, script.style_direction, lang.language, vo_upload.url
+            except Exception as e:
+                return _StageError(STATUS_TTS_FAILED, str(e))
 
         image_task = asyncio.create_task(_image_side())
         script_task = asyncio.create_task(_script_side())
@@ -273,9 +305,11 @@ async def process_image_vo_row(
         quadrants: list[bytes] = image_result
 
         script_result = await script_task
-        if isinstance(script_result, Exception):
-            return _fail(row, STATUS_INTERNAL_ERROR, str(script_result), t0, costs, metadata)
-        script_text, style_direction, language = script_result
+        if isinstance(script_result, _StageError):
+            return _fail(row, script_result.status, str(script_result), t0, costs, metadata)
+        # script_text/style_direction were consumed by TTS inside _script_side;
+        # only language (for ZapCap) and vo_url are needed downstream.
+        _script_text, _style_direction, language, vo_url = script_result
 
         # ─── Stage 7 (parallel): upload 4 quadrants ───
 
@@ -295,30 +329,8 @@ async def process_image_vo_row(
         except Exception as e:
             return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 9: TTS ───
-
-        if row.voice_over:
-            try:
-                tts_result = await clients.tts.synthesize(
-                    text=script_text, language=language, style_prompt=style_direction,
-                    country=row.country,
-                )
-                costs.tts += tts_result.cost_usd
-                vo_upload = await clients.storage.upload_bytes(
-                    tts_result.wav_bytes,
-                    key=f"bulkvid/vo/{slug}/vo.wav",
-                    content_type="audio/wav",
-                )
-                costs.storage += vo_upload.cost_usd
-                vo_url = vo_upload.url
-                metadata["vo_voice"] = tts_result.voice
-                metadata["vo_duration_seconds"] = round(tts_result.duration_seconds, 2)
-            except Exception as e:
-                return _fail(row, STATUS_TTS_FAILED, str(e), t0, costs, metadata)
-        else:
-            vo_url = None
-
         # ─── Stage 10 (parallel): Rendi stills_to_video x 4 ───
+        # (script + TTS already ran concurrently with image generation above)
 
         async def _make_video(idx: int, image_url: str) -> tuple[str, str]:
             aspect = normalize_aspect_ratio(row.aspect_ratio)

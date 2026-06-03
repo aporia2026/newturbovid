@@ -223,7 +223,7 @@ function generateSelected() {
     SpreadsheetApp.getUi().alert('No data rows selected. Click on a data row first.');
     return;
   }
-  _submitJobForRowNums(sheet, tabType, rowNums);
+  _submitJobForRowNums(sheet, tabType, rowNums, true);    // confirm before overwriting
 }
 
 
@@ -248,16 +248,17 @@ function generateAllUnprocessed() {
     ui.ButtonSet.OK_CANCEL
   );
   if (ok !== ui.Button.OK) return;
-  _submitJobForRowNums(sheet, tabType, rowNums);
+  // Already filtered to rows WITHOUT a video, so no overwrite confirm needed.
+  _submitJobForRowNums(sheet, tabType, rowNums, false);
 }
 
 
-function _submitJobForRowNums(sheet, tabType, rowNums) {
+function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   // Simple + Image-VO share the same input columns/readers; only 4Images differs.
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages : _validateImageVO;
 
-  const rows = [];
+  let rows = [];
   const skipped = [];
   rowNums.forEach(function (rn) {
     const row = readRow(sheet, rn);
@@ -274,6 +275,30 @@ function _submitJobForRowNums(sheet, tabType, rowNums) {
       'No valid rows. Issues:\n' + skipped.join('\n')
     );
     return;
+  }
+
+  // Guard against accidentally regenerating rows that already have a video.
+  if (checkExisting) {
+    const videoCol = (tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS : IMAGE_VO_COLS).readyVideo1;
+    const withVideo = rows.filter(function (r) {
+      return String(sheet.getRange(r.row_num, videoCol).getValue() || '').trim() !== '';
+    }).map(function (r) { return r.row_num; });
+    if (withVideo.length > 0) {
+      const ans = SpreadsheetApp.getUi().alert(
+        'Some rows already have a video',
+        withVideo.length + ' of the selected rows already have a video (rows ' +
+        withVideo.join(', ') + ').\n\nRegenerate and OVERWRITE them?\n' +
+        'Yes = regenerate all · No = skip those, do the rest.',
+        SpreadsheetApp.getUi().ButtonSet.YES_NO
+      );
+      if (ans !== SpreadsheetApp.getUi().Button.YES) {
+        rows = rows.filter(function (r) { return withVideo.indexOf(r.row_num) === -1; });
+        if (rows.length === 0) {
+          SpreadsheetApp.getUi().alert('Nothing to do — all selected rows already have a video.');
+          return;
+        }
+      }
+    }
   }
 
   const idToken = ScriptApp.getIdentityToken();
@@ -392,6 +417,18 @@ function killJob(jobId) {
   try {
     _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/kill', { method: 'post' });
     return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+
+/** Called from Sidebar.html: clear the queue — kill ALL of your active jobs.
+ *  Rows already in progress finish; everything still waiting is cancelled. */
+function killAllJobs() {
+  try {
+    const r = _fetchJson('/jobs/kill-all', { method: 'post' });
+    return { ok: true, killed: (r && r.killed) || 0 };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }

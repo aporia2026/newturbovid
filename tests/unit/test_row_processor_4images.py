@@ -7,9 +7,8 @@ Covers:
   - Invalid image URL -> STATUS_IMAGE_DOWNLOAD_FAILED before any work
   - Mismatch (how_many=3 but only 2 URLs) -> STATUS_IMAGE_DOWNLOAD_FAILED
   - Article fetch failure -> STATUS_ARTICLE_FETCH_FAILED
-  - Rendi resize failure -> STATUS_IMAGE_GEN_FAILED
   - TTS failure -> STATUS_TTS_FAILED
-  - Rendi assembly failure -> STATUS_VIDEO_ASSEMBLY_FAILED
+  - Rendi command failure -> STATUS_VIDEO_ASSEMBLY_FAILED
   - ZapCap=Yes happy path -> captioned URLs
   - ZapCap failure -> STATUS_ZAPCAP_FAILED_KEPT_NO_CAPTIONS
 """
@@ -33,7 +32,6 @@ from bulkvid.adapters.zapcap import ZapCapClient
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
     STATUS_IMAGE_DOWNLOAD_FAILED,
-    STATUS_IMAGE_GEN_FAILED,
     STATUS_INTERNAL_ERROR,
     STATUS_SUCCESS,
     STATUS_TTS_FAILED,
@@ -318,31 +316,6 @@ async def test_article_fetch_failure() -> None:
 
 
 @respx.mock
-async def test_rendi_resize_failure_returns_image_gen_failed() -> None:
-    _register_openai_routes()
-    _register_video_downloads()
-
-    # Submit succeeds but the poll says FAILED.
-    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(
-        return_value=httpx.Response(200, json={"command_id": "cmd-1"})
-    )
-    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "status": "FAILED",
-                "error": {"message": "scale filter rejected input", "stderr": "no input"},
-            },
-        )
-    )
-
-    clients = _build_clients()
-    result = await process_4images_vo2_row(_row(how_many=2), clients)
-
-    assert result.status == STATUS_IMAGE_GEN_FAILED
-
-
-@respx.mock
 async def test_tts_failure() -> None:
     _register_openai_routes()
     _register_rendi_routes()
@@ -355,43 +328,22 @@ async def test_tts_failure() -> None:
 
 
 @respx.mock
-async def test_rendi_assembly_failure_after_first_succeeds() -> None:
-    """Resize succeeds for both images, but stills_to_video FAILED on poll."""
+async def test_rendi_command_failure_returns_video_assembly_failed() -> None:
+    """The single image->video fit command submits but the poll says FAILED."""
     _register_openai_routes()
     _register_video_downloads()
 
-    submit_count = {"n": 0}
-
-    def _submit(request: httpx.Request) -> httpx.Response:
-        submit_count["n"] += 1
-        return httpx.Response(200, json={"command_id": f"cmd-{submit_count['n']}"})
-
-    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
-
-    def _poll(request: httpx.Request) -> httpx.Response:
-        cmd_id = str(request.url).rsplit("/", 1)[-1]
-        # cmd-1 and cmd-2 are the resize calls; cmd-3+ are the stills_to_video calls.
-        num = int(cmd_id.split("-")[1])
-        if num <= 2:
-            return httpx.Response(
-                200,
-                json={
-                    "status": "SUCCESS",
-                    "output_files": {"out_1": {"storage_url": f"https://r.dev/{cmd_id}.png"}},
-                },
-            )
-        return httpx.Response(
+    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(
+        return_value=httpx.Response(200, json={"command_id": "cmd-1"})
+    )
+    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(
+        return_value=httpx.Response(
             200,
             json={
                 "status": "FAILED",
                 "error": {"message": "assembly broke", "stderr": "x"},
             },
         )
-
-    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(side_effect=_poll)
-    # Resize outputs (.png) — not downloaded, only their URL is passed to the next stage.
-    respx.get(url__regex=r"https://r\.dev/.+\.png").mock(
-        return_value=httpx.Response(200, content=b"resized")
     )
 
     clients = _build_clients()

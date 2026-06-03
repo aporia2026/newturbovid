@@ -28,6 +28,8 @@ from bulkvid.adapters.rendi import (
     RendiTimeoutError,
     dimensions_for_ratio,
     normalize_aspect_ratio,
+    render_fit_silent_command,
+    render_fit_video_command,
     render_music_mix_command,
     render_resize_command,
     render_stills_to_video_command,
@@ -100,6 +102,31 @@ def test_stills_to_video_template_unchanged() -> None:
     assert "-loop 1" in cmd
     assert "libx264" in cmd
     assert "-shortest" in cmd
+
+
+def test_fit_video_command_does_blurred_fit_and_audio() -> None:
+    cmd = render_fit_video_command(1080, 1920)
+    # Whole image visible (fit, NOT crop): a decrease-scaled foreground over a
+    # blurred increase-scaled background.
+    assert "force_original_aspect_ratio=decrease" in cmd
+    assert "boxblur" in cmd
+    assert "overlay=(W-w)/2:(H-h)/2" in cmd
+    # Voiceover muxed + sped up, two inputs, capped at 15s.
+    assert "{{in_1}}" in cmd and "{{in_2}}" in cmd and "{{out_1}}" in cmd
+    assert "atempo=" in cmd
+    assert "-shortest" in cmd
+    assert "1080" in cmd and "1920" in cmd
+
+
+def test_fit_silent_command_has_no_audio() -> None:
+    cmd = render_fit_silent_command(1080, 1350, seconds=8)
+    assert "force_original_aspect_ratio=decrease" in cmd
+    assert "boxblur" in cmd
+    assert "-an" in cmd                 # silent
+    assert "atempo" not in cmd          # nothing to speed up
+    assert "{{in_2}}" not in cmd        # single input (image only)
+    assert "-t 8" in cmd
+    assert "1080" in cmd and "1350" in cmd
 
 
 def test_music_mix_template_unchanged() -> None:
@@ -317,6 +344,72 @@ async def test_stills_to_video_returns_url_and_cost() -> None:
     assert out.url == "https://r.dev/v.mp4"
     assert out.cost_usd == COST_RENDI_COMMAND_USD
     assert out.command_id == "cmd-stitch"
+
+
+@respx.mock
+async def test_image_to_video_fit_with_audio() -> None:
+    submitted: dict = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        submitted.update(_json.loads(request.content))
+        return httpx.Response(200, json={"command_id": "cmd-fit"})
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_capture)
+    respx.get(f"{BASE}/v1/commands/cmd-fit").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "output_files": {"out_1": {"storage_url": "https://r.dev/fit.mp4"}},
+            },
+        )
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        out = await client.image_to_video_fit(
+            image_url="https://src/ad.png",
+            audio_url="https://src/vo.wav",
+            aspect_ratio="9:16",
+            max_attempts=2,
+            delay_seconds=0.0,
+        )
+    assert out.url == "https://r.dev/fit.mp4"
+    assert out.command_id == "cmd-fit"
+    # One command, two inputs (image + audio) — not two separate Rendi calls.
+    assert set(submitted["input_files"]) == {"in_1", "in_2"}
+    assert "boxblur" in submitted["ffmpeg_command"]
+
+
+@respx.mock
+async def test_image_to_video_fit_silent_when_no_audio() -> None:
+    submitted: dict = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        submitted.update(_json.loads(request.content))
+        return httpx.Response(200, json={"command_id": "cmd-fit-silent"})
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_capture)
+    respx.get(f"{BASE}/v1/commands/cmd-fit-silent").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "output_files": {"out_1": {"storage_url": "https://r.dev/silent.mp4"}},
+            },
+        )
+    )
+    async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+        out = await client.image_to_video_fit(
+            image_url="https://src/ad.png",
+            audio_url=None,
+            aspect_ratio="1:1",
+            max_attempts=2,
+            delay_seconds=0.0,
+        )
+    assert out.url == "https://r.dev/silent.mp4"
+    assert set(submitted["input_files"]) == {"in_1"}      # image only
+    assert "-an" in submitted["ffmpeg_command"]
 
 
 @respx.mock

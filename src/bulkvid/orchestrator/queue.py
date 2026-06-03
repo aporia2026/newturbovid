@@ -20,7 +20,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -113,7 +113,7 @@ class QueuedRow:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _new_job_id() -> str:
@@ -157,6 +157,28 @@ class JobQueue:
 
     # ── Sync helpers (called via to_thread) ─────────────────────────────────
 
+    def _active_duplicate_row_nums(
+        self, sheet_id: str, worksheet: str, row_nums: list[int]
+    ) -> set[int]:
+        """Of ``row_nums``, which are already pending/processing for this
+        (sheet, worksheet) in a still-active job — i.e. would double-process and
+        overwrite. Used to dedup at enqueue so a row never runs twice at once."""
+        if not row_nums:
+            return set()
+        placeholders = ",".join("?" for _ in row_nums)
+        cur = self._conn.execute(
+            "SELECT DISTINCT rq.row_num FROM row_queue rq "
+            "JOIN jobs j ON j.job_id = rq.job_id "
+            "WHERE j.sheet_id = ? AND j.worksheet = ? "
+            "AND j.status IN (?, ?) AND rq.status IN (?, ?) "
+            f"AND rq.row_num IN ({placeholders})",
+            (
+                sheet_id, worksheet, JOB_QUEUED, JOB_RUNNING,
+                ROW_PENDING, ROW_PROCESSING, *row_nums,
+            ),
+        )
+        return {r["row_num"] for r in cur.fetchall()}
+
     def _enqueue_sync(
         self,
         *,
@@ -169,28 +191,58 @@ class JobQueue:
         job_id = _new_job_id()
         now = _now_iso()
         with self._conn:                    # implicit transaction
+            # Drop rows already queued/processing for this sheet+worksheet in an
+            # active job, so a double-submit or overlapping batch can't reprocess
+            # and overwrite a row.
+            dupes = self._active_duplicate_row_nums(
+                sheet_id, worksheet, [r.row_num for r in rows]
+            )
+            kept = [r for r in rows if r.row_num not in dupes]
+            # If nothing is left to do, record a finished job (0 rows) rather
+            # than a job that would hang forever as queued 0/0.
+            status = JOB_QUEUED if kept else JOB_COMPLETED
+            finished = None if kept else now
             self._conn.execute(
                 "INSERT INTO jobs "
                 "(job_id, user_email, sheet_id, worksheet, tab_type, status, "
-                "row_count, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (job_id, user_email, sheet_id, worksheet, tab_type, JOB_QUEUED, len(rows), now),
+                "row_count, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id, user_email, sheet_id, worksheet, tab_type, status,
+                    len(kept), now, finished,
+                ),
             )
-            self._conn.executemany(
-                "INSERT INTO row_queue (job_id, row_num, payload, status) VALUES (?,?,?,?)",
-                [
-                    (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
-                    for r in rows
-                ],
+            if kept:
+                self._conn.executemany(
+                    "INSERT INTO row_queue (job_id, row_num, payload, status) "
+                    "VALUES (?,?,?,?)",
+                    [
+                        (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
+                        for r in kept
+                    ],
+                )
+        if dupes:
+            _log.info(
+                "enqueue_skipped_duplicates",
+                job_id=job_id,
+                skipped=len(dupes),
+                row_nums=sorted(dupes),
             )
         return job_id
 
     def _claim_next_row_sync(self) -> QueuedRow | None:
-        """Atomically pull the next pending row and mark it processing."""
+        """Atomically pull the next pending row and mark it processing.
+
+        Only claims rows whose parent job is still active (queued/running), so
+        killing a job — or clearing the queue — immediately stops its pending
+        rows instead of the worker draining them anyway.
+        """
         with self._conn:
             cur = self._conn.execute(
-                "SELECT id, job_id, row_num, payload FROM row_queue "
-                "WHERE status = ? ORDER BY id ASC LIMIT 1",
-                (ROW_PENDING,),
+                "SELECT rq.id, rq.job_id, rq.row_num, rq.payload "
+                "FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "ORDER BY rq.id ASC LIMIT 1",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
             )
             row = cur.fetchone()
             if row is None:
@@ -312,6 +364,25 @@ class JobQueue:
             )
             return cur.rowcount > 0
 
+    def _kill_all_sync(self, user_email: str | None = None) -> int:
+        """Kill every active (queued/running) job — for one user, or all when
+        ``user_email`` is None (admin). In-flight rows finish; pending rows stop
+        being claimed (see ``_claim_next_row_sync``)."""
+        with self._conn:
+            if user_email:
+                cur = self._conn.execute(
+                    "UPDATE jobs SET status = ?, finished_at = ? "
+                    "WHERE user_email = ? AND status IN (?, ?)",
+                    (JOB_KILLED, _now_iso(), user_email, JOB_QUEUED, JOB_RUNNING),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE jobs SET status = ?, finished_at = ? "
+                    "WHERE status IN (?, ?)",
+                    (JOB_KILLED, _now_iso(), JOB_QUEUED, JOB_RUNNING),
+                )
+            return cur.rowcount
+
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
         with self._conn:
@@ -379,6 +450,14 @@ class JobQueue:
     async def kill_job(self, job_id: str) -> bool:
         async with self._lock:
             return await asyncio.to_thread(self._kill_job_sync, job_id)
+
+    async def kill_all_jobs(self, *, user_email: str | None = None) -> int:
+        """Kill all active jobs (one user, or everyone for admins). Returns the
+        number of jobs killed. Backs the sidebar's "Stop all / Clear queue"."""
+        async with self._lock:
+            n = await asyncio.to_thread(self._kill_all_sync, user_email=user_email)
+        _log.info("kill_all_jobs", user_email=user_email or "ALL", killed=n)
+        return n
 
     async def recover_orphaned_rows(self) -> int:
         """Call on worker startup: rows stuck in PROCESSING are released."""

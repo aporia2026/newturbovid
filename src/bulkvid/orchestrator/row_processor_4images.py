@@ -2,14 +2,14 @@
 
 Implements the simpler pipeline from plan §5 ("Per-row pipeline (4Images-VO2)"):
 
-  1. Parallel kickoff:
-     1a. Article fetch
-     1b. URL validation for the first ``how_many`` supplied images
-  2. After 1b: Rendi resize each image to the target aspect ratio          (parallel)
-  3. After 1a: language detect -> classify Open Comments -> script gen
-  4. After 3:  Gemini TTS -> upload VO
-  5. After 2 AND 4: Rendi stills_to_video for each image                   (parallel)
-  6. After 5: upload videos to storage                                     (parallel)
+  1. Validate how_many + the first ``how_many`` supplied image URLs
+  2. Article fetch
+  3. language detect -> classify Open Comments -> script gen
+  4. Gemini TTS -> upload VO
+  5. Rendi image_to_video_fit per image                                    (parallel)
+     — one command each: blurred-background fit (no cropping) + the voiceover
+     muxed in. No separate resize call.
+  6. upload videos to storage                                              (parallel)
   7. If ZapCap=Yes: caption each video                                     (parallel)
   8. Compile result with cost + metadata
 
@@ -30,7 +30,6 @@ from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
     STATUS_IMAGE_DOWNLOAD_FAILED,
-    STATUS_IMAGE_GEN_FAILED,
     STATUS_INTERNAL_ERROR,
     STATUS_STORAGE_FAILED,
     STATUS_SUCCESS,
@@ -151,54 +150,16 @@ async def process_4images_vo2_row(
         )
 
     try:
-        # ─── Stage 1+2 (parallel): article fetch + resize images ───
+        # ─── Stage 2: article fetch ───
 
-        async def _fetch_article() -> str | Exception:
-            try:
-                art = await clients.article.fetch(row.article_url)
-                costs.article += art.cost_usd
-                metadata["article_chars"] = art.char_count
-                metadata["article_source"] = art.source
-                return art.content
-            except Exception as e:
-                return e
-
-        async def _resize_one(idx: int, src_url: str) -> tuple[str, str] | Exception:
-            try:
-                out = await clients.rendi.resize_image(
-                    source_url=src_url,
-                    aspect_ratio=row.aspect_ratio,
-                    output_filename=f"resized_{idx + 1}.png",
-                )
-                costs.resize += out.cost_usd
-                return out.url, out.command_id
-            except Exception as e:
-                return e
-
-        article_task = asyncio.create_task(_fetch_article())
-        resize_tasks = [
-            asyncio.create_task(_resize_one(i, u)) for i, u in enumerate(selected_urls)
-        ]
-
-        article_result = await article_task
-        if isinstance(article_result, Exception):
-            # Cancel remaining resize work — its output won't be used.
-            for t in resize_tasks:
-                t.cancel()
-            return _fail(
-                row, STATUS_ARTICLE_FETCH_FAILED, str(article_result), t0, costs, metadata
-            )
-        article_body: str = article_result
-
-        resize_results = await asyncio.gather(*resize_tasks, return_exceptions=False)
-        resized_urls: list[str] = []
-        resize_command_ids: list[str] = []
-        for r in resize_results:
-            if isinstance(r, Exception):
-                return _fail(row, STATUS_IMAGE_GEN_FAILED, str(r), t0, costs, metadata)
-            url, command_id = r
-            resized_urls.append(url)
-            resize_command_ids.append(command_id)
+        try:
+            art = await clients.article.fetch(row.article_url)
+            costs.article += art.cost_usd
+            metadata["article_chars"] = art.char_count
+            metadata["article_source"] = art.source
+            article_body: str = art.content
+        except Exception as e:
+            return _fail(row, STATUS_ARTICLE_FETCH_FAILED, str(e), t0, costs, metadata)
 
         # ─── Stage 3: language detect -> classify -> script ───
 
@@ -252,29 +213,21 @@ async def process_4images_vo2_row(
         else:
             vo_url = None    # Voice Over = No -> silent videos (no voiceover)
 
-        # ─── Stage 5 (parallel): Rendi stills_to_video (or silent) × N ───
+        # ─── Stage 5 (parallel): one-shot image -> video (fit + VO) x N ───
 
         async def _make_video(idx: int, image_url: str) -> tuple[str, str]:
-            aspect = normalize_aspect_ratio(row.aspect_ratio)
-            if vo_url is None:
-                out = await clients.rendi.image_to_silent_video(
-                    image_url=image_url,
-                    output_filename=f"v{idx + 1}.mp4",
-                    aspect_ratio=aspect,
-                )
-            else:
-                out = await clients.rendi.stills_to_video(
-                    image_url=image_url,
-                    audio_url=vo_url,
-                    output_filename=f"v{idx + 1}.mp4",
-                    aspect_ratio=aspect,
-                )
+            out = await clients.rendi.image_to_video_fit(
+                image_url=image_url,
+                audio_url=vo_url,    # None -> silent clip
+                output_filename=f"v{idx + 1}.mp4",
+                aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+            )
             costs.rendi += out.cost_usd
             return out.url, out.command_id
 
         try:
             make_results = await asyncio.gather(
-                *[_make_video(i, u) for i, u in enumerate(resized_urls)]
+                *[_make_video(i, u) for i, u in enumerate(selected_urls)]
             )
         except Exception as e:
             return _fail(row, STATUS_VIDEO_ASSEMBLY_FAILED, str(e), t0, costs, metadata)
@@ -301,10 +254,9 @@ async def process_4images_vo2_row(
             return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
 
         # ─── Stage 6b: free Rendi storage (best-effort) ───
-        # The resize outputs and finished videos now live in our own storage;
-        # drop the Rendi copies so they stop counting against the account quota.
-        # Never fails the row.
-        await clients.rendi.cleanup_commands(resize_command_ids + stills_command_ids)
+        # The finished videos now live in our own storage; drop the Rendi copies
+        # so they stop counting against the account quota. Never fails the row.
+        await clients.rendi.cleanup_commands(stills_command_ids)
 
         # ─── Stage 7 (optional): ZapCap ───
 

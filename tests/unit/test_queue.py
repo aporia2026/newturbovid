@@ -31,10 +31,6 @@ from bulkvid.orchestrator.queue import (
     JOB_KILLED,
     JOB_QUEUED,
     JOB_RUNNING,
-    ROW_DONE,
-    ROW_FAILED,
-    ROW_PENDING,
-    ROW_PROCESSING,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     JobQueue,
@@ -320,3 +316,108 @@ async def test_get_job_returns_none_for_unknown_id(queue: JobQueue) -> None:
 
 async def test_list_jobs_empty_when_no_jobs(queue: JobQueue) -> None:
     assert await queue.list_jobs(user_email=None) == []
+
+
+# ── Claim guard: killed jobs stop draining ──────────────────────────────────
+
+
+async def test_killed_job_pending_rows_are_not_claimed(queue: JobQueue) -> None:
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
+    )
+    assert await queue.kill_job(job_id) is True
+    # A killed job's pending rows must NOT be handed to the worker.
+    assert await queue.claim_next_row() is None
+
+
+# ── Enqueue dedup: a row can't run twice at once ────────────────────────────
+
+
+async def test_enqueue_skips_rows_already_active(queue: JobQueue) -> None:
+    await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    job2 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
+    )
+    j2 = await queue.get_job(job2)
+    assert j2 is not None and j2.row_count == 1            # row 2 deduped away
+    assert [r["row_num"] for r in await queue.list_rows(job2)] == [3]
+
+
+async def test_enqueue_all_duplicates_marks_job_completed(queue: JobQueue) -> None:
+    await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    job2 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    j2 = await queue.get_job(job2)
+    assert j2 is not None and j2.row_count == 0 and j2.status == JOB_COMPLETED
+
+
+async def test_enqueue_dedup_is_scoped_to_sheet_and_worksheet(queue: JobQueue) -> None:
+    await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W1",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    # Same row number, DIFFERENT worksheet -> not a duplicate.
+    job2 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W2",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    j2 = await queue.get_job(job2)
+    assert j2 is not None and j2.row_count == 1
+
+
+async def test_enqueue_allows_rerun_after_job_no_longer_active(queue: JobQueue) -> None:
+    # A finished job's row is NOT an active duplicate — a deliberate rerun works.
+    job1 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    assert await queue.kill_job(job1) is True              # job1 no longer active
+    job2 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    j2 = await queue.get_job(job2)
+    assert j2 is not None and j2.row_count == 1
+
+
+# ── kill_all_jobs ───────────────────────────────────────────────────────────
+
+
+async def test_kill_all_jobs_kills_every_active_job(queue: JobQueue) -> None:
+    j1 = await queue.enqueue(
+        user_email="a@x.com", sheet_id="A", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    j2 = await queue.enqueue(
+        user_email="b@x.com", sheet_id="B", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    killed = await queue.kill_all_jobs()
+    assert killed == 2
+    assert (await queue.get_job(j1)).status == JOB_KILLED
+    assert (await queue.get_job(j2)).status == JOB_KILLED
+
+
+async def test_kill_all_jobs_scoped_to_one_user(queue: JobQueue) -> None:
+    j_a = await queue.enqueue(
+        user_email="a@x.com", sheet_id="A", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    j_b = await queue.enqueue(
+        user_email="b@x.com", sheet_id="B", worksheet="W",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    killed = await queue.kill_all_jobs(user_email="a@x.com")
+    assert killed == 1
+    assert (await queue.get_job(j_a)).status == JOB_KILLED
+    assert (await queue.get_job(j_b)).status == JOB_QUEUED
