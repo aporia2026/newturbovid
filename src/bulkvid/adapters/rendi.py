@@ -286,15 +286,24 @@ def render_cartoon_concat_command(
     *,
     audio: bool = True,
     tempo: float = SPEECH_ATEMPO,
+    total_video_seconds: float | None = None,
 ) -> str:
     """Build the cartoon-mode stitch command for a VARIABLE number of clips.
 
     Each of ``num_clips`` input clips is trimmed to ``per_clip_seconds``, forced
     to ``width`` x ``height`` (cover + center-crop), and concatenated in order.
-    When ``audio`` is True the voiceover is the LAST input (``in_{num_clips+1}``),
-    sped up via ``atempo`` and muxed in with ``-shortest`` so the video matches
-    the (sped-up) voiceover length. ``{{in_N}}`` / ``{{out_1}}`` stay literal for
+    When ``audio`` is True the voiceover is the LAST input (``in_{num_clips+1}``)
+    and sped up via ``atempo``. ``{{in_N}}`` / ``{{out_1}}`` stay literal for
     Rendi to substitute.
+
+    Length handling:
+      - ``total_video_seconds`` set: output is forced to exactly that many
+        seconds via ``-t``, with a 0.3s audio fade-out so a sped-up VO that
+        overruns the target is cut smoothly. This is what the cartoon row
+        processor uses to guarantee a 6-8s clip regardless of VO length.
+      - ``total_video_seconds`` is None: legacy behavior — output runs ``-shortest``
+        so the video tracks the (sped-up) VO length exactly. Kept for callers
+        that haven't migrated.
     """
     if num_clips < 1:
         raise ValueError("render_cartoon_concat_command needs at least one clip")
@@ -312,13 +321,23 @@ def render_cartoon_concat_command(
     concat_inputs = "".join(f"[v{i}]" for i in range(num_clips))
     graph = f"{trims}{concat_inputs}concat=n={num_clips}:v=1:a=0[outv]"
     if audio:
-        graph += f";[{num_clips}:a]atempo={tempo}[outa]"
+        if total_video_seconds is not None:
+            fade_start = max(0.0, float(total_video_seconds) - 0.3)
+            graph += (
+                f";[{num_clips}:a]atempo={tempo},"
+                f"afade=t=out:st={fade_start:.3f}:d=0.300[outa]"
+            )
+        else:
+            graph += f";[{num_clips}:a]atempo={tempo}[outa]"
 
     maps = '-map "[outv]" '
     codecs = "-c:v libx264 -pix_fmt yuv420p "
     if audio:
         maps += '-map "[outa]" '
-        codecs += "-c:a aac -b:a 192k -shortest "
+        if total_video_seconds is not None:
+            codecs += f"-c:a aac -b:a 192k -t {float(total_video_seconds):.3f} "
+        else:
+            codecs += "-c:a aac -b:a 192k -shortest "
     else:
         codecs += "-an "
 
@@ -656,6 +675,7 @@ class RendiClient:
         output_filename: str = "out.mp4",
         *,
         aspect_ratio: str = "9:16",
+        total_video_seconds: float | None = None,
         max_attempts: int = 120,
         delay_seconds: float = 5.0,
     ) -> RendiOutput:
@@ -663,15 +683,20 @@ class RendiClient:
 
         Used by the cartoon pipeline: each Seedance clip is trimmed and forced to
         the target aspect, the clips are concatenated in order, and — when
-        ``audio_url`` is given — the voiceover is sped up and muxed in with
-        ``-shortest`` so the video tracks the voiceover length. ``audio_url=None``
-        yields a silent stitch. Auto-retried.
+        ``audio_url`` is given — the voiceover is sped up and muxed in. Output
+        length is controlled by ``total_video_seconds``: when set the video is
+        forced to exactly that duration (audio cut with a short fade-out when
+        the VO overruns), otherwise the legacy ``-shortest`` mode is used and
+        the video tracks the VO length. ``audio_url=None`` yields a silent
+        stitch. Auto-retried.
         """
         if not clip_urls:
             raise ValueError("concat_clips_with_audio requires at least one clip")
         width, height = dimensions_for_ratio(aspect_ratio)
         command = render_cartoon_concat_command(
-            len(clip_urls), per_clip_seconds, width, height, audio=audio_url is not None
+            len(clip_urls), per_clip_seconds, width, height,
+            audio=audio_url is not None,
+            total_video_seconds=total_video_seconds,
         )
         inputs = {f"in_{i + 1}": url for i, url in enumerate(clip_urls)}
         if audio_url is not None:

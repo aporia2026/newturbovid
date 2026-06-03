@@ -574,6 +574,7 @@ async def test_cleanup_commands_is_best_effort() -> None:
 
 
 def test_cartoon_concat_command_with_audio() -> None:
+    # Legacy path (no total_video_seconds): -shortest, no fade, no -t.
     cmd = render_cartoon_concat_command(2, 3.5, 1080, 1920, audio=True)
     # Two video inputs + one audio input (in_3), one output.
     assert "-i {{in_1}}" in cmd
@@ -587,7 +588,42 @@ def test_cartoon_concat_command_with_audio() -> None:
     assert "atempo=" in cmd
     assert '-map "[outa]"' in cmd
     assert "-shortest" in cmd
+    assert "afade" not in cmd          # no fade in legacy path
     assert "1080:1920" in cmd
+
+
+def test_cartoon_concat_command_with_total_video_seconds_forces_duration() -> None:
+    # When total_video_seconds is set the output is forced to that length via
+    # -t, the audio gets a 0.3s afade-out, and -shortest is gone. This is the
+    # path the cartoon row processor uses to guarantee a 6-8s clip.
+    cmd = render_cartoon_concat_command(
+        2, 4.0, 1080, 1920, audio=True, total_video_seconds=8.0,
+    )
+    assert "-t 8.000" in cmd
+    assert "afade=t=out:st=7.700:d=0.300" in cmd
+    assert "-shortest" not in cmd
+    # Atempo still present so the VO is sped up before the fade.
+    assert "atempo=" in cmd
+
+
+def test_cartoon_concat_command_total_video_seconds_short_target_safe_fade() -> None:
+    # Tiny target (smaller than the fade duration) must not produce a negative
+    # fade start — clamp to 0.0.
+    cmd = render_cartoon_concat_command(
+        2, 0.1, 1080, 1920, audio=True, total_video_seconds=0.2,
+    )
+    assert "afade=t=out:st=0.000:d=0.300" in cmd
+    assert "-t 0.200" in cmd
+
+
+def test_cartoon_concat_command_total_video_seconds_ignored_when_silent() -> None:
+    # No audio -> no -t and no fade; silent stitch falls back to -an.
+    cmd = render_cartoon_concat_command(
+        2, 3.0, 1080, 1920, audio=False, total_video_seconds=8.0,
+    )
+    assert "-an" in cmd
+    assert "-t " not in cmd
+    assert "afade" not in cmd
 
 
 def test_cartoon_concat_command_silent() -> None:

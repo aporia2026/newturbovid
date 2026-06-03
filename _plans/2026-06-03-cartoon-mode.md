@@ -1,7 +1,7 @@
 # Cartoon mode (animated, image-to-video)
 
 Date: 2026-06-03
-Status: Awaiting approval
+Status: Shipped on `cartoon-mode` branch (commit 563cb22). Iterating on VO length.
 Owner: TurboVid
 
 ## Goal
@@ -167,3 +167,138 @@ Mirrors the existing per-mode pattern (see row_processor_image_vo.py).
 Phase 1: build behind the new tab; test on 1-2 rows end to end; eyeball on a phone.
 Phase 2: tune the style preamble + shot-plan prompt from real output.
 Phase 3: surface `NUM_SHOTS`, resolution, and cost cap in the admin panel.
+
+## Iteration log
+
+### 2026-06-03 — VO length backstop (fixes 2026-06-03 live-run overshoot)
+
+Live run on 2026-06-03 produced idea 2 with a VO ~2s longer than the assembled
+video (two 4s Seedance clips, capped at 8s wall-clock). Root cause: the planner
+asked for ~12 words in a 7-18 range but applied **no hard cap in code**, and the
+observed Gemini TTS rate after the 1.3x speed-up is ~1.5 words/sec for short news
+lines — at 18 words that's ~12s of speech, well past the 8s video cap.
+
+Fix (`pipeline/cartoon_prompt.py`):
+- Tightened the prompt range: target 9 (was 12), 6-11 (was 7-18). 11 words ×
+  1.5 wps ≈ 7.3s, safely under the 8s video cap with headroom.
+- Added a deterministic backstop `_enforce_word_cap()` invoked in
+  `_coerce_ideas()`: truncates any voiceover over `CARTOON_MAX_WORDS`, preferring
+  the last sentence boundary inside the cap (no mid-thought cuts) and falling
+  back to a clean word-boundary cut + terminal period. Logs
+  `cartoon_voiceover_capped` whenever it fires so model drift is visible.
+- Tests added: cap enforced via integration through `generate_cartoon_plan`,
+  plus unit tests on `_enforce_word_cap` for under-limit, sentence-boundary,
+  no-boundary fallback, and trailing-punctuation cleanup; constants-consistency
+  guard. Full suite: 479 passing.
+
+Outstanding: **needs a live run to confirm** videos now land at 6-7s in both
+ideas. Unit tests prove the code does what it should; only a live row proves
+the rate calibration is right. If the model still picks the upper end of the
+range and lines feel rushed in TTS, consider dropping max to 10 or tightening
+the system-prompt wording to "around 9 words (6-11), ideally short".
+
+### 2026-06-03 — VO length re-tune (corrects the over-correction)
+
+Live run #2 on 2026-06-03 (Wikipedia "Used car", US/automotive, 9:16) shipped
+both ideas successfully at $0.474 / 4:47, status SUCCESS, **no overshoot**. But
+videos came out 3.82s and 5.82s — under the 6-7s target. Backstop did not fire
+(model stayed inside 6-11 words on its own); the prompt range itself was too
+tight.
+
+Measured TTS rate from the run: ~1.75 wps after the 1.3x speed-up (7-word VO →
+3.82s, 10-word VO → 5.82s). This recalibration shows that:
+- The **old max=18** was the real overshoot driver (18 × 1.75 ≈ 10.3s, ~2.3s
+  past the 8s ceiling — matches the original observation).
+- The **old target=12** was actually correct (12 × 1.75 ≈ 6.9s, dead-centre).
+- The **first-iteration target=9** was the source of the new undershoot.
+
+Fix (`pipeline/cartoon_prompt.py`):
+- Target 11 (was 9), range 9-13 (was 6-11). 11 × 1.75 ≈ 6.3s (centre of band),
+  13 × 1.75 ≈ 7.4s (still under the 8s cap with margin).
+- Comment in `cartoon_prompt.py` re-grounded on observed wps (was estimated).
+- Constants-consistency test relaxed: max ≤ 14 (was ≤ 12).
+
+User confirmed cartoon style itself looks right — only length needed adjusting.
+
+### 2026-06-03 — Structural fix: video duration clamped to [6, 8]s
+
+Live runs #2 and #3 showed the underlying problem is **TTS rate variance**, not
+word count. Same model + voice produced 1.5-3.0 wps depending on the
+model-generated `style_direction` (calm/deliberate → slow; punchy/excited → fast).
+Run #3:
+- Idea 1: ~11 words → 3.64s effective (3.02 wps, undershoot)
+- Idea 2: ~13 words → 8.50s effective (1.53 wps, overshoots 8s cap by 0.5s)
+
+Word-count tuning can't fix a 2x rate range. So the row processor now controls
+the *video* duration directly rather than letting it track the VO.
+
+Mechanism:
+- `row_processor_cartoon.py`: new `TARGET_VIDEO_MIN_SECONDS=6.0` /
+  `TARGET_VIDEO_MAX_SECONDS=8.0`. Every cartoon video is clamped to that band:
+  `target = clamp(effective_vo, 6, 8)`, `per_shot = target / NUM_SHOTS`. New
+  `cartoon_vo_sized` log records raw/effective/target/per_shot/clamped for every
+  idea, so a future rate drift is visible without re-instrumenting.
+- `rendi.py::render_cartoon_concat_command` gains an optional
+  `total_video_seconds` kwarg. When set: replaces `-shortest` with
+  `-t {target}` and adds a 0.3s `afade=t=out` on the audio. Short VOs leave
+  trailing silence; long VOs cut cleanly via the fade. Legacy `-shortest` path
+  preserved for any callers that don't pass it.
+- `concat_clips_with_audio` forwards `total_video_seconds`; the cartoon row
+  processor passes it.
+
+Side effect: the word-cap/wps tuning is now belt-and-braces. Either lever
+could regress and the video still lands in 6-8s. The cap prevents wasted TTS
+chars; the wps tuning keeps natural-sounding lines that rarely hit the audio
+fade.
+
+Tests (6 new, full suite 485 passing):
+- Rendi: `-t` + `afade` present with `total_video_seconds`; absent without it;
+  silent path unaffected; short target clamps fade-start to 0.0 (no negative
+  values).
+- Row processor: short VO clamps to 6.0s, long VO clamps to 8.0s, in-band VO
+  follows natural duration, no-VO defaults to 7.0s.
+
+Outstanding: live re-run to confirm the assembled MP4s now land in [6, 8]s in
+practice. Same Wikipedia "Used car" row.
+
+### 2026-06-03 — Soft floor + longer VOs (silence-padding fix)
+
+Live run #4 confirmed the hard 6s floor worked but produced 3s of trailing
+silence on the short-VO idea (effective 3.15s in a 6s video). User flagged
+that as "too much silence" — the structural clamp solved overshoot but
+introduced a UX regression at the floor end.
+
+The conflict is fundamental: hard floor → silence; no floor → 3s videos. The
+fix uses *both* levers — push VOs longer at the source AND replace the hard
+floor with a small dwell.
+
+Mechanism:
+- `pipeline/cartoon_prompt.py`: word range up. Target 13 (was 11), 11-15 (was
+  9-13). At the observed wps spread (1.5-3.5 post-speedup), 13 words ≈ 6.5s
+  at the median, 15 words still ≈ 4s at the fast end (which the soft tail
+  rounds out).
+- `orchestrator/row_processor_cartoon.py`: floor lowered to 4.0s. Target is
+  now `clamp(effective_vo + VO_TAIL_SECONDS, 4.0, 8.0)` where `VO_TAIL_SECONDS
+  = 0.8`. Short VOs get a deliberate ~0.8s dwell on the last scene; clamping
+  to the floor only happens when effective_vo < 3.2s, and even then the dwell
+  is ≤ 1.3s.
+- The `cartoon_vo_sized` log keeps emitting raw/effective/target/per_shot/
+  clamped so we can see in production whether the dwell is engaging or the
+  floor is biting.
+
+Why this beats the alternatives:
+- "Just drop the floor" → 3-4s videos felt too short (user confirmed earlier).
+- "Constrain style_direction" → root-cause fix for TTS rate variance, but
+  bigger change. Held in reserve if the soft tail still leaves dead air.
+- "Two VO lines per idea" → real architectural change. Deferred.
+
+Tests (12 cartoon-related, full suite 485 passing):
+- Row processor: 3.5s raw VO clamps to 4.0s floor; 13s raw clamps to 8s
+  ceiling; 7s raw lands in-band at effective + tail; no-VO path unchanged.
+- Word constants: max relaxed to ≤ 16 (the [4, 8]s clamp is the real bound).
+- Existing rendi `-t` / `afade` tests unchanged — the command shape is the
+  same, only the row processor's target arithmetic moved.
+
+Outstanding: live re-run to confirm the new tail feels like a dwell rather
+than dead air, and that the average video length now sits in the 5-7s range
+naturally rather than at the 6s floor.

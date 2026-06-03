@@ -45,11 +45,17 @@ CARTOON_STYLE = (
     "colors, modern 2D animated-film look."
 )
 
-# Each voiceover targets ~6-7 seconds of speech. At the observed Gemini TTS rate
-# (sped up 1.3x downstream) that's roughly this many words.
-CARTOON_TARGET_WORDS = 12
-CARTOON_MIN_WORDS = 7
-CARTOON_MAX_WORDS = 18
+# Each voiceover targets ~6-7 seconds of speech. The observed Gemini TTS rate
+# (after the 1.3x downstream speed-up) varies 1.5-3.5 wps across live runs on
+# 2026-06-03 — the model's free-form ``style_direction`` swings delivery between
+# calm-deliberate and punchy-fast. With that variance pinned by the row
+# processor's [4, 8]s output clamp + 0.8s tail silence, the word range is now
+# set to lift natural speech length: at the median ~2 wps, 13 words ≈ 6.5s
+# (centre of target); at the slow end 11 × 0.67 ≈ 7.3s; at the fast end 15
+# words still produces a ~4s VO that the soft tail rounds out without dead air.
+CARTOON_TARGET_WORDS = 13
+CARTOON_MIN_WORDS = 11
+CARTOON_MAX_WORDS = 15
 
 DEFAULT_NUM_IDEAS = 2
 DEFAULT_NUM_SHOTS = 2
@@ -191,15 +197,44 @@ def _fallback_plan(vertical: str, num_ideas: int, num_shots: int) -> list[Cartoo
     return ideas
 
 
+def _enforce_word_cap(text: str, max_words: int) -> str:
+    """Truncate ``text`` to at most ``max_words`` words.
+
+    Prefers to end at the last sentence boundary (``.``, ``!``, ``?``) inside the
+    cap so the spoken line doesn't end mid-thought; otherwise trims at the word
+    boundary and adds a terminal period. Backstop for model drift past the
+    prompt's word range — see CARTOON_MAX_WORDS rationale above.
+    """
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    truncated = " ".join(words[:max_words])
+    half = len(truncated) // 2
+    last_break = max(truncated.rfind(p) for p in ".!?")
+    if last_break >= half:
+        return truncated[: last_break + 1].rstrip()
+    return truncated.rstrip(",;:- ").rstrip() + "."
+
+
 def _coerce_ideas(
     raw_ideas: list[Any], num_ideas: int, num_shots: int
 ) -> list[CartoonIdea]:
     """Normalize the parsed JSON into exactly ``num_ideas`` ideas of ``num_shots`` shots."""
     ideas: list[CartoonIdea] = []
-    for raw in raw_ideas[:num_ideas]:
+    for raw_idx, raw in enumerate(raw_ideas[:num_ideas]):
         if not isinstance(raw, dict):
             continue
-        voiceover = str(raw.get("voiceover") or "").strip()
+        voiceover_raw = str(raw.get("voiceover") or "").strip()
+        original_words = len(voiceover_raw.split())
+        voiceover = _enforce_word_cap(voiceover_raw, CARTOON_MAX_WORDS)
+        if original_words > CARTOON_MAX_WORDS:
+            _log.warning(
+                "cartoon_voiceover_capped",
+                idea_index=raw_idx,
+                original_words=original_words,
+                max_words=CARTOON_MAX_WORDS,
+                capped_words=len(voiceover.split()),
+            )
         style = str(raw.get("style_direction") or "").strip() or DEFAULT_STYLE_DIRECTION
         raw_shots = raw.get("shots") or []
         shots: list[CartoonShot] = []
