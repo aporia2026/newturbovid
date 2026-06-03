@@ -218,7 +218,11 @@ async def process_image_vo_row(
             try:
                 description, c1 = await describe_source_image(clients.openai, source_b64)
                 costs.vision += c1
-                collage_prompt, c2 = await build_collage_prompt(clients.openai, description)
+                # Keep the ad's text/CTA, change only the photo — grounded in the
+                # article topic, not whatever the inspiration photo showed.
+                collage_prompt, c2 = await build_collage_prompt(
+                    clients.openai, description, article_excerpt=article_body[:1500]
+                )
                 costs.collage_prompt += c2
 
                 collage_url, c3 = await edit_with_fallback(
