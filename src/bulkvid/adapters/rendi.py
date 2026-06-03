@@ -280,7 +280,7 @@ def render_music_mix_command() -> str:
 
 def render_cartoon_concat_command(
     num_clips: int,
-    per_clip_seconds: float,
+    per_clip_seconds: float | list[float],
     width: int = 1080,
     height: int = 1920,
     *,
@@ -290,30 +290,43 @@ def render_cartoon_concat_command(
 ) -> str:
     """Build the cartoon-mode stitch command for a VARIABLE number of clips.
 
-    Each of ``num_clips`` input clips is trimmed to ``per_clip_seconds``, forced
-    to ``width`` x ``height`` (cover + center-crop), and concatenated in order.
-    When ``audio`` is True the voiceover is the LAST input (``in_{num_clips+1}``)
-    and sped up via ``atempo``. ``{{in_N}}`` / ``{{out_1}}`` stay literal for
-    Rendi to substitute.
+    Each input clip is trimmed to its own duration, forced to ``width`` x
+    ``height`` (cover + center-crop), and concatenated in order. When ``audio``
+    is True the voiceover is the LAST input (``in_{num_clips+1}``) and sped up
+    via ``atempo``. ``{{in_N}}`` / ``{{out_1}}`` stay literal for Rendi to
+    substitute.
+
+    ``per_clip_seconds`` accepts either:
+      - a single ``float`` (every clip trimmed to the same duration), or
+      - a ``list[float]`` of length ``num_clips`` (each clip trimmed to its own
+        duration — used by the cartoon row processor when the last shot is
+        rendered at Seedance 8s to fit a long VO and the first shot stays 4s).
 
     Length handling:
       - ``total_video_seconds`` set: output is forced to exactly that many
         seconds via ``-t``, with a 0.3s audio fade-out so a sped-up VO that
-        overruns the target is cut smoothly. This is what the cartoon row
-        processor uses to guarantee a 6-8s clip regardless of VO length.
-      - ``total_video_seconds`` is None: legacy behavior — output runs ``-shortest``
-        so the video tracks the (sped-up) VO length exactly. Kept for callers
-        that haven't migrated.
+        overruns the target is cut smoothly.
+      - ``total_video_seconds`` is None: legacy behavior — output runs
+        ``-shortest`` so the video tracks the (sped-up) VO length exactly. Kept
+        for callers that haven't migrated.
     """
     if num_clips < 1:
         raise ValueError("render_cartoon_concat_command needs at least one clip")
-    per = f"{per_clip_seconds:.3f}"
+    if isinstance(per_clip_seconds, list):
+        if len(per_clip_seconds) != num_clips:
+            raise ValueError(
+                f"per_clip_seconds list length {len(per_clip_seconds)} "
+                f"does not match num_clips {num_clips}"
+            )
+        per_durations = [float(d) for d in per_clip_seconds]
+    else:
+        per_durations = [float(per_clip_seconds)] * num_clips
     inputs = "".join(f"-i {{{{in_{i + 1}}}}} " for i in range(num_clips))
     if audio:
         inputs += f"-i {{{{in_{num_clips + 1}}}}} "
 
     trims = "".join(
-        f"[{i}:v]trim=start=0:duration={per},setpts=PTS-STARTPTS,"
+        f"[{i}:v]trim=start=0:duration={per_durations[i]:.3f},setpts=PTS-STARTPTS,"
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},setsar=1[v{i}];"
         for i in range(num_clips)
@@ -671,7 +684,7 @@ class RendiClient:
         self,
         clip_urls: list[str],
         audio_url: str | None,
-        per_clip_seconds: float,
+        per_clip_seconds: float | list[float],
         output_filename: str = "out.mp4",
         *,
         aspect_ratio: str = "9:16",

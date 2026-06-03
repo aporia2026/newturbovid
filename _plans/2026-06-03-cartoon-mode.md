@@ -341,3 +341,58 @@ Tests (+3, full suite 488):
 - alt voiceover/scene/motion keys round-trip cleanly (no fallback)
 - bare-string shots get default motion supplied
 - single-shot lists pad by repeating last shot (both shots == padded copy)
+
+### 2026-06-04 — Adaptive Seedance 8s for the last shot (VO completion fix)
+
+First production run on cartoon-mode revealed the structural fix's blind spot:
+even with the 0.3s audio fade, VOs whose `effective` exceeded 7.2-7.5s would
+be hard-cut or fade-clipped on the LAST spoken word because the 8s soft
+ceiling (= per_shot 4s × NUM_SHOTS 2) couldn't accommodate the audio. The
+fade made the cut softer, not absent. User confirmed two production videos
+both had this issue.
+
+Root: per_shot × NUM_SHOTS = 8s is the wall-clock cap when every shot is a 4s
+Seedance clip. Anything longer than that would either be truncated by `-t` or
+faded by `afade=t=out`.
+
+Fix: the LAST shot is now rendered at Seedance 8s when `effective_vo > 7.5s`,
+so the video can extend up to a new TARGET_VIDEO_HARD_MAX_SECONDS = 11.0
+(= 4s first shot + 7s last-shot trim). Earlier shots stay at 4s. Per-clip
+trim durations are now PER-SHOT, not uniform.
+
+Mechanism:
+- `adapters/kie.py`: new `COST_SEEDANCE_PRO_720P_8S_USD = 0.14`.
+  `seedance_image_to_video` now returns the cost matching the duration tier
+  (4s → 0.07, 8s → 0.14) instead of always returning the 4s cost.
+- `adapters/rendi.py::render_cartoon_concat_command` accepts
+  `per_clip_seconds: float | list[float]`. List form trims each input clip to
+  its own duration; the float form (uniform) is preserved for any
+  non-cartoon caller.
+  `concat_clips_with_audio` forwards the new shape.
+- `orchestrator/row_processor_cartoon.py`: new constants
+  `SEEDANCE_DURATION_LONG = 8`, `LONG_AUDIO_THRESHOLD_SECONDS = 7.5`,
+  `TARGET_VIDEO_HARD_MAX_SECONDS = 11.0`. After TTS, if effective > 7.5,
+  the LAST shot's `seedance_durations[s] = 8` and its trim fills the rest of
+  the natural target (capped at both the 8s clip length and the hard max so
+  Rendi never renders a clip whose tail will be truncated by `-t`). The new
+  `cartoon_vo_sized` log adds `seedance_durations`, `per_clip_seconds`
+  (list), `long_audio` (bool), and the clamp tri-state so production runs
+  expose which path fired.
+
+Cost impact: +$0.07 per idea ONLY when the long-audio path fires (~$0.14 per
+row when both ideas hit it). Normal-VO rows are unchanged at ~$0.47. Worst
+case (both ideas long): ~$0.61.
+
+Tests (+4, full suite 492 passing):
+- short VO uses 4s shots and uniform per_clip (regression cover)
+- long VO (13s raw, ~10s effective) triggers per-idea `[4, 8]` Seedance
+  durations and per_clip `[4.0, ~6.8]`; total video runs the full natural
+  length (no audio cut)
+- very long VO (16s raw, ~12.3s effective) clamps the LAST shot trim to 7s
+  (4 + 7 = 11s hard max) so Rendi doesn't render the wasted second
+- no-VO rows still use uniform 3.5s shots
+- rendi command builder accepts per-clip list, raises on length mismatch
+
+Outstanding: live re-run to confirm the long-audio path produces VOs that
+finish before the video ends, and that the 8s last-shot Seedance billing
+matches our $0.14 estimate.

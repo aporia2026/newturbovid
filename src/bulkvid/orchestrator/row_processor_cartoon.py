@@ -63,21 +63,29 @@ _log = get_logger("row")
 
 CARTOON_NUM_IDEAS = 2          # videos per row (Ready Video 1 + 2)
 CARTOON_NUM_SHOTS = 2          # shots stitched per video
-SEEDANCE_DURATION = 4          # seconds per Seedance clip (4/8/12 only)
+SEEDANCE_DURATION_SHORT = 4    # default seconds per Seedance clip (4/8/12 only)
+SEEDANCE_DURATION_LONG = 8     # bumped last shot when the VO needs more room
 SEEDANCE_RESOLUTION = "720p"
 IMAGE_RESOLUTION = "1K"        # nano-banana-2 resolution (animated -> 720p)
 NO_VO_PER_SHOT_SECONDS = 3.5   # per-shot length when Voice Over = No (gives 7s, in band)
 MIN_PER_SHOT_SECONDS = 1.5     # floor so a short VO never yields micro-cuts
 
-# Every cartoon video lands in this band regardless of the VO's natural length:
-# short VOs extend with held video + a brief trailing silence (= VO_TAIL),
-# long VOs are cut with a 0.3s audio fade. Set in Rendi via -t + afade (see
-# render_cartoon_concat_command). The floor is 4s — anything tighter feels
-# rushed — and the soft tail (rather than a 6s hard floor) keeps short VOs
-# from sitting in 2-3 seconds of dead air at the end.
+# Soft band [MIN, MAX] for short and normal VOs: short VOs extend with held
+# video + a brief trailing silence (= VO_TAIL), longer VOs land near the soft
+# ceiling. When the natural target would exceed MAX, instead of audio-fading
+# into the last spoken word the LAST shot is re-rendered at Seedance 8s and
+# the video extends up to TARGET_VIDEO_HARD_MAX_SECONDS so the VO finishes
+# cleanly. Audio is only ever truncated when even the hard max isn't enough.
 TARGET_VIDEO_MIN_SECONDS = 4.0
 TARGET_VIDEO_MAX_SECONDS = 8.0
+TARGET_VIDEO_HARD_MAX_SECONDS = 11.0    # 4s first shot + up to 7s of an 8s last shot
 VO_TAIL_SECONDS = 0.8          # silence dwell after VO ends, before the cap
+
+# When effective_vo > this, the row processor bumps the LAST shot's Seedance
+# clip to SEEDANCE_DURATION_LONG so the video has room to fit the full VO + a
+# dwell. Threshold lives just below where the audio fade would otherwise start
+# eating the last word at the soft ceiling.
+LONG_AUDIO_THRESHOLD_SECONDS = 7.5
 
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:
@@ -193,14 +201,18 @@ async def process_cartoon_row(
             """Build one stitched, voiced, optionally-captioned video. None on failure."""
             nonlocal zapcap_failed
             try:
-                # 4a. Voiceover (optional). The video's *output* length is clamped
-                # to [TARGET_VIDEO_MIN, TARGET_VIDEO_MAX] regardless of VO length:
-                # short VOs leave trailing silence, long VOs are cut with a fade
-                # in the Rendi concat (-t + afade). per_shot is then derived from
-                # the clamped target so the two video clips fill it exactly.
+                # 4a. Voiceover (optional). Video length follows the VO with a
+                # small dwell. Soft band [MIN, MAX]: VOs in the band give a
+                # ~0.8s tail after the last word; floor pads with held video;
+                # ceiling triggers the LAST shot to re-render at Seedance 8s so
+                # the video can extend up to TARGET_VIDEO_HARD_MAX without
+                # truncating the audio. per_clip_seconds and seedance_durations
+                # are per-shot so the long-VO mode can use 4s + 8s.
                 vo_url: str | None = None
+                seedance_durations: list[int] = [SEEDANCE_DURATION_SHORT] * CARTOON_NUM_SHOTS
+                per_clip_seconds: list[float] = [NO_VO_PER_SHOT_SECONDS] * CARTOON_NUM_SHOTS
                 target_video_seconds = NO_VO_PER_SHOT_SECONDS * CARTOON_NUM_SHOTS
-                per_shot = NO_VO_PER_SHOT_SECONDS
+                long_audio = False
                 if row.voice_over:
                     tts = await clients.tts.synthesize(
                         text=idea.voiceover,
@@ -216,28 +228,53 @@ async def process_cartoon_row(
                     )
                     costs.storage += vo_up.cost_usd
                     vo_url = vo_up.url
-                    # The concat command speeds the VO up by SPEECH_ATEMPO, so the
-                    # effective played length is shorter than the raw WAV. Target
-                    # = effective VO + a small dwell, clamped into the band.
+                    # The concat command speeds the VO up by SPEECH_ATEMPO, so
+                    # the effective played length is shorter than the raw WAV.
                     effective = tts.duration_seconds / SPEECH_ATEMPO
                     natural_target = effective + VO_TAIL_SECONDS
-                    target_video_seconds = min(
-                        max(natural_target, TARGET_VIDEO_MIN_SECONDS),
-                        TARGET_VIDEO_MAX_SECONDS,
-                    )
-                    per_shot = min(
-                        max(target_video_seconds / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
-                        float(SEEDANCE_DURATION),
-                    )
-                    # The flag reflects what actually happened to the natural
-                    # (effective + tail) target — "floor" means the dwell got
-                    # padded up, "ceiling" means the audio fade engaged.
-                    if natural_target < TARGET_VIDEO_MIN_SECONDS:
-                        clamp_state = "floor"
-                    elif natural_target > TARGET_VIDEO_MAX_SECONDS:
-                        clamp_state = "ceiling"
+                    long_audio = effective > LONG_AUDIO_THRESHOLD_SECONDS
+
+                    if long_audio:
+                        # Bump the LAST shot to Seedance 8s; earlier shots stay
+                        # at 4s (full clip). The last shot's trim fills whatever
+                        # is left to reach the natural target, capped at BOTH the
+                        # Seedance 8s clip length AND the hard max (so the concat
+                        # never asks Rendi to render a clip whose tail will just
+                        # be truncated by -t — wasted compute).
+                        first_total = SEEDANCE_DURATION_SHORT * (CARTOON_NUM_SHOTS - 1)
+                        last_per_clip = min(
+                            max(natural_target - first_total, MIN_PER_SHOT_SECONDS),
+                            float(SEEDANCE_DURATION_LONG),
+                            TARGET_VIDEO_HARD_MAX_SECONDS - first_total,
+                        )
+                        seedance_durations = (
+                            [SEEDANCE_DURATION_SHORT] * (CARTOON_NUM_SHOTS - 1)
+                            + [SEEDANCE_DURATION_LONG]
+                        )
+                        per_clip_seconds = (
+                            [float(SEEDANCE_DURATION_SHORT)] * (CARTOON_NUM_SHOTS - 1)
+                            + [last_per_clip]
+                        )
+                        target_video_seconds = first_total + last_per_clip
+                        clamp_state = "ceiling" if natural_target > target_video_seconds else "none"
                     else:
-                        clamp_state = "none"
+                        # Normal path: all shots at 4s Seedance, even split.
+                        target_video_seconds = min(
+                            max(natural_target, TARGET_VIDEO_MIN_SECONDS),
+                            TARGET_VIDEO_MAX_SECONDS,
+                        )
+                        per_shot = min(
+                            max(target_video_seconds / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
+                            float(SEEDANCE_DURATION_SHORT),
+                        )
+                        per_clip_seconds = [per_shot] * CARTOON_NUM_SHOTS
+                        if natural_target < TARGET_VIDEO_MIN_SECONDS:
+                            clamp_state = "floor"
+                        elif natural_target > TARGET_VIDEO_MAX_SECONDS:
+                            clamp_state = "ceiling"
+                        else:
+                            clamp_state = "none"
+
                     _log.info(
                         "cartoon_vo_sized",
                         idea=idx + 1,
@@ -245,7 +282,9 @@ async def process_cartoon_row(
                         vo_effective_seconds=round(effective, 3),
                         natural_target_seconds=round(natural_target, 3),
                         target_video_seconds=round(target_video_seconds, 3),
-                        per_shot_seconds=round(per_shot, 3),
+                        per_clip_seconds=[round(p, 3) for p in per_clip_seconds],
+                        seedance_durations=list(seedance_durations),
+                        long_audio=long_audio,
                         clamp=clamp_state,
                     )
 
@@ -277,11 +316,14 @@ async def process_cartoon_row(
 
                 # 4c. Animate each image (concurrently). A failed clip holds a
                 # neighbour so the concat still has NUM_SHOTS clips in order.
+                # ``seedance_durations[s]`` is 4s for every shot except the last
+                # when long_audio is True — that last shot gets the 8s tier so
+                # the concat has room to fit the full VO + dwell.
                 async def _animate(s: int, image_url: str) -> tuple[int, str | None]:
                     try:
                         clip_url, cost = await seedance_image_to_video(
                             clients.kie, image_url, idea.shots[s].motion, aspect,
-                            duration=SEEDANCE_DURATION, resolution=SEEDANCE_RESOLUTION,
+                            duration=seedance_durations[s], resolution=SEEDANCE_RESOLUTION,
                         )
                         costs.seedance += cost
                         return s, clip_url
@@ -317,13 +359,14 @@ async def process_cartoon_row(
                     _log.error("cartoon_idea_no_clips", idea=idx + 1)
                     return None
 
-                # 4d. Stitch + overlay VO. ``total_video_seconds`` clamps the
-                # output to the [6, 8]s band — the row processor sized per_shot
-                # to fill that exactly.
+                # 4d. Stitch + overlay VO. ``per_clip_seconds`` may be
+                # non-uniform when the last shot was rendered at Seedance 8s for
+                # a long VO. ``total_video_seconds`` forces the final length so
+                # short VOs land at the floor and long VOs reach the hard max.
                 stitched = await clients.rendi.concat_clips_with_audio(
                     clip_urls,
                     vo_url,
-                    per_clip_seconds=per_shot,
+                    per_clip_seconds=per_clip_seconds,
                     output_filename=f"v{idx + 1}.mp4",
                     aspect_ratio=aspect,
                     total_video_seconds=target_video_seconds,

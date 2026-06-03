@@ -44,6 +44,7 @@ COST_NANO_BANANA_2_1K_USD = 0.04     # nano-banana-2 @ 1K (cartoon mode default)
 COST_GPT_IMAGE_2_USD = 0.08          # gpt-image-2 fallback, rough mid-tier estimate
 COST_RECRAFT_UPSCALE_USD = 0.04
 COST_SEEDANCE_PRO_720P_4S_USD = 0.07  # Seedance 1.5 Pro i2v @ 720p, 4s, no audio
+COST_SEEDANCE_PRO_720P_8S_USD = 0.14  # Seedance 1.5 Pro i2v @ 720p, 8s, no audio
 
 # Production model identifiers.
 MODEL_NANO_BANANA_EDIT = "google/nano-banana-edit"
@@ -507,7 +508,7 @@ async def seedance_image_to_video(
     ``duration`` must be 4, 8, or 12 (the only values the model accepts) and is
     sent as a STRING — the API rejects an integer ("duration it must be a
     string"). Audio generation is left off (VO is added downstream). Returns
-    ``(video_url, cost_usd)``.
+    ``(video_url, cost_usd)`` with the cost matching the duration tier.
     """
     input_params: dict[str, Any] = {
         "prompt": prompt,
@@ -520,7 +521,14 @@ async def seedance_image_to_video(
     urls = await client.poll_task(
         task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
     )
-    return urls[0], COST_SEEDANCE_PRO_720P_4S_USD
+    # 8s clips are billed roughly 2x the 4s tier (plan §11; verify next live run).
+    # 12s is not used by cartoon mode today — fall through to the 8s cost rather
+    # than under-reporting, with a TODO if a 12s path appears later.
+    cost = (
+        COST_SEEDANCE_PRO_720P_4S_USD if duration == 4
+        else COST_SEEDANCE_PRO_720P_8S_USD
+    )
+    return urls[0], cost
 
 
 # ── Construction from settings ───────────────────────────────────────────────

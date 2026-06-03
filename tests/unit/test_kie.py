@@ -27,6 +27,7 @@ from bulkvid.adapters.kie import (
     COST_NANO_BANANA_EDIT_USD,
     COST_RECRAFT_UPSCALE_USD,
     COST_SEEDANCE_PRO_720P_4S_USD,
+    COST_SEEDANCE_PRO_720P_8S_USD,
     MODEL_GPT_IMAGE_2,
     MODEL_NANO_BANANA_2,
     MODEL_NANO_BANANA_EDIT,
@@ -486,6 +487,23 @@ async def test_seedance_sends_duration_as_string() -> None:
     assert isinstance(body["input"]["duration"], str)
 
 
+@respx.mock
+async def test_seedance_8s_returns_long_tier_cost() -> None:
+    # Cartoon mode's long-VO path requests Seedance 8s for the last shot — the
+    # billed cost must scale to the 8s tier so cost reporting stays accurate.
+    captured = _capture_submit_then_succeed("https://cdn/clip8.mp4")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=8, resolution="720p",
+            max_attempts=2, delay_seconds=0.0,
+        )
+    assert url == "https://cdn/clip8.mp4"
+    assert cost == COST_SEEDANCE_PRO_720P_8S_USD
+    assert captured[0]["input"]["duration"] == "8"
+
+
 # ── Sanity on the model names + cost constants (catch accidental renames) ────
 
 
@@ -500,3 +518,6 @@ def test_cost_constants_are_positive() -> None:
     assert COST_RECRAFT_UPSCALE_USD > 0
     assert COST_NANO_BANANA_2_1K_USD > 0
     assert COST_SEEDANCE_PRO_720P_4S_USD > 0
+    # 8s tier should bill more than 4s and not less than 2x in the model we use.
+    assert COST_SEEDANCE_PRO_720P_8S_USD > COST_SEEDANCE_PRO_720P_4S_USD
+    assert COST_SEEDANCE_PRO_720P_8S_USD >= 2 * COST_SEEDANCE_PRO_720P_4S_USD * 0.95

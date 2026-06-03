@@ -626,6 +626,25 @@ def test_cartoon_concat_command_total_video_seconds_ignored_when_silent() -> Non
     assert "afade" not in cmd
 
 
+def test_cartoon_concat_command_per_clip_list_trims_each_clip_independently() -> None:
+    # Long-VO path: first shot is the standard 4s, last shot extends to ~6.8s
+    # (Seedance 8s clip trimmed). Each input must trim to its own duration.
+    cmd = render_cartoon_concat_command(
+        2, [4.0, 6.8], 1080, 1920, audio=True, total_video_seconds=10.8,
+    )
+    assert "trim=start=0:duration=4.000" in cmd
+    assert "trim=start=0:duration=6.800" in cmd
+    # Both clips still concat in order, audio still gets the speedup + fade.
+    assert "concat=n=2:v=1:a=0[outv]" in cmd
+    assert "atempo=" in cmd
+    assert "-t 10.800" in cmd
+
+
+def test_cartoon_concat_command_per_clip_list_length_mismatch_raises() -> None:
+    with pytest.raises(ValueError):
+        render_cartoon_concat_command(2, [4.0, 4.0, 4.0])    # 3 durations, 2 clips
+
+
 def test_cartoon_concat_command_silent() -> None:
     cmd = render_cartoon_concat_command(3, 2.0, 1080, 1920, audio=False)
     # Three video inputs, NO audio input, no audio map.

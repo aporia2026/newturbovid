@@ -186,17 +186,22 @@ def _patch_kie(
             raise RuntimeError("i2i boom")
         return f"https://kie.test/img-i2i-{counters['i2i']}.png", 0.04
 
+    durations: list[int] = []
+
     async def _seedance(_kie, _img, _motion, _aspect, duration=4, resolution="720p", **_):
         counters["seedance"] += 1
+        durations.append(int(duration))
         if seedance_fail_all or (
             seedance_fail_on is not None and counters["seedance"] == seedance_fail_on
         ):
             raise RuntimeError("seedance boom")
-        return f"https://kie.test/clip-{counters['seedance']}.mp4", 0.07
+        cost = 0.14 if duration == 8 else 0.07
+        return f"https://kie.test/clip-{counters['seedance']}.mp4", cost
 
     monkeypatch.setattr(rpc, "nano_banana_2_text_to_image", _t2i)
     monkeypatch.setattr(rpc, "nano_banana_2_image_to_image", _i2i)
     monkeypatch.setattr(rpc, "seedance_image_to_video", _seedance)
+    counters["durations"] = durations    # type: ignore[assignment]
     return counters
 
 
@@ -256,7 +261,8 @@ async def test_cartoon_happy_path_two_videos(monkeypatch) -> None:
 async def test_cartoon_vo_short_clamped_to_floor(monkeypatch) -> None:
     # Raw 3.5s VO -> effective 2.69s. Soft tail (+0.8s) gives 3.49s, BELOW the
     # 4s floor → clamps UP to 4.0s. Tail silence ≈ 1.3s, not the prior 3s.
-    _patch_kie(monkeypatch)
+    # Short audio → all shots stay at Seedance 4s, per_clip uniform.
+    counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
     clients.tts = _FakeTTS(duration=3.5)    # type: ignore[assignment]
@@ -265,14 +271,19 @@ async def test_cartoon_vo_short_clamped_to_floor(monkeypatch) -> None:
     assert result.status == STATUS_SUCCESS
     call = clients.rendi.concat_calls[0]
     assert call["total_video_seconds"] == pytest.approx(4.0, abs=0.01)
-    assert call["per_clip"] == pytest.approx(2.0, abs=0.01)
+    assert call["per_clip"] == [pytest.approx(2.0, abs=0.01)] * 2
+    # All Seedance calls (4 = 2 ideas * 2 shots) used the 4s tier.
+    assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
-async def test_cartoon_vo_long_clamped_to_ceiling(monkeypatch) -> None:
-    # Raw 13s -> effective 10s + 0.8s tail = 10.8s, above the 8s ceiling. Clamps
-    # DOWN to 8.0 (regression: pre-fix live runs overshot here).
-    _patch_kie(monkeypatch)
+async def test_cartoon_vo_long_triggers_8s_last_shot(monkeypatch) -> None:
+    # Raw 13s -> effective 10s, above the 7.5s long-audio threshold. Last shot
+    # re-renders at Seedance 8s; first shot stays 4s. natural_target = 10.8s,
+    # under the 11s hard max → video runs the full natural length so VO
+    # finishes cleanly (audio fade lands on silence). This is the regression
+    # fix for the "video ends before the last word" issue.
+    counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
     clients.tts = _FakeTTS(duration=13.0)    # type: ignore[assignment]
@@ -280,15 +291,39 @@ async def test_cartoon_vo_long_clamped_to_ceiling(monkeypatch) -> None:
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
     call = clients.rendi.concat_calls[0]
-    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
-    assert call["per_clip"] == pytest.approx(4.0, abs=0.01)
+    expected_total = 13.0 / 1.3 + 0.8        # natural target, ~10.8
+    assert call["total_video_seconds"] == pytest.approx(expected_total, abs=0.01)
+    # First shot 4s, last shot fills the remainder (~6.8s).
+    assert call["per_clip"][0] == pytest.approx(4.0, abs=0.01)
+    assert call["per_clip"][-1] == pytest.approx(expected_total - 4.0, abs=0.01)
+    # Per-idea: first shot Seedance 4s, last shot Seedance 8s. Two ideas → 4 calls.
+    assert counters["durations"] == [4, 8, 4, 8]
+
+
+@respx.mock
+async def test_cartoon_vo_very_long_clamps_to_hard_ceiling(monkeypatch) -> None:
+    # Raw 16s -> effective ~12.3s. natural_target = 13.1s, above the 11s hard
+    # max → clamp to 11s (audio gets the last ~1.3s faded by the concat).
+    counters = _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    clients.tts = _FakeTTS(duration=16.0)    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    call = clients.rendi.concat_calls[0]
+    assert call["total_video_seconds"] == pytest.approx(11.0, abs=0.01)
+    # Last shot trimmed to 7s (8s clip, 1s left on the table).
+    assert call["per_clip"][0] == pytest.approx(4.0, abs=0.01)
+    assert call["per_clip"][-1] == pytest.approx(7.0, abs=0.01)
+    assert counters["durations"] == [4, 8, 4, 8]
 
 
 @respx.mock
 async def test_cartoon_vo_in_band_keeps_tail(monkeypatch) -> None:
-    # Raw 7s -> effective ~5.38s + 0.8s tail = 6.18s, in the [4, 8]s band.
-    # Target follows the VO with the dwell, no clamping either side.
-    _patch_kie(monkeypatch)
+    # Raw 7s -> effective ~5.38s + 0.8s tail = 6.18s, in the [4, 8]s band and
+    # below the 7.5s long-audio threshold. All shots stay at 4s, per_clip uniform.
+    counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
     clients.tts = _FakeTTS(duration=7.0)    # type: ignore[assignment]
@@ -299,12 +334,14 @@ async def test_cartoon_vo_in_band_keeps_tail(monkeypatch) -> None:
     expected = 7.0 / 1.3 + 0.8
     assert call["total_video_seconds"] == pytest.approx(expected, abs=0.01)
     assert 4.0 <= call["total_video_seconds"] <= 8.0
+    assert call["per_clip"] == [pytest.approx(expected / 2, abs=0.01)] * 2
+    assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
 async def test_cartoon_no_vo_uses_default_target(monkeypatch) -> None:
     # No-VO rows keep the existing 3.5s per shot * 2 = 7s default target (in band).
-    _patch_kie(monkeypatch)
+    counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
 
@@ -313,7 +350,8 @@ async def test_cartoon_no_vo_uses_default_target(monkeypatch) -> None:
     call = clients.rendi.concat_calls[0]
     assert call["audio"] is None
     assert call["total_video_seconds"] == pytest.approx(7.0, abs=0.01)
-    assert call["per_clip"] == pytest.approx(3.5, abs=0.01)
+    assert call["per_clip"] == [pytest.approx(3.5, abs=0.01)] * 2
+    assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
