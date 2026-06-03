@@ -28,52 +28,57 @@ from bulkvid.logging import configure_logging, get_logger
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runtime_settings import registry_defaults
 from bulkvid.orchestrator.settings_store import SettingsStore
-from bulkvid.tunnel import TunnelManager
 from bulkvid.routes import admin as admin_routes
 from bulkvid.routes import health as health_routes
 from bulkvid.routes import jobs as jobs_routes
+from bulkvid.tunnel import TunnelManager
 
 _log = get_logger("boot")
+
+
+def _build_state(app: FastAPI) -> None:
+    """Create shared resources on ``app.state``. Idempotent.
+
+    Called by the ASGI ``lifespan`` (uvicorn) AND by ``init_wsgi()`` (WSGI
+    hosts like PythonAnywhere, where the ASGI lifespan never runs). The guard
+    makes a double call (e.g. lifespan + wrapper) harmless.
+
+    The worker process opens its own JobQueue + SettingsStore on the same DB
+    files — SQLite WAL mode makes that safe.
+    """
+    if getattr(app.state, "queue", None) is not None:
+        return
+    settings = get_settings()
+    data_dir = Path(settings.BULKVID_DATA_DIR)
+    app.state.queue = JobQueue(data_dir / "jobs.db")
+    app.state.settings_store = SettingsStore(
+        data_dir / "settings.db", defaults=registry_defaults()
+    )
+    app.state.verifier = build_verifier_from_settings(settings)
+    # Local-dev only: manages the cloudflared quick tunnel for the admin panel.
+    # No-op in production (no cloudflared installed).
+    app.state.tunnel = TunnelManager(settings.BULKVID_PORT, data_dir)
+    _log.info(
+        "service_start",
+        version=__version__,
+        env=settings.BULKVID_ENV,
+        data_dir=str(data_dir),
+        bulk_team_count=len(settings.bulk_team_emails),
+        admin_count=len(settings.admin_emails),
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     configure_logging()
-    settings = get_settings()
-
-    # Shared queue + settings store. The worker process opens its own
-    # JobQueue + SettingsStore on the same DB files — SQLite WAL mode
-    # makes that safe.
-    data_dir = Path(settings.BULKVID_DATA_DIR)
-    queue = JobQueue(data_dir / "jobs.db")
-    settings_store = SettingsStore(
-        data_dir / "settings.db", defaults=registry_defaults()
-    )
-    app.state.queue = queue
-    app.state.settings_store = settings_store
-    app.state.verifier = build_verifier_from_settings(settings)
-    # Local-dev only: manages the cloudflared quick tunnel for the admin panel.
-    # No-op in production (no cloudflared installed).
-    app.state.tunnel = TunnelManager(settings.BULKVID_PORT, data_dir)
-
-    _log.info(
-        "service_start",
-        version=__version__,
-        env=settings.BULKVID_ENV,
-        port=settings.BULKVID_PORT,
-        max_concurrent_rows=settings.BULKVID_MAX_CONCURRENT_ROWS,
-        kie_keys_configured=len(settings.kie_key_list),
-        kill_switch=bool(settings.BULKVID_KILL_SWITCH),
-        bulk_team_count=len(settings.bulk_team_emails),
-        admin_count=len(settings.admin_emails),
-        data_dir=str(data_dir),
-    )
-
+    _build_state(app)
     try:
         yield
     finally:
-        queue.close()
-        settings_store.close()
+        if getattr(app.state, "queue", None) is not None:
+            app.state.queue.close()
+        if getattr(app.state, "settings_store", None) is not None:
+            app.state.settings_store.close()
         _log.info("service_stop")
 
 
@@ -87,6 +92,15 @@ app = FastAPI(
 app.include_router(jobs_routes.router)
 app.include_router(health_routes.router)
 app.include_router(admin_routes.router)
+
+
+def init_wsgi() -> FastAPI:
+    """Entrypoint for WSGI hosts (PythonAnywhere) where the ASGI lifespan does
+    not run. Configures logging, builds ``app.state``, and returns the app to
+    be wrapped by ``a2wsgi.ASGIMiddleware``."""
+    configure_logging()
+    _build_state(app)
+    return app
 
 
 @app.get("/health")
