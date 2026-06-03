@@ -6,7 +6,7 @@ Covers:
   - describe_source_image: reads on-image marketing text + CTA (prompt intent)
   - build_collage_prompt: returns text + cost, strips wrapping quotes
   - collage prompt now asks for SIMILAR marketing text + CTA per panel,
-    keeps branding/logos, and no longer strips text
+    forbids real brands/logos/trademarks, and no longer strips text
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ async def test_build_collage_strips_wrapping_quotes() -> None:
 
 
 @respx.mock
-async def test_build_collage_asks_for_text_cta_and_keeps_logos() -> None:
+async def test_build_collage_asks_for_text_cta_and_forbids_real_brands() -> None:
     captured: list[dict] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -158,8 +158,9 @@ async def test_build_collage_asks_for_text_cta_and_keeps_logos() -> None:
     assert "headline" in user_msg.lower()
     assert "cta" in user_msg.lower() or "call-to-action" in user_msg.lower()
     assert "same language" in user_msg.lower()
-    # NEW: branding is kept, not stripped.
-    assert "keep" in user_msg.lower()
-    # Regression: the old no-text / logo-stripping rules are gone.
+    # Real brands are forbidden in the generated panels (legal requirement).
+    assert "no real brands" in user_msg.lower()
+    assert "trademark" in user_msg.lower()
+    # Regression: the old no-text rule is gone (text/CTA are now required).
     assert "NO text" not in user_msg
     assert "AUTOMOTIVE RULE" not in user_msg
