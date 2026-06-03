@@ -27,8 +27,13 @@ from google.oauth2.service_account import Credentials
 
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow
-from bulkvid.orchestrator.queue import TAB_FOUR_IMAGES, TAB_IMAGE_VO, TAB_SIMPLE
+from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
+from bulkvid.orchestrator.queue import (
+    TAB_CARTOON,
+    TAB_FOUR_IMAGES,
+    TAB_IMAGE_VO,
+    TAB_SIMPLE,
+)
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 _log = get_logger("sheets")
@@ -265,6 +270,48 @@ class SheetsClient:
         )
         return rows
 
+    async def read_cartoon_rows(
+        self, sheet_id: str, worksheet_name: str
+    ) -> list[CartoonRow]:
+        """Read the cartoon tab. Shares the Image-VO column layout, but the
+        Manual Image column (D) is ignored — cartoon scenes are generated from
+        scratch — so only the article URL is required."""
+        data = await asyncio.to_thread(
+            self._read_all_values_sync, sheet_id, worksheet_name
+        )
+        rows: list[CartoonRow] = []
+        if not data:
+            return rows
+
+        cols = IMAGE_VO_COLS
+        for offset, raw in enumerate(data[1:], start=2):
+            article = _cell(raw, cols.article)
+            if not article:
+                if not _row_is_blank(raw, [cols.country, cols.vertical, cols.open_comments]):
+                    _log.warning("skip_incomplete_cartoon_row", sheet_row=offset)
+                continue
+            rows.append(
+                CartoonRow(
+                    row_num=offset,
+                    country=_cell(raw, cols.country),
+                    vertical=_cell(raw, cols.vertical),
+                    article_url=article,
+                    voice_over=_yes(_cell(raw, cols.voice_over), default=True),
+                    zapcap=_yes(_cell(raw, cols.zapcap), default=False),
+                    aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
+                    script_pattern=_cell(raw, cols.script_pattern),
+                    open_comments=_cell(raw, cols.open_comments),
+                )
+            )
+
+        _log.info(
+            "read_cartoon_rows",
+            sheet_id=sheet_id,
+            worksheet=worksheet_name,
+            row_count=len(rows),
+        )
+        return rows
+
     # ── Public write API (the coalesced flush callback) ─────────────────────
 
     async def batch_write_video_urls(self, writes: list[PendingWrite]) -> int:
@@ -283,7 +330,7 @@ class SheetsClient:
         for (sheet_id, worksheet, tab_type), batch in grouped.items():
             ready_start = (
                 IMAGE_VO_COLS.ready_video_start
-                if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
+                if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE, TAB_CARTOON)
                 else FOUR_IMAGES_COLS.ready_video_start
                 if tab_type == TAB_FOUR_IMAGES
                 else None

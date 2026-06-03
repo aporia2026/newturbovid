@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from bulkvid.logging import get_logger
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow, RowResult, SimpleRow
+from bulkvid.models.row import (
+    CartoonRow,
+    FourImagesVO2Row,
+    ImageVORow,
+    RowResult,
+    SimpleRow,
+)
 
 _log = get_logger("queue")
 
@@ -47,6 +53,7 @@ ROW_FAILED = "failed"
 TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
+TAB_CARTOON = "cartoon"
 
 
 _SCHEMA = """
@@ -120,19 +127,25 @@ def _new_job_id() -> str:
     return f"job-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 
-def _row_to_payload(row: ImageVORow | FourImagesVO2Row | SimpleRow, tab: str) -> str:
+def _row_to_payload(
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow, tab: str
+) -> str:
     data = asdict(row)
     data["__tab__"] = tab
     return json.dumps(data, ensure_ascii=False)
 
 
-def _payload_to_row(payload_json: str) -> ImageVORow | FourImagesVO2Row | SimpleRow:
+def _payload_to_row(
+    payload_json: str,
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**data)
     if tab == TAB_SIMPLE:
         return SimpleRow(**data)
+    if tab == TAB_CARTOON:
+        return CartoonRow(**data)
     return ImageVORow(**data)
 
 
@@ -186,7 +199,7 @@ class JobQueue:
         sheet_id: str,
         worksheet: str,
         tab_type: str,
-        rows: list[ImageVORow] | list[FourImagesVO2Row],
+        rows: list[ImageVORow] | list[FourImagesVO2Row] | list[SimpleRow] | list[CartoonRow],
     ) -> str:
         job_id = _new_job_id()
         now = _now_iso()
@@ -408,7 +421,7 @@ class JobQueue:
         sheet_id: str,
         worksheet: str,
         tab_type: str,
-        rows: list[ImageVORow] | list[FourImagesVO2Row],
+        rows: list[ImageVORow] | list[FourImagesVO2Row] | list[SimpleRow] | list[CartoonRow],
     ) -> str:
         async with self._lock:
             job_id = await asyncio.to_thread(
@@ -468,11 +481,15 @@ class JobQueue:
         return n
 
 
-def payload_to_row(payload: dict[str, Any]) -> ImageVORow | FourImagesVO2Row | SimpleRow:
+def payload_to_row(
+    payload: dict[str, Any],
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**payload)
     if tab == TAB_SIMPLE:
         return SimpleRow(**payload)
+    if tab == TAB_CARTOON:
+        return CartoonRow(**payload)
     return ImageVORow(**payload)

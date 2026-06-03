@@ -22,6 +22,7 @@ import pytest
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
     STATUS_SUCCESS,
+    CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
@@ -31,6 +32,7 @@ from bulkvid.orchestrator.queue import (
     JOB_KILLED,
     JOB_QUEUED,
     JOB_RUNNING,
+    TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     JobQueue,
@@ -45,6 +47,20 @@ def _img_row(n: int = 2) -> ImageVORow:
         vertical="tech",
         article_url="https://example.com/article",
         manual_image_url="https://example.com/seed.png",
+        voice_over=True,
+        zapcap=False,
+        aspect_ratio="9:16",
+        script_pattern="How To",
+        open_comments="",
+    )
+
+
+def _cartoon_row(n: int = 4) -> CartoonRow:
+    return CartoonRow(
+        row_num=n,
+        country="MX",
+        vertical="automotive",
+        article_url="https://example.com/article",
         voice_over=True,
         zapcap=False,
         aspect_ratio="9:16",
@@ -150,6 +166,20 @@ async def test_claim_payload_round_trips_four_images(queue: JobQueue) -> None:
     assert isinstance(row, FourImagesVO2Row)
     assert row.row_num == 9
     assert row.how_many == 2
+
+
+async def test_claim_payload_round_trips_cartoon(queue: JobQueue) -> None:
+    await queue.enqueue(
+        user_email="u@aporia.com",
+        sheet_id="s", worksheet="w", tab_type=TAB_CARTOON,
+        rows=[_cartoon_row(4)],
+    )
+    queued = await queue.claim_next_row()
+    assert queued is not None
+    row = payload_to_row(queued.payload)
+    assert isinstance(row, CartoonRow)
+    assert row.row_num == 4
+    assert row.vertical == "automotive"
 
 
 # ── record_result ───────────────────────────────────────────────────────────

@@ -22,8 +22,9 @@ from pydantic import BaseModel, Field
 from bulkvid.auth import AuthError, ForbiddenError, GoogleIdentityVerifier, Identity
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger, read_job_log_lines
-from bulkvid.models.row import FourImagesVO2Row, ImageVORow, SimpleRow
+from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow, SimpleRow
 from bulkvid.orchestrator.queue import (
+    TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
@@ -67,6 +68,18 @@ class FourImagesVO2RowIn(BaseModel):
     open_comments: str = ""
 
 
+class CartoonRowIn(BaseModel):
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    open_comments: str = ""
+
+
 class SubmitJobIn(BaseModel):
     sheet_id: str
     worksheet: str
@@ -75,6 +88,8 @@ class SubmitJobIn(BaseModel):
     rows_four_images: list[FourImagesVO2RowIn] | None = None
     # The simple tab reuses the Image-VO input shape (one video, no image gen).
     rows_simple: list[ImageVORowIn] | None = None
+    # The cartoon tab generates animated videos from text (no seed image).
+    rows_cartoon: list[CartoonRowIn] | None = None
 
 
 class SubmitJobOut(BaseModel):
@@ -223,6 +238,10 @@ async def submit_job(
         if not payload.rows_simple:
             raise HTTPException(400, "rows_simple is required for tab_type=simple")
         rows = [SimpleRow(**r.model_dump()) for r in payload.rows_simple]
+    elif payload.tab_type == TAB_CARTOON:
+        if not payload.rows_cartoon:
+            raise HTTPException(400, "rows_cartoon is required for tab_type=cartoon")
+        rows = [CartoonRow(**r.model_dump()) for r in payload.rows_cartoon]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

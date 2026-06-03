@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Status codes — one per failure mode the orchestrator can return.
 STATUS_SUCCESS = "SUCCESS"
 STATUS_ARTICLE_FETCH_FAILED = "ARTICLE_FETCH_FAILED"
@@ -55,6 +54,29 @@ class SimpleRow:
     vertical: str
     article_url: str
     manual_image_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+
+
+@dataclass
+class CartoonRow:
+    """Cartoon tab input row — animated, multi-shot videos generated from text.
+
+    Same input columns as Image-VO (the "Manual Image" column is present in the
+    sheet but ignored: cartoon scenes are generated from scratch, no seed). Each
+    row produces TWO independent ~6-7s videos, each a stitched sequence of short
+    Seedance image-to-video clips. Two ``Ready Video`` cells are written back.
+
+    See ``orchestrator/row_processor_cartoon.py`` and ``pipeline/cartoon_prompt.py``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
     voice_over: bool                  # default True
     zapcap: bool                      # default False
     aspect_ratio: str                 # e.g. "9:16"

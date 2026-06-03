@@ -28,6 +28,7 @@ from bulkvid.adapters.rendi import (
     RendiTimeoutError,
     dimensions_for_ratio,
     normalize_aspect_ratio,
+    render_cartoon_concat_command,
     render_fit_silent_command,
     render_fit_video_command,
     render_music_mix_command,
@@ -567,6 +568,43 @@ async def test_cleanup_commands_is_best_effort() -> None:
         await client.cleanup_commands(["cmd-ok", "cmd-bad"])  # must not raise
     assert ok.called
     assert bad.called
+
+
+# ── Cartoon concat command ──────────────────────────────────────────────────
+
+
+def test_cartoon_concat_command_with_audio() -> None:
+    cmd = render_cartoon_concat_command(2, 3.5, 1080, 1920, audio=True)
+    # Two video inputs + one audio input (in_3), one output.
+    assert "-i {{in_1}}" in cmd
+    assert "-i {{in_2}}" in cmd
+    assert "-i {{in_3}}" in cmd        # voiceover is the last input
+    assert "{{out_1}}" in cmd
+    # Each clip trimmed to the per-clip duration, then concatenated.
+    assert "trim=start=0:duration=3.500" in cmd
+    assert "concat=n=2:v=1:a=0[outv]" in cmd
+    # Audio sped up + muxed, shortest so video tracks the VO length.
+    assert "atempo=" in cmd
+    assert '-map "[outa]"' in cmd
+    assert "-shortest" in cmd
+    assert "1080:1920" in cmd
+
+
+def test_cartoon_concat_command_silent() -> None:
+    cmd = render_cartoon_concat_command(3, 2.0, 1080, 1920, audio=False)
+    # Three video inputs, NO audio input, no audio map.
+    assert "-i {{in_1}}" in cmd
+    assert "-i {{in_3}}" in cmd
+    assert "-i {{in_4}}" not in cmd
+    assert "concat=n=3:v=1:a=0[outv]" in cmd
+    assert "-an" in cmd
+    assert "atempo" not in cmd
+    assert '-map "[outa]"' not in cmd
+
+
+def test_cartoon_concat_command_rejects_zero_clips() -> None:
+    with pytest.raises(ValueError):
+        render_cartoon_concat_command(0, 3.0)
 
 
 # ── Cost constant sanity ────────────────────────────────────────────────────

@@ -14,6 +14,7 @@
 const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
+const TAB_CARTOON = 'cartoon';
 
 /** Column maps — MUST match src/bulkvid/adapters/sheets.py (1-indexed for Sheets). */
 const IMAGE_VO_COLS = {
@@ -90,6 +91,9 @@ function _detectTabType(sheet) {
   if (name.indexOf('x4') !== -1) return TAB_IMAGE_VO;
   // "simple" -> ONE video from the existing Manual Image, NO image generation.
   if (name.indexOf('simple') !== -1) return TAB_SIMPLE;
+  // "cartoon" -> generate animated multi-shot videos from text (no seed image).
+  // Checked by NAME because the tab shares the Image-VO "Manual Image" header.
+  if (name.indexOf('cartoon') !== -1) return TAB_CARTOON;
 
   const lastCol = sheet.getLastColumn();
   if (lastCol === 0) return null;
@@ -161,9 +165,34 @@ function _readFourImagesRow(sheet, rowNum) {
 }
 
 
+function _readCartoonRow(sheet, rowNum) {
+  // Cartoon shares the Image-VO layout but ignores Manual Image (scenes are
+  // generated from scratch), so the payload omits manual_image_url.
+  const cols = IMAGE_VO_COLS;
+  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  return {
+    row_num: rowNum,
+    country: _cell(values, cols.country),
+    vertical: _cell(values, cols.vertical),
+    article_url: _cell(values, cols.article),
+    voice_over: _yes(_cell(values, cols.voiceOver), true),
+    zapcap: _yes(_cell(values, cols.zapcap), false),
+    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    script_pattern: _cell(values, cols.scriptPattern),
+    open_comments: _cell(values, cols.openComments),
+  };
+}
+
+
 function _validateImageVO(r) {
   if (!r.article_url) return 'article URL missing';
   if (!r.manual_image_url) return 'manual image URL missing';
+  return null;
+}
+
+
+function _validateCartoon(r) {
+  if (!r.article_url) return 'article URL missing';
   return null;
 }
 
@@ -254,9 +283,13 @@ function generateAllUnprocessed() {
 
 
 function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
-  // Simple + Image-VO share the same input columns/readers; only 4Images differs.
-  const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow : _readImageVORow;
-  const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages : _validateImageVO;
+  // Simple + Image-VO share the same input columns/readers; 4Images and cartoon differ.
+  const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
+    : tabType === TAB_CARTOON ? _readCartoonRow
+    : _readImageVORow;
+  const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
+    : tabType === TAB_CARTOON ? _validateCartoon
+    : _validateImageVO;
 
   let rows = [];
   const skipped = [];
@@ -316,6 +349,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   };
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
+  else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else payload.rows_image_vo = rows;
 
   var body;
