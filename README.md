@@ -1,3 +1,13 @@
+---
+title: Aporia BulkVid
+emoji: 🎬
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # TurboVid — Aporia Bulk Video Tool
 
 Simple bulk video creation for Facebook campaigns. Resized image + voiceover, optional ZapCap subtitles. Up to 4 videos per row, 200+ rows per batch in 12–20 minutes.
