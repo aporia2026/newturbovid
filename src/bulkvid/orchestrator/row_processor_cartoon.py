@@ -113,14 +113,29 @@ def compute_atempo(raw_seconds: float) -> tuple[float, float]:
       - Raw audio > 9.75s: even max speedup (1.3) doesn't fit. Return (1.3,
         raw/1.3) — the caller will see ``effective > MAX_EFFECTIVE_VO_SECONDS``
         and trigger the shorten-and-retry path.
+
+    Floating-point note: in the "speed up just enough to fit" branch we
+    return the cap value as a literal, NOT ``raw_seconds / atempo``. By
+    construction the math says effective == cap, but IEEE 754 division can
+    drift a few ULPs and the caller's ``effective > cap`` check then false-
+    positives on FP noise (see job ``local-desktop-l6i1bf7-20260604T103814Z``
+    for the regression that prompted this comment — raw 8.17s came back as
+    7.5000000001 and dropped a clean idea).
     """
     if raw_seconds <= 0:
         return SPEECH_ATEMPO, 0.0
     if raw_seconds <= MAX_EFFECTIVE_VO_SECONDS:
         return SPEECH_ATEMPO_MIN, raw_seconds
     needed = raw_seconds / MAX_EFFECTIVE_VO_SECONDS
-    atempo = min(needed, SPEECH_ATEMPO)
-    return atempo, raw_seconds / atempo
+    if needed <= SPEECH_ATEMPO:
+        # Audio fits with some speedup; effective lands exactly at the cap.
+        # Return the cap as a literal to avoid FP drift past it.
+        return needed, MAX_EFFECTIVE_VO_SECONDS
+    # Audio doesn't fit even at max speedup; caller will see effective > cap
+    # and trigger shorten-and-retry. We DO return the math here (not the cap)
+    # because the value carries meaningful "how badly does this overshoot"
+    # information for the log line.
+    return SPEECH_ATEMPO, raw_seconds / SPEECH_ATEMPO
 
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:

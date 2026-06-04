@@ -303,6 +303,27 @@ def test_compute_atempo_very_long_vo_caps_at_1_3() -> None:
     assert effective == pytest.approx(12.0 / 1.3)
 
 
+def test_compute_atempo_boundary_returns_cap_exactly_no_fp_drift() -> None:
+    # Regression for job local-desktop-l6i1bf7-20260604T103814Z: raw=8.17s
+    # made the previous implementation return effective=7.5000000001 (FP
+    # drift), which tripped the row processor's `effective > cap` check
+    # and dropped an otherwise-clean idea. compute_atempo now returns the
+    # cap as a literal in this branch — exhaustive sweep across the band
+    # confirms effective is never strictly greater than the cap.
+    band_raws = [7.51, 7.6, 7.99, 8.0, 8.17, 8.5, 9.0, 9.5, 9.74, 9.749]
+    for raw in band_raws:
+        atempo, effective = compute_atempo(raw)
+        assert effective == MAX_EFFECTIVE_VO_SECONDS, (
+            f"raw={raw}: expected effective=={MAX_EFFECTIVE_VO_SECONDS}, "
+            f"got {effective!r}"
+        )
+        # And the row processor's strict gate must NOT fire on the boundary.
+        assert not (effective > MAX_EFFECTIVE_VO_SECONDS), (
+            f"raw={raw}: FP drift would re-introduce the bug"
+        )
+        assert SPEECH_ATEMPO_MIN < atempo <= 1.3
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
