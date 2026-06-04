@@ -64,7 +64,7 @@ _log = get_logger("row")
 
 # ── Tunables (admin-surfaced in Phase 5) ─────────────────────────────────────
 
-CARTOON_NUM_IDEAS = 3          # videos per row (Ready Video 1 + 2 + 3)
+CARTOON_NUM_IDEAS = 2          # videos per row (Ready Video 1 + 2)
 CARTOON_NUM_SHOTS = 2          # shots stitched per video
 SEEDANCE_DURATION_SHORT = 4    # seconds per Seedance clip (4/8/12 only)
 SEEDANCE_RESOLUTION = "720p"
