@@ -70,3 +70,195 @@ def test_redact_host_strips_userinfo() -> None:
 
 def test_redact_host_on_bare_host_is_identity() -> None:
     assert _db._redact_host("example.com") == "example.com"
+
+
+# ── libsql tuple-to-dict shims ─────────────────────────────────────────────
+# These test the layer that lets queue.py + settings_store.py keep using
+# ``row["col_name"]`` access even though libsql's raw cursors return
+# plain tuples. We can't install libsql on every dev box (no Python 3.14
+# wheel), so these tests exercise the wrapper against a fake "libsql-like"
+# connection that mimics tuple-returning cursors.
+
+
+class _FakeCursor:
+    """Plain-tuple cursor matching libsql's actual surface — what _LibsqlCursor
+    has to wrap. Returns tuples from fetchone/fetchall/fetchmany; exposes
+    description, rowcount, lastrowid."""
+
+    def __init__(
+        self,
+        rows: list[tuple] | None = None,
+        description: list[tuple] | None = None,
+        rowcount: int = 0,
+        lastrowid: int | None = None,
+    ) -> None:
+        self._rows = list(rows or [])
+        self.description = description
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> tuple | None:
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self) -> list[tuple]:
+        out, self._rows = self._rows, []
+        return out
+
+    def fetchmany(self, size: int | None = None) -> list[tuple]:
+        n = size or 1
+        out = self._rows[:n]
+        self._rows = self._rows[n:]
+        return out
+
+    def __iter__(self):
+        while self._rows:
+            yield self._rows.pop(0)
+
+
+def test_dictrow_supports_string_and_int_indexing() -> None:
+    row = _db._DictRow(("job-1", "queued", 3), ("job_id", "status", "row_count"))
+    assert row["job_id"] == "job-1"
+    assert row["status"] == "queued"
+    assert row["row_count"] == 3
+    # Index access still works (sqlite3.Row supports both).
+    assert row[0] == "job-1"
+    assert row[2] == 3
+
+
+def test_dictrow_keys_returns_column_names() -> None:
+    row = _db._DictRow(("a", "b"), ("c1", "c2"))
+    assert row.keys() == ["c1", "c2"]
+
+
+def test_dictrow_iteration_yields_values() -> None:
+    row = _db._DictRow(("a", "b"), ("c1", "c2"))
+    assert list(row) == ["a", "b"]
+
+
+def test_dictrow_dict_comprehension_pattern_matches_queue_code() -> None:
+    """queue._get_job_sync uses ``Job(**{k: row[k] for k in row.keys()})``.
+    Pin that exact pattern so it never silently degrades."""
+    row = _db._DictRow(("job-1", "queued"), ("job_id", "status"))
+    assembled = {k: row[k] for k in row.keys()}
+    assert assembled == {"job_id": "job-1", "status": "queued"}
+
+
+def test_dictrow_unknown_column_raises_indexerror() -> None:
+    row = _db._DictRow(("a",), ("c1",))
+    with pytest.raises(IndexError, match="no column named"):
+        _ = row["nope"]
+
+
+def test_libsqlcursor_fetchone_wraps_tuple_in_dictrow() -> None:
+    fake = _FakeCursor(
+        rows=[("job-1", "queued")],
+        description=[("job_id",), ("status",)],
+    )
+    wrapped = _db._LibsqlCursor(fake)
+    row = wrapped.fetchone()
+    assert row is not None
+    assert row["job_id"] == "job-1"
+    assert row["status"] == "queued"
+
+
+def test_libsqlcursor_fetchone_passes_through_none_at_eof() -> None:
+    fake = _FakeCursor(rows=[], description=[("c",)])
+    assert _db._LibsqlCursor(fake).fetchone() is None
+
+
+def test_libsqlcursor_fetchall_returns_list_of_dictrows() -> None:
+    fake = _FakeCursor(
+        rows=[("1", "a"), ("2", "b")],
+        description=[("id",), ("name",)],
+    )
+    rows = _db._LibsqlCursor(fake).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["id"] == "1"
+    assert rows[1]["name"] == "b"
+
+
+def test_libsqlcursor_forwards_rowcount_and_lastrowid() -> None:
+    fake = _FakeCursor(rowcount=7, lastrowid=42)
+    wrapped = _db._LibsqlCursor(fake)
+    assert wrapped.rowcount == 7
+    assert wrapped.lastrowid == 42
+
+
+class _FakeConn:
+    """Fake libsql-shaped connection for testing _LibsqlConn forwarding."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, Any]] = []
+        self.committed = 0
+        self.rolled_back = 0
+        self.closed = False
+
+    def execute(self, sql: str, params: Any = ()) -> _FakeCursor:
+        self.executed.append((sql, params))
+        return _FakeCursor(
+            rows=[("v",)],
+            description=[("col",)],
+            rowcount=1,
+        )
+
+    def executemany(self, sql: str, params_seq: Any) -> _FakeCursor:
+        self.executed.append((sql, list(params_seq)))
+        return _FakeCursor(rowcount=len(list(params_seq)))
+
+    def executescript(self, sql: str) -> str:
+        self.executed.append(("script", sql))
+        return "ok"
+
+    def commit(self) -> None:
+        self.committed += 1
+
+    def rollback(self) -> None:
+        self.rolled_back += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_libsqlconn_execute_returns_wrapped_cursor() -> None:
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    cur = wrapped.execute("SELECT col FROM t")
+    assert isinstance(cur, _db._LibsqlCursor)
+    assert cur.fetchone()["col"] == "v"
+
+
+def test_libsqlconn_accepts_row_factory_assignment_silently() -> None:
+    """queue.py and settings_store.py do
+    ``self._conn.row_factory = sqlite3.Row``. The wrapper must accept that
+    assignment without raising — even though row_factory has no effect
+    (every cursor already returns _DictRow)."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.row_factory = sqlite3.Row    # must not raise
+    assert wrapped.row_factory is sqlite3.Row
+
+
+def test_libsqlconn_forwards_commit_rollback_close() -> None:
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.commit()
+    wrapped.rollback()
+    wrapped.close()
+    assert fake.committed == 1
+    assert fake.rolled_back == 1
+    assert fake.closed is True
+
+
+def test_libsqlconn_sync_noop_when_underlying_lacks_method() -> None:
+    """Remote-mode libsql connections don't expose .sync(); make sure the
+    wrapper doesn't blow up on those."""
+    fake = _FakeConn()    # no sync attribute
+    wrapped = _db._LibsqlConn(fake)
+    assert wrapped.sync() is None    # should not raise
+
+
+def test_libsqlconn_passes_through_unknown_attrs() -> None:
+    fake = _FakeConn()
+    fake.in_transaction = True    # type: ignore[attr-defined]
+    wrapped = _db._LibsqlConn(fake)
+    assert wrapped.in_transaction is True
