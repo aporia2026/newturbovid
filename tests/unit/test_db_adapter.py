@@ -322,6 +322,41 @@ def test_libsqlconn_passes_regular_sql_through_untouched() -> None:
     assert fake.rolled_back == 0
 
 
+def test_libsqlconn_executemany_unrolls_to_execute_calls() -> None:
+    """libsql remote mode silently no-ops executemany on at least some
+    INSERT shapes (observed prod failure: jobs.INSERT landed, row_queue
+    INSERTs via executemany did not, worker JOIN saw empty queue).
+    The wrapper unrolls executemany into N execute() calls so each row
+    is its own HTTPS round-trip — slower, correct."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.executemany(
+        "INSERT INTO row_queue (job_id, row_num, payload, status) VALUES (?,?,?,?)",
+        [
+            ("j1", 2, "{}", "pending"),
+            ("j1", 3, "{}", "pending"),
+            ("j1", 4, "{}", "pending"),
+        ],
+    )
+    # Each row was sent as its own execute(), NOT one executemany.
+    assert len(fake.executed) == 3
+    for sql, params in fake.executed:
+        assert sql.startswith("INSERT INTO row_queue")
+        assert isinstance(params, tuple)
+        assert len(params) == 4
+    # Row 2 came first.
+    assert fake.executed[0][1][1] == 2
+    assert fake.executed[2][1][1] == 4
+
+
+def test_libsqlconn_executemany_with_empty_seq_is_safe() -> None:
+    """Edge case: empty params list shouldn't blow up or commit anything."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.executemany("INSERT INTO row_queue VALUES (?)", [])
+    assert fake.executed == []
+
+
 def test_libsqlconn_tx_pattern_matches_queue_tx_context_manager() -> None:
     """End-to-end check: replicate exactly what queue.py's _tx() does
     (BEGIN IMMEDIATE → work → COMMIT) and confirm we end up with one

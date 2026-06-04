@@ -241,7 +241,18 @@ class _LibsqlConn:
         return _LibsqlCursor(self._conn.execute(sql, params))
 
     def executemany(self, sql: str, params_seq: Any) -> _LibsqlCursor:
-        return _LibsqlCursor(self._conn.executemany(sql, params_seq))
+        # libsql's remote-mode executemany has been observed to silently
+        # no-op on our INSERT INTO row_queue path (jobs row lands, row_queue
+        # rows don't — the worker's JOIN then sees zero pending rows and
+        # the queue is permanently stuck). Defensive: iterate and use plain
+        # execute, which is verified to work in remote mode. The cost is
+        # one extra HTTPS round-trip per row, which is irrelevant for our
+        # batch sizes (a 50-row submit becomes 50 round-trips ≈ 2-3
+        # seconds, negligible against the multi-minute pipeline).
+        last_cur: Any = _NoopCursor()
+        for params in params_seq:
+            last_cur = self._conn.execute(sql, params)
+        return _LibsqlCursor(last_cur)
 
     def executescript(self, sql: str) -> Any:
         # Return whatever libsql returns — callers never read this cursor.
