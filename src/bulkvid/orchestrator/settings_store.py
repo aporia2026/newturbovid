@@ -92,6 +92,18 @@ class SettingsStore:
         cur = self._conn.execute("SELECT key, value FROM settings")
         return {row["key"]: row["value"] for row in cur.fetchall()}
 
+    def _get_sync(self, key: str) -> str | None:
+        """Return the stored value for ``key`` or ``None`` if no row exists.
+
+        Distinct from ``get(...)`` because the migration helper has to tell
+        ``"value is empty string"`` apart from ``"key was never written"``.
+        """
+        cur = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        )
+        row = cur.fetchone()
+        return row["value"] if row is not None else None
+
     def _set_sync(self, key: str, value: str, updated_by: str) -> str | None:
         """Set value. Returns old value (or None if new key)."""
         now = _now_iso()
@@ -182,6 +194,58 @@ class SettingsStore:
             value_chars=len(value),
         )
         return old
+
+    def migrate_legacy_keys_sync(
+        self,
+        mapping: dict[str, tuple[str, ...]],
+        *,
+        updated_by: str = "migration",
+    ) -> dict[str, list[str]]:
+        """Copy a legacy key's stored value into one or more new keys.
+
+        ``mapping`` is ``{legacy_key: (new_key_1, new_key_2, ...)}``.
+
+        For each ``legacy_key`` that has a row in the store, we copy its
+        ``value`` into every ``new_key`` that doesn't already have a row
+        (so a previously customized new value is never overwritten). The
+        legacy row itself is left in place — it's harmless once it's
+        absent from ``SETTINGS_REGISTRY`` and lets us roll back cleanly.
+
+        Returns ``{legacy_key: [new_keys_actually_written]}`` so the caller
+        can log what happened.
+
+        Idempotent: a second call after the new keys are populated is a no-op.
+
+        Sync because startup (``_build_state``) and the WSGI entrypoint are
+        both sync — keeping this off the event loop avoids forcing those
+        callers to manage an asyncio runtime just to run a one-time copy.
+        """
+        result: dict[str, list[str]] = {}
+        for legacy_key, new_keys in mapping.items():
+            existing = self._get_sync(legacy_key)
+            if existing is None:
+                # Legacy row never existed on this deploy — nothing to migrate.
+                continue
+            written: list[str] = []
+            for new_key in new_keys:
+                already = self._get_sync(new_key)
+                if already is not None:
+                    # Admin has already customized the new key; don't overwrite.
+                    continue
+                self._set_sync(new_key, existing, updated_by)
+                written.append(new_key)
+            if written:
+                _log.info(
+                    "settings_migrated",
+                    legacy_key=legacy_key,
+                    new_keys=written,
+                    value_chars=len(existing),
+                )
+                result[legacy_key] = written
+        # Invalidate cache so the next get reads the migrated values.
+        self._cache_loaded_at = 0.0
+        self._cache = {}
+        return result
 
     async def audit(
         self, key: str | None = None, limit: int = 50

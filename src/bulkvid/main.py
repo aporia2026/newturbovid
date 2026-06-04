@@ -26,7 +26,12 @@ from bulkvid.auth import build_verifier_from_settings
 from bulkvid.config import get_settings
 from bulkvid.logging import configure_logging, get_logger
 from bulkvid.orchestrator.queue import JobQueue
-from bulkvid.orchestrator.runtime_settings import registry_defaults
+from bulkvid.orchestrator.runtime_settings import (
+    SETTING_SCRIPT_SYSTEM_PROMPT,
+    SETTING_SIMPLE_SCRIPT_PROMPT,
+    SETTING_SIMPLE_X4_SCRIPT_PROMPT,
+    registry_defaults,
+)
 from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.routes import admin as admin_routes
 from bulkvid.routes import health as health_routes
@@ -53,6 +58,18 @@ def _build_state(app: FastAPI) -> None:
     app.state.queue = JobQueue(data_dir / "jobs.db")
     app.state.settings_store = SettingsStore(
         data_dir / "settings.db", defaults=registry_defaults()
+    )
+    # One-shot migration: the legacy single ``script_system_prompt`` becomes
+    # the per-tab ``simple_script_prompt`` + ``simple_x4_script_prompt`` so
+    # any admin customization made before 2026-06-04 survives the split.
+    # Idempotent — safe to call on every boot.
+    app.state.settings_store.migrate_legacy_keys_sync(
+        {
+            SETTING_SCRIPT_SYSTEM_PROMPT: (
+                SETTING_SIMPLE_SCRIPT_PROMPT,
+                SETTING_SIMPLE_X4_SCRIPT_PROMPT,
+            ),
+        }
     )
     app.state.verifier = build_verifier_from_settings(settings)
     # Local-dev only: manages the cloudflared quick tunnel for the admin panel.

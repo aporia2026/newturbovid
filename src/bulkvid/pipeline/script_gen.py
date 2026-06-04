@@ -24,10 +24,12 @@ from bulkvid.adapters.openai_client import MODEL_SCRIPT_GEN, OpenAIClient
 from bulkvid.logging import get_logger
 from bulkvid.orchestrator.runtime_settings import (
     SCRIPT_SYSTEM_PROMPT_DEFAULT,
-    SETTING_SCRIPT_SYSTEM_PROMPT,
+    SETTING_SENSITIVE_APPAREL_RULES,
+    SETTING_SIMPLE_SCRIPT_PROMPT,
 )
 from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.pipeline.open_comments import OpenCommentsAnalysis, OpenCommentsMode
+from bulkvid.pipeline.safety import SAFE, SafetyContext, append_safety_block
 
 _log = get_logger("script")
 
@@ -144,6 +146,8 @@ async def generate_script(
     target_words: int = DEFAULT_TARGET_WORDS,
     model: str = MODEL_SCRIPT_GEN,
     settings_store: SettingsStore | None = None,
+    prompt_setting_key: str = SETTING_SIMPLE_SCRIPT_PROMPT,
+    safety: SafetyContext = SAFE,
 ) -> ScriptResult:
     """Generate (or pass through) a ~10-second VO script.
 
@@ -151,8 +155,13 @@ async def generate_script(
     no LLM call, zero cost. Every other mode runs gpt-5.4-mini in JSON mode.
 
     When ``settings_store`` is provided, the system-prompt template is read
-    from it (``script_system_prompt`` key) — this is what makes the prompt
-    admin-editable without a redeploy.
+    from it (``prompt_setting_key``) — this is what makes the prompt
+    admin-editable without a redeploy. Callers pass the tab-specific key
+    (``simple_script_prompt`` for Simple/4Images-VO2, ``simple_x4_script_prompt``
+    for Image-VO) so each tab can be tuned independently.
+
+    When ``safety.matched`` is true, the admin's sensitive-apparel safety
+    block is appended to the system prompt before the LLM call.
     """
     # Mode OVERRIDE: use the user's text verbatim. Highest-priority signal.
     if open_comments.mode is OpenCommentsMode.OVERRIDE and open_comments.override_script:
@@ -174,10 +183,17 @@ async def generate_script(
         )
 
     template = SYSTEM_PROMPT_TEMPLATE
+    safety_block = ""
     if settings_store is not None:
         template = await settings_store.get(
-            SETTING_SCRIPT_SYSTEM_PROMPT, default=SYSTEM_PROMPT_TEMPLATE
+            prompt_setting_key, default=SYSTEM_PROMPT_TEMPLATE
         )
+        if safety.matched:
+            # No explicit default — let the store fall through to the
+            # registered default (``SENSITIVE_APPAREL_RULES_DEFAULT``).
+            safety_block = await settings_store.get(
+                SETTING_SENSITIVE_APPAREL_RULES
+            )
 
     system = _format_system_prompt(
         template,
@@ -187,6 +203,14 @@ async def generate_script(
         script_pattern=script_pattern,
         target_words=target_words,
     )
+    system = append_safety_block(system, safety, safety_block)
+    if safety.matched:
+        _log.info(
+            "safety_applied",
+            stage="script_prompt",
+            prompt_key=prompt_setting_key,
+            matched_keyword=safety.matched_keyword,
+        )
 
     # When the bulk team typed DIRECTIVES into Open Comments, they're explicit
     # per-row overrides. They MUST be honored even if they conflict with the

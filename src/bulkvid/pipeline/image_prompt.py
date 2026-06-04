@@ -25,6 +25,9 @@ from bulkvid.adapters.openai_client import (
     OpenAIClient,
 )
 from bulkvid.logging import get_logger
+from bulkvid.orchestrator.runtime_settings import SETTING_SENSITIVE_APPAREL_RULES
+from bulkvid.orchestrator.settings_store import SettingsStore
+from bulkvid.pipeline.safety import SAFE, SafetyContext, append_safety_block
 
 _log = get_logger("imageprompt")
 
@@ -138,22 +141,44 @@ async def build_collage_prompt(
     description: str,
     model: str = MODEL_COLLAGE_PROMPT,
     article_excerpt: str = "",
+    *,
+    settings_store: SettingsStore | None = None,
+    safety: SafetyContext = SAFE,
 ) -> tuple[str, float]:
     """gpt-5.4-mini builds the 2x2 collage prompt. Returns ``(prompt, cost_usd)``.
 
     Keeps the inspiration's headline + CTA + layout verbatim and changes ONLY the
     photo; ``article_excerpt`` (when given) grounds the new photo in the article
-    topic rather than whatever the inspiration photo happened to show."""
+    topic rather than whatever the inspiration photo happened to show.
+
+    When ``safety.matched`` the admin's sensitive-apparel safety block is
+    appended to the user message before the LLM call, so the generated image
+    description forces product-only frames with no humans.
+    """
+    user_message = _collage_user_message(description, article_excerpt)
+    if safety.matched and settings_store is not None:
+        # No explicit default — let the store fall through to the registered
+        # default (``SENSITIVE_APPAREL_RULES_DEFAULT``).
+        safety_block = await settings_store.get(SETTING_SENSITIVE_APPAREL_RULES)
+        user_message = append_safety_block(user_message, safety, safety_block)
+        if safety_block.strip():
+            _log.info(
+                "safety_applied",
+                stage="collage_prompt",
+                matched_keyword=safety.matched_keyword,
+            )
+
     _log.info(
         "collage_prompt_submit",
         description_chars=len(description),
         article_chars=len(article_excerpt),
+        safety_matched=safety.matched,
     )
     result = await client.chat(
         model=model,
         messages=[
             {"role": "system", "content": _COLLAGE_SYSTEM},
-            {"role": "user", "content": _collage_user_message(description, article_excerpt)},
+            {"role": "user", "content": user_message},
         ],
         max_tokens=800,
         temperature=0.7,

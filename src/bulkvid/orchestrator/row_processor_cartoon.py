@@ -55,6 +55,7 @@ from bulkvid.pipeline.cartoon_prompt import (
 )
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
+from bulkvid.pipeline.safety import resolve_safety
 
 _log = get_logger("row")
 
@@ -178,6 +179,12 @@ async def process_cartoon_row(
             analysis = await classify_open_comments(clients.openai, row.open_comments)
             costs.classify += analysis.cost_usd
 
+            safety = await resolve_safety(
+                clients.settings_store, row.vertical, row.row_num
+            )
+            metadata["safety_matched"] = safety.matched
+            metadata["safety_keyword"] = safety.matched_keyword
+
             plan = await generate_cartoon_plan(
                 clients.openai,
                 article_body=article_body,
@@ -188,6 +195,8 @@ async def process_cartoon_row(
                 open_comments=analysis,
                 num_ideas=CARTOON_NUM_IDEAS,
                 num_shots=CARTOON_NUM_SHOTS,
+                settings_store=clients.settings_store,
+                safety=safety,
             )
             costs.plan += plan.cost_usd
             metadata["language"] = lang.language

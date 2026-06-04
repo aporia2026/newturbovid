@@ -13,7 +13,7 @@ from bulkvid.config import Settings, get_settings
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runtime_settings import (
     SCRIPT_SYSTEM_PROMPT_DEFAULT,
-    SETTING_SCRIPT_SYSTEM_PROMPT,
+    SETTING_SIMPLE_SCRIPT_PROMPT,
     registry_defaults,
 )
 from bulkvid.orchestrator.settings_store import SettingsStore
@@ -66,7 +66,7 @@ def test_settings_list_renders_registered_settings(client: TestClient) -> None:
     r = client.get("/admin/settings", headers=_basic("yoav", "tenta20"))
     assert r.status_code == 200
     body = r.text
-    assert "Script generator system prompt" in body
+    assert "Simple: script prompt" in body
     # The default value's preview shows somewhere in the table.
     assert "commercial or educational video" in body
 
@@ -76,12 +76,12 @@ def test_settings_list_renders_registered_settings(client: TestClient) -> None:
 
 def test_settings_detail_renders_current_value(client: TestClient) -> None:
     r = client.get(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         headers=_basic("yoav", "tenta20"),
     )
     assert r.status_code == 200
     body = r.text
-    assert "Script generator system prompt" in body
+    assert "Simple: script prompt" in body
     # Some recognizable line from the default prompt.
     assert "Hard maximum: 20 words" in body
 
@@ -99,17 +99,17 @@ def test_save_persists_new_value_and_redirects(
 ) -> None:
     new_value = "REPLACED PROMPT for testing"
     r = client.post(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         headers=_basic("yoav", "tenta20"),
         data={"value": new_value},
         follow_redirects=False,
     )
     assert r.status_code == 303
-    assert r.headers["location"] == f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}"
+    assert r.headers["location"] == f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}"
 
     # Detail page now shows the new value.
     detail = client.get(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         headers=_basic("yoav", "tenta20"),
     )
     assert "REPLACED PROMPT for testing" in detail.text
@@ -135,20 +135,20 @@ def test_reset_restores_default(client: TestClient) -> None:
 
     # First save a custom value.
     client.post(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         headers=auth, data={"value": "custom"},
         follow_redirects=False,
     )
     # Now reset.
     r = client.post(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}/reset",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}/reset",
         headers=auth,
         follow_redirects=False,
     )
     assert r.status_code == 303
 
     detail = client.get(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}", headers=auth
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}", headers=auth
     )
     body = detail.text
     # The full default prompt is back.
@@ -160,7 +160,7 @@ def test_reset_restores_default(client: TestClient) -> None:
 
 def test_save_without_auth_returns_401(client: TestClient) -> None:
     r = client.post(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         data={"value": "x"},
     )
     assert r.status_code == 401
@@ -169,12 +169,12 @@ def test_save_without_auth_returns_401(client: TestClient) -> None:
 def test_audit_log_shows_in_detail_page_after_edits(client: TestClient) -> None:
     auth = _basic("yoav", "tenta20")
     client.post(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}",
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}",
         headers=auth, data={"value": "edit-one"},
         follow_redirects=False,
     )
     detail = client.get(
-        f"/admin/settings/{SETTING_SCRIPT_SYSTEM_PROMPT}", headers=auth
+        f"/admin/settings/{SETTING_SIMPLE_SCRIPT_PROMPT}", headers=auth
     )
     body = detail.text
     assert "Change history" in body

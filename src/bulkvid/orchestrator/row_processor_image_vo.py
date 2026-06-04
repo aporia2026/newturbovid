@@ -54,10 +54,12 @@ from bulkvid.models.row import (
     RowResult,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_X4_SCRIPT_PROMPT
 from bulkvid.pipeline.image_gen import edit_with_fallback
 from bulkvid.pipeline.image_prompt import build_collage_prompt, describe_source_image
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
+from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
 
 _log = get_logger("row")
@@ -212,6 +214,14 @@ async def process_image_vo_row(
             )
         source_url, source_b64 = source_result
 
+        # ─── Sensitive-apparel safeguard (per row, before the parallel work) ───
+
+        safety = await resolve_safety(
+            clients.settings_store, row.vertical, row.row_num
+        )
+        metadata["safety_matched"] = safety.matched
+        metadata["safety_keyword"] = safety.matched_keyword
+
         # ─── Stage 2 + 8 (parallel): image-side prompt build + script-side run ───
 
         async def _image_side() -> list[bytes] | Exception:
@@ -221,7 +231,11 @@ async def process_image_vo_row(
                 # Keep the ad's text/CTA, change only the photo — grounded in the
                 # article topic, not whatever the inspiration photo showed.
                 collage_prompt, c2 = await build_collage_prompt(
-                    clients.openai, description, article_excerpt=article_body[:1500]
+                    clients.openai,
+                    description,
+                    article_excerpt=article_body[:1500],
+                    settings_store=clients.settings_store,
+                    safety=safety,
                 )
                 costs.collage_prompt += c2
 
@@ -270,6 +284,8 @@ async def process_image_vo_row(
                     script_pattern=row.script_pattern,
                     open_comments=analysis,
                     settings_store=clients.settings_store,
+                    prompt_setting_key=SETTING_SIMPLE_X4_SCRIPT_PROMPT,
+                    safety=safety,
                 )
                 costs.script += script.cost_usd
                 metadata["language"] = lang.language

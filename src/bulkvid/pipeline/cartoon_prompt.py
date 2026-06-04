@@ -30,7 +30,14 @@ from typing import Any
 
 from bulkvid.adapters.openai_client import MODEL_SCRIPT_GEN, OpenAIClient
 from bulkvid.logging import get_logger
+from bulkvid.orchestrator.runtime_settings import (
+    CARTOON_PLANNER_PROMPT_DEFAULT,
+    SETTING_CARTOON_PLANNER_PROMPT,
+    SETTING_SENSITIVE_APPAREL_RULES,
+)
+from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.pipeline.open_comments import OpenCommentsAnalysis
+from bulkvid.pipeline.safety import SAFE, SafetyContext, append_safety_block
 
 _log = get_logger("cartoonprompt")
 
@@ -101,38 +108,35 @@ class CartoonPlan:
 # ── Prompt construction ──────────────────────────────────────────────────────
 
 
-def _system_prompt(language: str, num_ideas: int, num_shots: int) -> str:
-    return (
-        "You are a creative director making SHORT animated cartoon social videos "
-        "from a news article. You plan the visuals and a tight voiceover.\n\n"
-        f"Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a "
-        f"separate ~6-7 second video told in exactly {num_shots} shots.\n\n"
-        "For EACH idea return:\n"
-        f"- voiceover: ONE short spoken line in {language or 'the article language'}, "
-        f"about {CARTOON_TARGET_WORDS} words ({CARTOON_MIN_WORDS}-{CARTOON_MAX_WORDS}), "
-        "natural and engaging, readable in ~6-7 seconds.\n"
-        "- style_direction: a short delivery hint for the voice actor.\n"
-        f"- shots: an array of exactly {num_shots} shots, each with:\n"
-        "    * scene: a vivid description of ONE cartoon scene (subject, setting, "
-        "framing). Vertical composition.\n"
-        "    * motion: how that scene should gently animate (small, natural "
-        "movements and subtle camera moves).\n\n"
-        "HARD RULES:\n"
-        "1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, "
-        "named, or recognizable public figure. NEVER name a real brand or "
-        "manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all "
-        "vehicles, products, and signage as plain and unbranded — no logos, badges, "
-        "or readable license plates.\n"
-        "2. Within one idea, keep ONE recurring main character and describe them "
-        "IDENTICALLY across the shots (same age, hair, clothing) so the shots feel "
-        "like one continuous scene.\n"
-        "3. NO legible on-screen text: keep any screens, signs, phones, or papers "
-        "abstract, blurred, or out of focus. Do not ask for words or numbers.\n"
-        "4. Keep it tasteful and brand-safe.\n\n"
-        'Return STRICT JSON only, shaped exactly like:\n'
-        '{"ideas": [{"voiceover": "...", "style_direction": "...", '
-        '"shots": [{"scene": "...", "motion": "..."}]}]}'
-    )
+def _format_planner_prompt(
+    template: str, *, language: str, num_ideas: int, num_shots: int
+) -> str:
+    """Substitute the planner's per-row placeholders into the admin template.
+
+    Tolerant of unknown ``{...}`` tokens — admin edits may drop a placeholder
+    or paste literal braces in examples. KeyError falls through to a one-by-one
+    replacement that leaves unknown tokens as-is.
+    """
+    vars: dict[str, object] = {
+        "language": language or "the article language",
+        "num_ideas": num_ideas,
+        "num_shots": num_shots,
+        "target_words": CARTOON_TARGET_WORDS,
+        "min_words": CARTOON_MIN_WORDS,
+        "max_words": CARTOON_MAX_WORDS,
+    }
+    try:
+        return template.format(**vars)
+    except (KeyError, IndexError) as e:
+        _log.warning(
+            "cartoon_planner_substitution_warning",
+            error=str(e),
+            note="missing placeholder; using literal fallback",
+        )
+        out = template
+        for k, v in vars.items():
+            out = out.replace("{" + k + "}", str(v))
+        return out
 
 
 def _user_message(
@@ -341,15 +345,46 @@ async def generate_cartoon_plan(
     num_ideas: int = DEFAULT_NUM_IDEAS,
     num_shots: int = DEFAULT_NUM_SHOTS,
     model: str = MODEL_SCRIPT_GEN,
+    settings_store: SettingsStore | None = None,
+    safety: SafetyContext = SAFE,
 ) -> CartoonPlan:
     """Plan ``num_ideas`` cartoon videos from the article. Never raises.
 
     On any parse/shape problem it falls back to a generic on-topic plan so the
     row still ships rather than blocking the batch.
+
+    The planner system prompt is admin-editable via the ``cartoon_planner_prompt``
+    setting; when ``safety.matched`` the sensitive-apparel block is appended
+    so both the voiceover and the scene descriptions stay product-only.
     """
-    system = _system_prompt(language, num_ideas, num_shots)
+    template = CARTOON_PLANNER_PROMPT_DEFAULT
+    safety_block = ""
+    if settings_store is not None:
+        template = await settings_store.get(
+            SETTING_CARTOON_PLANNER_PROMPT, default=CARTOON_PLANNER_PROMPT_DEFAULT
+        )
+        if safety.matched:
+            # No explicit default — let the store fall through to the
+            # registered default (``SENSITIVE_APPAREL_RULES_DEFAULT``).
+            safety_block = await settings_store.get(
+                SETTING_SENSITIVE_APPAREL_RULES
+            )
+
+    system = _format_planner_prompt(
+        template,
+        language=language,
+        num_ideas=num_ideas,
+        num_shots=num_shots,
+    )
     if script_pattern.strip():
         system += f"\n\nPreferred opening style: {script_pattern.strip()}."
+    system = append_safety_block(system, safety, safety_block)
+    if safety.matched:
+        _log.info(
+            "safety_applied",
+            stage="cartoon_planner_prompt",
+            matched_keyword=safety.matched_keyword,
+        )
     user = _user_message(article_body, open_comments)
 
     _log.info(

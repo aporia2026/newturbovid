@@ -33,7 +33,12 @@ from bulkvid.logging import configure_logging, get_logger
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runner import BatchRunner
-from bulkvid.orchestrator.runtime_settings import registry_defaults
+from bulkvid.orchestrator.runtime_settings import (
+    SETTING_SCRIPT_SYSTEM_PROMPT,
+    SETTING_SIMPLE_SCRIPT_PROMPT,
+    SETTING_SIMPLE_X4_SCRIPT_PROMPT,
+    registry_defaults,
+)
 from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.orchestrator.sheet_writer import (
     CoalescedSheetWriter,
@@ -114,6 +119,17 @@ async def run() -> None:
     queue = JobQueue(db_path)
     settings_store = SettingsStore(
         data_dir / "settings.db", defaults=registry_defaults()
+    )
+    # Migrate the legacy single-prompt key to the per-tab keys. Web app does
+    # the same on its boot; both running it is safe — the inner check skips
+    # already-populated keys.
+    settings_store.migrate_legacy_keys_sync(
+        {
+            SETTING_SCRIPT_SYSTEM_PROMPT: (
+                SETTING_SIMPLE_SCRIPT_PROMPT,
+                SETTING_SIMPLE_X4_SCRIPT_PROMPT,
+            ),
+        }
     )
     clients = build_pipeline_clients(settings)
     clients.settings_store = settings_store

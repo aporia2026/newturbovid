@@ -43,8 +43,10 @@ from bulkvid.models.row import (
     SimpleRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
+from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
 
 _log = get_logger("row")
@@ -147,6 +149,12 @@ async def process_simple_row(
             analysis = await classify_open_comments(clients.openai, row.open_comments)
             costs.classify += analysis.cost_usd
 
+            safety = await resolve_safety(
+                clients.settings_store, row.vertical, row.row_num
+            )
+            metadata["safety_matched"] = safety.matched
+            metadata["safety_keyword"] = safety.matched_keyword
+
             script = await generate_script(
                 clients.openai,
                 article_body=article_body,
@@ -156,6 +164,8 @@ async def process_simple_row(
                 script_pattern=row.script_pattern,
                 open_comments=analysis,
                 settings_store=clients.settings_store,
+                prompt_setting_key=SETTING_SIMPLE_SCRIPT_PROMPT,
+                safety=safety,
             )
             costs.script += script.cost_usd
             metadata["language"] = lang.language
