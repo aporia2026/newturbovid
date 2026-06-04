@@ -262,3 +262,88 @@ def test_libsqlconn_passes_through_unknown_attrs() -> None:
     fake.in_transaction = True    # type: ignore[attr-defined]
     wrapped = _db._LibsqlConn(fake)
     assert wrapped.in_transaction is True
+
+
+# ── Transaction-statement translation (the wal_insert_begin failure) ───────
+# libsql manages WAL transactions internally; raw execute("COMMIT") raises
+# ``ValueError: wal_insert_begin failed`` because it tries to start a fresh
+# transaction to commit, with no actual transaction open. queue.py's _tx()
+# was written for sqlite3 autocommit-with-explicit-BEGIN/COMMIT semantics,
+# so the wrapper has to translate those three statements into libsql's
+# native commit()/rollback() calls.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["BEGIN", "BEGIN IMMEDIATE", "begin immediate", "BEGIN EXCLUSIVE", "BEGIN DEFERRED"],
+)
+def test_libsqlconn_execute_begin_is_noop(sql: str) -> None:
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    cur = wrapped.execute(sql)
+    # No-op cursor; nothing forwarded to libsql.
+    assert fake.executed == []
+    assert cur.fetchone() is None    # no rows from a BEGIN
+    assert cur.fetchall() == []
+
+
+@pytest.mark.parametrize("sql", ["COMMIT", "commit", "COMMIT;", "END", "END TRANSACTION"])
+def test_libsqlconn_execute_commit_translates_to_native_commit(sql: str) -> None:
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.execute(sql)
+    assert fake.committed == 1
+    # Did NOT forward as a regular execute (which would push to the
+    # ``executed`` list and trigger the libsql wal_insert_begin bug).
+    assert fake.executed == []
+
+
+@pytest.mark.parametrize("sql", ["ROLLBACK", "rollback", "ROLLBACK;", "ROLLBACK TRANSACTION"])
+def test_libsqlconn_execute_rollback_translates_to_native_rollback(sql: str) -> None:
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.execute(sql)
+    assert fake.rolled_back == 1
+    assert fake.executed == []
+
+
+def test_libsqlconn_passes_regular_sql_through_untouched() -> None:
+    """Defense: we only intercept transaction statements. Regular DML/DDL
+    must still hit libsql so the data actually lands."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.execute("INSERT INTO jobs (job_id) VALUES (?)", ("job-1",))
+    wrapped.execute("SELECT * FROM jobs WHERE job_id = ?", ("job-1",))
+    assert len(fake.executed) == 2
+    assert fake.committed == 0    # no implicit commit
+    assert fake.rolled_back == 0
+
+
+def test_libsqlconn_tx_pattern_matches_queue_tx_context_manager() -> None:
+    """End-to-end check: replicate exactly what queue.py's _tx() does
+    (BEGIN IMMEDIATE → work → COMMIT) and confirm we end up with one
+    libsql .commit() call and zero broken execute("COMMIT") forwards."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+
+    wrapped.execute("BEGIN IMMEDIATE")
+    wrapped.execute("INSERT INTO jobs (job_id, status) VALUES (?, ?)", ("j1", "queued"))
+    wrapped.execute("INSERT INTO row_queue (job_id, row_num) VALUES (?, ?)", ("j1", 2))
+    wrapped.execute("COMMIT")
+
+    # The two DML statements landed. The BEGIN/COMMIT were translated.
+    assert len(fake.executed) == 2
+    assert fake.committed == 1
+    assert fake.rolled_back == 0
+
+
+def test_libsqlconn_tx_pattern_with_rollback_matches_queue_tx_on_error() -> None:
+    """Same end-to-end check, error path."""
+    fake = _FakeConn()
+    wrapped = _db._LibsqlConn(fake)
+    wrapped.execute("BEGIN IMMEDIATE")
+    wrapped.execute("INSERT INTO jobs (job_id) VALUES (?)", ("j1",))
+    wrapped.execute("ROLLBACK")
+    assert len(fake.executed) == 1
+    assert fake.rolled_back == 1
+    assert fake.committed == 0

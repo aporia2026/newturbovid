@@ -89,6 +89,36 @@ class _DictRow:
         return f"_DictRow({dict(zip(self._keys, self._data, strict=False))!r})"
 
 
+class _NoopCursor:
+    """Stand-in cursor returned from translated BEGIN/COMMIT/ROLLBACK calls.
+
+    queue.py and settings_store.py never read the return value of those
+    statements, so this just needs to be safely callable for the
+    attributes ``_LibsqlCursor`` forwards. Keeps the wrapper from blowing
+    up if a future caller does ``cur.fetchone()`` on the result of a
+    transaction statement.
+    """
+
+    description: list[tuple] | None = None
+    rowcount: int = 0
+    lastrowid: int | None = None
+
+    def fetchone(self) -> None:
+        return None
+
+    def fetchall(self) -> list:
+        return []
+
+    def fetchmany(self, size: int | None = None) -> list:
+        return []
+
+    def __iter__(self) -> Any:
+        return iter(())
+
+    def close(self) -> None:
+        return None
+
+
 class _LibsqlCursor:
     """Thin pass-through cursor that wraps every fetched row in ``_DictRow``.
 
@@ -130,10 +160,37 @@ class _LibsqlCursor:
         return getattr(self._cur, name)
 
 
+def _is_begin_stmt(sql: str) -> bool:
+    """``BEGIN`` / ``BEGIN IMMEDIATE`` / ``BEGIN EXCLUSIVE`` / ``BEGIN DEFERRED``."""
+    head = sql.strip().split(None, 1)[0].upper() if sql.strip() else ""
+    return head == "BEGIN"
+
+
+def _is_commit_stmt(sql: str) -> bool:
+    head = sql.strip().rstrip(";").upper()
+    return head in ("COMMIT", "END", "COMMIT TRANSACTION", "END TRANSACTION")
+
+
+def _is_rollback_stmt(sql: str) -> bool:
+    head = sql.strip().rstrip(";").upper()
+    return head in ("ROLLBACK", "ROLLBACK TRANSACTION")
+
+
 class _LibsqlConn:
     """Connection wrapper that returns ``_LibsqlCursor`` from every
     ``execute``/``executemany``/``cursor`` call so callers see dict-like
-    rows. Everything else forwards.
+    rows. Also translates raw transaction statements into libsql's native
+    transaction methods — ``execute("BEGIN IMMEDIATE")`` becomes a no-op,
+    ``execute("COMMIT")`` becomes ``conn.commit()``, and
+    ``execute("ROLLBACK")`` becomes ``conn.rollback()``.
+
+    Why: libsql manages WAL transactions internally (via its
+    ``commit()`` / ``rollback()`` methods). If you hand it a raw
+    ``execute("COMMIT")`` it tries to start a fresh WAL transaction to
+    "commit", which then fails with ``ValueError: wal_insert_begin
+    failed``. queue.py's ``_tx()`` context manager was written for plain
+    sqlite3's autocommit-with-explicit-BEGIN/COMMIT idiom; this shim
+    keeps that idiom working unchanged for libsql callers.
     """
 
     def __init__(self, conn: Any) -> None:
@@ -144,6 +201,18 @@ class _LibsqlConn:
         self.row_factory: Any = None
 
     def execute(self, sql: str, params: Any = ()) -> _LibsqlCursor:
+        # Translate the three transaction statements queue.py issues via
+        # raw ``execute`` into libsql's native commit/rollback. BEGIN is a
+        # no-op because libsql implicitly starts a transaction on the
+        # first DML in DEFERRED isolation mode (libsql's default).
+        if _is_begin_stmt(sql):
+            return _LibsqlCursor(_NoopCursor())
+        if _is_commit_stmt(sql):
+            self._conn.commit()
+            return _LibsqlCursor(_NoopCursor())
+        if _is_rollback_stmt(sql):
+            self._conn.rollback()
+            return _LibsqlCursor(_NoopCursor())
         return _LibsqlCursor(self._conn.execute(sql, params))
 
     def executemany(self, sql: str, params_seq: Any) -> _LibsqlCursor:
