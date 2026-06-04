@@ -49,9 +49,11 @@ from bulkvid.models.row import (
 )
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.pipeline.cartoon_prompt import (
+    CARTOON_TARGET_WORDS,
     CartoonIdea,
     generate_cartoon_plan,
     image_prompt_for_shot,
+    shorten_voiceover,
 )
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
@@ -64,29 +66,26 @@ _log = get_logger("row")
 
 CARTOON_NUM_IDEAS = 2          # videos per row (Ready Video 1 + 2)
 CARTOON_NUM_SHOTS = 2          # shots stitched per video
-SEEDANCE_DURATION_SHORT = 4    # default seconds per Seedance clip (4/8/12 only)
-SEEDANCE_DURATION_LONG = 8     # bumped last shot when the VO needs more room
+SEEDANCE_DURATION_SHORT = 4    # seconds per Seedance clip (4/8/12 only)
 SEEDANCE_RESOLUTION = "720p"
 IMAGE_RESOLUTION = "1K"        # nano-banana-2 resolution (animated -> 720p)
-NO_VO_PER_SHOT_SECONDS = 3.5   # per-shot length when Voice Over = No (gives 7s, in band)
-MIN_PER_SHOT_SECONDS = 1.5     # floor so a short VO never yields micro-cuts
 
-# Soft band [MIN, MAX] for short and normal VOs: short VOs extend with held
-# video + a brief trailing silence (= VO_TAIL), longer VOs land near the soft
-# ceiling. When the natural target would exceed MAX, instead of audio-fading
-# into the last spoken word the LAST shot is re-rendered at Seedance 8s and
-# the video extends up to TARGET_VIDEO_HARD_MAX_SECONDS so the VO finishes
-# cleanly. Audio is only ever truncated when even the hard max isn't enough.
-TARGET_VIDEO_MIN_SECONDS = 4.0
-TARGET_VIDEO_MAX_SECONDS = 8.0
-TARGET_VIDEO_HARD_MAX_SECONDS = 11.0    # 4s first shot + up to 7s of an 8s last shot
-VO_TAIL_SECONDS = 0.8          # silence dwell after VO ends, before the cap
+# Cartoon videos are a **flat 8.0s every time**. Two 4s Seedance clips concat
+# to 8s of footage; the VO overlays the first ~6-7s of that with VO_TAIL
+# silence dwell to the end. If the synthesized VO measures effectively longer
+# than MAX_EFFECTIVE_VO_SECONDS, the row processor calls shorten_voiceover()
+# and re-TTSes ONCE; if it still doesn't fit, the idea is dropped and the
+# OTHER idea ships. The audio is never truncated mid-word.
+# See _plans/2026-06-04-cartoon-8s-hard-cap.md.
+TARGET_VIDEO_SECONDS = 8.0
+VO_TAIL_SECONDS = 0.5                                  # silence dwell after VO
+MAX_EFFECTIVE_VO_SECONDS = TARGET_VIDEO_SECONDS - VO_TAIL_SECONDS    # 7.5s
 
-# When effective_vo > this, the row processor bumps the LAST shot's Seedance
-# clip to SEEDANCE_DURATION_LONG so the video has room to fit the full VO + a
-# dwell. Threshold lives just below where the audio fade would otherwise start
-# eating the last word at the soft ceiling.
-LONG_AUDIO_THRESHOLD_SECONDS = 7.5
+# When shortening a too-long VO, target this many fewer words than the
+# planner's normal target — and never go below VO_SHORTEN_MIN_WORDS (a 6-word
+# line is roughly 4s at slow delivery, leaving healthy margin under the cap).
+VO_SHORTEN_MIN_WORDS = 6
+VO_SHORTEN_STEP = 3
 
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:
@@ -210,26 +209,87 @@ async def process_cartoon_row(
             """Build one stitched, voiced, optionally-captioned video. None on failure."""
             nonlocal zapcap_failed
             try:
-                # 4a. Voiceover (optional). Video length follows the VO with a
-                # small dwell. Soft band [MIN, MAX]: VOs in the band give a
-                # ~0.8s tail after the last word; floor pads with held video;
-                # ceiling triggers the LAST shot to re-render at Seedance 8s so
-                # the video can extend up to TARGET_VIDEO_HARD_MAX without
-                # truncating the audio. per_clip_seconds and seedance_durations
-                # are per-shot so the long-VO mode can use 4s + 8s.
+                # 4a. Voiceover (optional). Hard-cap design: video is ALWAYS
+                # TARGET_VIDEO_SECONDS (8.0s), two equal 4s Seedance clips. If
+                # the synthesized VO measures effectively longer than
+                # MAX_EFFECTIVE_VO_SECONDS, shorten the line and re-TTS ONCE;
+                # if that still doesn't fit, drop the idea so the OTHER idea
+                # can still ship. The audio is never truncated mid-word.
                 vo_url: str | None = None
                 seedance_durations: list[int] = [SEEDANCE_DURATION_SHORT] * CARTOON_NUM_SHOTS
-                per_clip_seconds: list[float] = [NO_VO_PER_SHOT_SECONDS] * CARTOON_NUM_SHOTS
-                target_video_seconds = NO_VO_PER_SHOT_SECONDS * CARTOON_NUM_SHOTS
-                long_audio = False
+                per_clip_seconds: list[float] = [float(SEEDANCE_DURATION_SHORT)] * CARTOON_NUM_SHOTS
+                target_video_seconds = TARGET_VIDEO_SECONDS
+
                 if row.voice_over:
+                    final_text = idea.voiceover
                     tts = await clients.tts.synthesize(
-                        text=idea.voiceover,
+                        text=final_text,
                         language=lang.language,
                         style_prompt=idea.style_direction,
                         country=row.country,
                     )
                     costs.tts += tts.cost_usd
+                    # The concat command speeds the VO up by SPEECH_ATEMPO, so
+                    # the effective played length is shorter than the raw WAV.
+                    effective = tts.duration_seconds / SPEECH_ATEMPO
+                    original_effective = effective
+                    shortened = False
+
+                    if effective > MAX_EFFECTIVE_VO_SECONDS:
+                        shorten_target = max(
+                            VO_SHORTEN_MIN_WORDS,
+                            CARTOON_TARGET_WORDS - VO_SHORTEN_STEP,
+                        )
+                        _log.warning(
+                            "cartoon_vo_too_long_shortening",
+                            idea=idx + 1,
+                            original_words=len(final_text.split()),
+                            original_effective=round(effective, 3),
+                            shorten_target_words=shorten_target,
+                        )
+                        shorten_result = await shorten_voiceover(
+                            clients.openai,
+                            text=final_text,
+                            language=lang.language,
+                            target_words=shorten_target,
+                        )
+                        costs.plan += shorten_result.cost_usd
+
+                        # The shortener's defensive fallbacks (bad JSON, empty
+                        # response, not-actually-shorter) return the original
+                        # text. There's no point re-TTSing the same string —
+                        # drop the idea now.
+                        if shorten_result.voiceover == final_text:
+                            _log.error(
+                                "cartoon_vo_shortener_no_change_dropped",
+                                idea=idx + 1,
+                                original_effective=round(effective, 3),
+                            )
+                            return None
+
+                        final_text = shorten_result.voiceover
+                        tts = await clients.tts.synthesize(
+                            text=final_text,
+                            language=lang.language,
+                            style_prompt=idea.style_direction,
+                            country=row.country,
+                        )
+                        costs.tts += tts.cost_usd
+                        effective = tts.duration_seconds / SPEECH_ATEMPO
+                        shortened = True
+
+                        if effective > MAX_EFFECTIVE_VO_SECONDS:
+                            # Shortened TTS still overshoots. Don't truncate
+                            # the audio; drop this idea so the OTHER idea
+                            # ships clean. Row only fails if BOTH ideas drop.
+                            _log.error(
+                                "cartoon_vo_too_long_after_retry_dropped",
+                                idea=idx + 1,
+                                original_effective=round(original_effective, 3),
+                                retry_effective=round(effective, 3),
+                            )
+                            return None
+
                     vo_up = await clients.storage.upload_bytes(
                         tts.wav_bytes,
                         key=f"bulkvid/vo/{slug}/idea{idx + 1}.wav",
@@ -237,64 +297,18 @@ async def process_cartoon_row(
                     )
                     costs.storage += vo_up.cost_usd
                     vo_url = vo_up.url
-                    # The concat command speeds the VO up by SPEECH_ATEMPO, so
-                    # the effective played length is shorter than the raw WAV.
-                    effective = tts.duration_seconds / SPEECH_ATEMPO
-                    natural_target = effective + VO_TAIL_SECONDS
-                    long_audio = effective > LONG_AUDIO_THRESHOLD_SECONDS
-
-                    if long_audio:
-                        # Bump the LAST shot to Seedance 8s; earlier shots stay
-                        # at 4s (full clip). The last shot's trim fills whatever
-                        # is left to reach the natural target, capped at BOTH the
-                        # Seedance 8s clip length AND the hard max (so the concat
-                        # never asks Rendi to render a clip whose tail will just
-                        # be truncated by -t — wasted compute).
-                        first_total = SEEDANCE_DURATION_SHORT * (CARTOON_NUM_SHOTS - 1)
-                        last_per_clip = min(
-                            max(natural_target - first_total, MIN_PER_SHOT_SECONDS),
-                            float(SEEDANCE_DURATION_LONG),
-                            TARGET_VIDEO_HARD_MAX_SECONDS - first_total,
-                        )
-                        seedance_durations = (
-                            [SEEDANCE_DURATION_SHORT] * (CARTOON_NUM_SHOTS - 1)
-                            + [SEEDANCE_DURATION_LONG]
-                        )
-                        per_clip_seconds = (
-                            [float(SEEDANCE_DURATION_SHORT)] * (CARTOON_NUM_SHOTS - 1)
-                            + [last_per_clip]
-                        )
-                        target_video_seconds = first_total + last_per_clip
-                        clamp_state = "ceiling" if natural_target > target_video_seconds else "none"
-                    else:
-                        # Normal path: all shots at 4s Seedance, even split.
-                        target_video_seconds = min(
-                            max(natural_target, TARGET_VIDEO_MIN_SECONDS),
-                            TARGET_VIDEO_MAX_SECONDS,
-                        )
-                        per_shot = min(
-                            max(target_video_seconds / CARTOON_NUM_SHOTS, MIN_PER_SHOT_SECONDS),
-                            float(SEEDANCE_DURATION_SHORT),
-                        )
-                        per_clip_seconds = [per_shot] * CARTOON_NUM_SHOTS
-                        if natural_target < TARGET_VIDEO_MIN_SECONDS:
-                            clamp_state = "floor"
-                        elif natural_target > TARGET_VIDEO_MAX_SECONDS:
-                            clamp_state = "ceiling"
-                        else:
-                            clamp_state = "none"
 
                     _log.info(
                         "cartoon_vo_sized",
                         idea=idx + 1,
+                        vo_words=len(final_text.split()),
                         vo_raw_seconds=round(tts.duration_seconds, 3),
                         vo_effective_seconds=round(effective, 3),
-                        natural_target_seconds=round(natural_target, 3),
-                        target_video_seconds=round(target_video_seconds, 3),
+                        target_video_seconds=target_video_seconds,
                         per_clip_seconds=[round(p, 3) for p in per_clip_seconds],
                         seedance_durations=list(seedance_durations),
-                        long_audio=long_audio,
-                        clamp=clamp_state,
+                        shortened=shortened,
+                        fits=True,
                     )
 
                 # 4b. Scene images — shot 1 from text, shots 2+ chained on shot 1.
@@ -368,10 +382,11 @@ async def process_cartoon_row(
                     _log.error("cartoon_idea_no_clips", idea=idx + 1)
                     return None
 
-                # 4d. Stitch + overlay VO. ``per_clip_seconds`` may be
-                # non-uniform when the last shot was rendered at Seedance 8s for
-                # a long VO. ``total_video_seconds`` forces the final length so
-                # short VOs land at the floor and long VOs reach the hard max.
+                # 4d. Stitch + overlay VO. ``per_clip_seconds`` is uniform
+                # [4.0, 4.0] and ``total_video_seconds`` is the flat 8.0s
+                # ceiling — see the constants. By construction the VO that
+                # reaches this step is <= MAX_EFFECTIVE_VO_SECONDS, so the
+                # concat never truncates audio.
                 stitched = await clients.rendi.concat_clips_with_audio(
                     clip_urls,
                     vo_url,

@@ -52,17 +52,19 @@ CARTOON_STYLE = (
     "colors, modern 2D animated-film look."
 )
 
-# Each voiceover targets ~6-7 seconds of speech. The observed Gemini TTS rate
-# (after the 1.3x downstream speed-up) varies 1.5-3.5 wps across live runs on
-# 2026-06-03 — the model's free-form ``style_direction`` swings delivery between
-# calm-deliberate and punchy-fast. With that variance pinned by the row
-# processor's [4, 8]s output clamp + 0.8s tail silence, the word range is now
-# set to lift natural speech length: at the median ~2 wps, 13 words ≈ 6.5s
-# (centre of target); at the slow end 11 × 0.67 ≈ 7.3s; at the fast end 15
-# words still produces a ~4s VO that the soft tail rounds out without dead air.
-CARTOON_TARGET_WORDS = 13
-CARTOON_MIN_WORDS = 11
-CARTOON_MAX_WORDS = 15
+# Each voiceover targets ~5-6 seconds of speech, sized so that even at the slow
+# end of the Gemini TTS rate (~1.5 wps observed after the 1.3x speed-up), the
+# full line fits inside the cartoon row processor's hard 8.0s video ceiling
+# with a 0.5s trailing dwell. At slow delivery: 12 words / 1.5 wps = 8s raw,
+# 6.15s effective after the 1.3x speed-up — leaves ~1.4s of margin under the
+# 7.5s MAX_EFFECTIVE_VO_SECONDS. At fast delivery: 12 words / 3.5 wps = 3.4s
+# raw, 2.6s effective — short, but the row processor pads the video to a flat
+# 8s regardless of VO length, so there's no dead air pressure to push higher.
+# Anything that still comes out > 7.5s effective triggers the row processor's
+# shorten-and-retry path (see _plans/2026-06-04-cartoon-8s-hard-cap.md).
+CARTOON_TARGET_WORDS = 10
+CARTOON_MIN_WORDS = 8
+CARTOON_MAX_WORDS = 12
 
 DEFAULT_NUM_IDEAS = 2
 DEFAULT_NUM_SHOTS = 2
@@ -102,6 +104,12 @@ class CartoonIdea:
 @dataclass
 class CartoonPlan:
     ideas: list[CartoonIdea]
+    cost_usd: float
+
+
+@dataclass
+class ShortenResult:
+    voiceover: str
     cost_usd: float
 
 
@@ -430,3 +438,90 @@ async def generate_cartoon_plan(
         cost_usd=result.cost_usd,
     )
     return CartoonPlan(ideas=ideas, cost_usd=result.cost_usd)
+
+
+# ── Shorten a single VO (used when the synthesized TTS overshoots 8s) ───────
+
+
+async def shorten_voiceover(
+    client: OpenAIClient,
+    *,
+    text: str,
+    language: str,
+    target_words: int,
+    model: str = MODEL_SCRIPT_GEN,
+) -> ShortenResult:
+    """Rewrite ``text`` in fewer words while preserving meaning.
+
+    Called from the cartoon row processor when the synthesized TTS for an idea
+    measures effectively longer than ``MAX_EFFECTIVE_VO_SECONDS`` and would
+    not fit inside the 8.0s video ceiling without truncation. One LLM call,
+    JSON mode for robust parse.
+
+    Defensive: on parse failure, empty result, or a "shorter" rewrite that's
+    actually the same length or longer (model misbehaviour), returns the
+    original ``text`` unchanged. The caller can then decide whether to drop
+    the idea (see ``_plans/2026-06-04-cartoon-8s-hard-cap.md``).
+    """
+    system = (
+        f"You rewrite voiceover lines in {language}. The user's line is too "
+        f"long for a short video. Rewrite it in {target_words} words or fewer "
+        "while preserving the meaning and the language. End at a clean "
+        "sentence boundary (period, question mark, or exclamation). "
+        'Return JSON: {"voiceover": "..."}.'
+    )
+    user = text.strip()
+
+    _log.info(
+        "cartoon_shorten_submit",
+        target_words=target_words,
+        original_words=len(text.split()),
+    )
+
+    result = await client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=200,
+        temperature=0.3,
+    )
+
+    try:
+        parsed = json.loads(result.text)
+        new_vo = str(parsed.get("voiceover", "")).strip()
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        _log.warning(
+            "cartoon_shorten_parse_failed",
+            error=str(e),
+            raw_preview=result.text[:120],
+        )
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    if not new_vo:
+        _log.warning("cartoon_shorten_empty_returned_original", original=text[:80])
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    # Backstop — a "shorter" rewrite that's actually the same length or longer
+    # is a model misbehaviour. Fall back to the original so the caller's
+    # decision (drop the idea) is based on the original measurement, not a
+    # false-positive shortening.
+    if len(new_vo.split()) >= len(text.split()):
+        _log.warning(
+            "cartoon_shorten_not_shorter_returned_original",
+            original_words=len(text.split()),
+            returned_words=len(new_vo.split()),
+        )
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    # Hard cap to target_words in case the model went slightly over.
+    capped = _enforce_word_cap(new_vo, target_words)
+    _log.info(
+        "cartoon_shorten_ok",
+        original_words=len(text.split()),
+        returned_words=len(capped.split()),
+        cost_usd=result.cost_usd,
+    )
+    return ShortenResult(voiceover=capped, cost_usd=result.cost_usd)

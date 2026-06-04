@@ -28,6 +28,7 @@ from bulkvid.pipeline.cartoon_prompt import (
     _enforce_word_cap,
     generate_cartoon_plan,
     image_prompt_for_shot,
+    shorten_voiceover,
 )
 from bulkvid.pipeline.open_comments import OpenCommentsAnalysis, OpenCommentsMode
 
@@ -331,8 +332,95 @@ def test_enforce_word_cap_strips_trailing_punctuation_before_period() -> None:
 
 
 def test_cartoon_word_constants_consistent() -> None:
-    # Guard the contract: min ≤ target ≤ max, all positive. The row processor's
-    # [4, 8]s output clamp + audio fade backstops the upper bound, so the word
-    # max just needs to keep TTS bills sane and avoid mid-thought truncations.
+    # Guard the contract: min ≤ target ≤ max, all positive. The row processor
+    # now hard-caps the video at 8.0s and shortens-and-retries any VO that
+    # measures > MAX_EFFECTIVE_VO_SECONDS, so the word ceiling must be tight
+    # enough to keep slow TTS deliveries inside that window most of the time.
     assert 0 < CARTOON_MIN_WORDS <= CARTOON_TARGET_WORDS <= CARTOON_MAX_WORDS
-    assert CARTOON_MAX_WORDS <= 16
+    assert CARTOON_MAX_WORDS <= 13
+
+
+# ── shorten_voiceover ───────────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_shorten_voiceover_returns_shorter_text() -> None:
+    """Happy path: the shortener returns a JSON object with a shorter VO; the
+    helper trims to ``target_words`` and reports it back."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(json.dumps({"voiceover": "Prices dropped this spring."})),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = (
+        "Used car prices have been falling fast across major US cities "
+        "this spring as buyers grow more cautious about big purchases."
+    )  # 20+ words
+    out = await shorten_voiceover(
+        client, text=original, language="en", target_words=6
+    )
+    assert out.voiceover == "Prices dropped this spring."
+    assert len(out.voiceover.split()) <= 6
+    assert out.cost_usd > 0
+
+
+@respx.mock
+async def test_shorten_voiceover_falls_back_on_bad_json() -> None:
+    """A non-JSON model response must not crash; helper returns the original
+    text so the caller can decide (typically: drop the idea)."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=_chat_resp("not json at all"))
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = "A long sentence that the model failed to shorten cleanly."
+    out = await shorten_voiceover(
+        client, text=original, language="en", target_words=5
+    )
+    assert out.voiceover == original   # unchanged on parse failure
+
+
+@respx.mock
+async def test_shorten_voiceover_never_lengthens() -> None:
+    """If the 'shorter' rewrite is actually the same length or longer than the
+    original, the helper rejects it and returns the original. Protects against
+    the caller deciding 'shorten worked' when the model just paraphrased."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(
+                json.dumps(
+                    {
+                        "voiceover": (
+                            "This rewritten line is intentionally exactly as "
+                            "long as the input to verify the backstop."
+                        )
+                    }
+                )
+            ),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = "A shorter line about the topic this morning."   # 8 words
+    out = await shorten_voiceover(
+        client, text=original, language="en", target_words=4
+    )
+    assert out.voiceover == original
+    assert len(out.voiceover.split()) <= len(original.split())
+
+
+@respx.mock
+async def test_shorten_voiceover_empty_returns_original() -> None:
+    """Empty 'voiceover' field in the response → fall back to the original."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200, json=_chat_resp(json.dumps({"voiceover": "   "}))
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = "Cars are cheaper this spring than last spring."
+    out = await shorten_voiceover(
+        client, text=original, language="en", target_words=5
+    )
+    assert out.voiceover == original

@@ -74,15 +74,29 @@ class _FakeStorageClient:
 
 
 class _FakeTTS:
-    def __init__(self, duration: float = 6.0) -> None:
+    def __init__(
+        self,
+        duration: float = 6.0,
+        durations: list[float] | None = None,
+    ) -> None:
+        """``durations`` (if given) lets a test return a different VO length on
+        each call — useful for the shorten-then-retry flow where the first
+        synthesize overshoots and the retry must fit."""
         self.calls = 0
         self._duration = duration
+        self._durations = list(durations) if durations else []
+        self.last_texts: list[str] = []     # capture what was synthesised, in order
 
     async def synthesize(
         self, text: str, language: str, voice: str | None = None,
         style_prompt: str | None = None, country: str = "",
     ) -> TTSResult:
         self.calls += 1
+        self.last_texts.append(text)
+        if self._durations:
+            duration = self._durations[(self.calls - 1) % len(self._durations)]
+        else:
+            duration = self._duration
         import wave
 
         buf = io.BytesIO()
@@ -93,7 +107,7 @@ class _FakeTTS:
             wf.writeframes(b"\x00" * 24_000)
         return TTSResult(
             wav_bytes=buf.getvalue(), voice=voice or "Kore", language=language,
-            duration_seconds=self._duration, character_count=len(text), cost_usd=0.003,
+            duration_seconds=duration, character_count=len(text), cost_usd=0.003,
         )
 
 
@@ -258,10 +272,10 @@ async def test_cartoon_happy_path_two_videos(monkeypatch) -> None:
 
 
 @respx.mock
-async def test_cartoon_vo_short_clamped_to_floor(monkeypatch) -> None:
-    # Raw 3.5s VO -> effective 2.69s. Soft tail (+0.8s) gives 3.49s, BELOW the
-    # 4s floor → clamps UP to 4.0s. Tail silence ≈ 1.3s, not the prior 3s.
-    # Short audio → all shots stay at Seedance 4s, per_clip uniform.
+async def test_cartoon_video_always_8s_when_short_vo(monkeypatch) -> None:
+    # Raw 3.5s VO -> effective 2.69s, well under MAX_EFFECTIVE_VO_SECONDS.
+    # Hard cap: video is still exactly 8.0s, two flat 4s clips, VO ends ~5s
+    # into the video with the rest as trailing silence. No clamp logic.
     counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
@@ -270,59 +284,16 @@ async def test_cartoon_vo_short_clamped_to_floor(monkeypatch) -> None:
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
     call = clients.rendi.concat_calls[0]
-    assert call["total_video_seconds"] == pytest.approx(4.0, abs=0.01)
-    assert call["per_clip"] == [pytest.approx(2.0, abs=0.01)] * 2
-    # All Seedance calls (4 = 2 ideas * 2 shots) used the 4s tier.
+    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+    assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
+    # All Seedance calls used the 4s tier — no 8s last-shot mode anywhere.
     assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
-async def test_cartoon_vo_long_triggers_8s_last_shot(monkeypatch) -> None:
-    # Raw 13s -> effective 10s, above the 7.5s long-audio threshold. Last shot
-    # re-renders at Seedance 8s; first shot stays 4s. natural_target = 10.8s,
-    # under the 11s hard max → video runs the full natural length so VO
-    # finishes cleanly (audio fade lands on silence). This is the regression
-    # fix for the "video ends before the last word" issue.
-    counters = _patch_kie(monkeypatch)
-    _register_downloads()
-    clients = _build_clients()
-    clients.tts = _FakeTTS(duration=13.0)    # type: ignore[assignment]
-
-    result = await process_cartoon_row(_row(), clients, job_id="j")
-    assert result.status == STATUS_SUCCESS
-    call = clients.rendi.concat_calls[0]
-    expected_total = 13.0 / 1.3 + 0.8        # natural target, ~10.8
-    assert call["total_video_seconds"] == pytest.approx(expected_total, abs=0.01)
-    # First shot 4s, last shot fills the remainder (~6.8s).
-    assert call["per_clip"][0] == pytest.approx(4.0, abs=0.01)
-    assert call["per_clip"][-1] == pytest.approx(expected_total - 4.0, abs=0.01)
-    # Per-idea: first shot Seedance 4s, last shot Seedance 8s. Two ideas → 4 calls.
-    assert counters["durations"] == [4, 8, 4, 8]
-
-
-@respx.mock
-async def test_cartoon_vo_very_long_clamps_to_hard_ceiling(monkeypatch) -> None:
-    # Raw 16s -> effective ~12.3s. natural_target = 13.1s, above the 11s hard
-    # max → clamp to 11s (audio gets the last ~1.3s faded by the concat).
-    counters = _patch_kie(monkeypatch)
-    _register_downloads()
-    clients = _build_clients()
-    clients.tts = _FakeTTS(duration=16.0)    # type: ignore[assignment]
-
-    result = await process_cartoon_row(_row(), clients, job_id="j")
-    assert result.status == STATUS_SUCCESS
-    call = clients.rendi.concat_calls[0]
-    assert call["total_video_seconds"] == pytest.approx(11.0, abs=0.01)
-    # Last shot trimmed to 7s (8s clip, 1s left on the table).
-    assert call["per_clip"][0] == pytest.approx(4.0, abs=0.01)
-    assert call["per_clip"][-1] == pytest.approx(7.0, abs=0.01)
-    assert counters["durations"] == [4, 8, 4, 8]
-
-
-@respx.mock
-async def test_cartoon_vo_in_band_keeps_tail(monkeypatch) -> None:
-    # Raw 7s -> effective ~5.38s + 0.8s tail = 6.18s, in the [4, 8]s band and
-    # below the 7.5s long-audio threshold. All shots stay at 4s, per_clip uniform.
+async def test_cartoon_video_always_8s_when_normal_vo(monkeypatch) -> None:
+    # Raw 7s VO -> effective ~5.38s, comfortably under MAX_EFFECTIVE_VO_SECONDS
+    # (7.5s). Video is exactly 8.0s, two 4s clips. No shortening needed.
     counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
@@ -331,16 +302,133 @@ async def test_cartoon_vo_in_band_keeps_tail(monkeypatch) -> None:
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
     call = clients.rendi.concat_calls[0]
-    expected = 7.0 / 1.3 + 0.8
-    assert call["total_video_seconds"] == pytest.approx(expected, abs=0.01)
-    assert 4.0 <= call["total_video_seconds"] <= 8.0
-    assert call["per_clip"] == [pytest.approx(expected / 2, abs=0.01)] * 2
+    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+    assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
+    # Only one TTS call per idea — no retry was needed.
+    assert clients.tts.calls == 2
     assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
-async def test_cartoon_no_vo_uses_default_target(monkeypatch) -> None:
-    # No-VO rows keep the existing 3.5s per shot * 2 = 7s default target (in band).
+async def test_cartoon_vo_too_long_triggers_shorten_then_fits(monkeypatch) -> None:
+    """The regression scenario that produced refs/v1.mp4 (11s, VO cut mid-word):
+    first TTS overshoots, shorten_voiceover is called, second TTS fits inside
+    the 8s ceiling, video ships normally at exactly 8.0s with no truncation."""
+    from bulkvid.pipeline.cartoon_prompt import ShortenResult
+
+    shorten_calls: list[tuple[str, int]] = []
+
+    async def _shorten(_client, *, text: str, language: str, target_words: int, **_):
+        shorten_calls.append((text, target_words))
+        return ShortenResult(voiceover="A shorter line.", cost_usd=0.0008)
+
+    monkeypatch.setattr(rpc, "shorten_voiceover", _shorten)
+
+    counters = _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    # First TTS = 13s raw -> effective 10s (over cap). Second TTS = 5s -> 3.85s
+    # effective (under cap). Both ideas follow the same pattern in this fake.
+    clients.tts = _FakeTTS(durations=[13.0, 5.0, 13.0, 5.0])    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 2
+    # 4 TTS calls = 2 ideas * (1 initial + 1 retry).
+    assert clients.tts.calls == 4
+    # Shortener was invoked once per idea.
+    assert len(shorten_calls) == 2
+    # Both stitched videos are still 8.0s with uniform 4s clips.
+    for call in clients.rendi.concat_calls:
+        assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+        assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
+    # The TTS retry was called with the SHORTENED text.
+    assert "A shorter line." in clients.tts.last_texts
+    assert all(d == 4 for d in counters["durations"])
+
+
+@respx.mock
+async def test_cartoon_vo_too_long_after_retry_drops_idea(monkeypatch) -> None:
+    """If the shortened TTS *still* overshoots the 8s ceiling, the idea is
+    dropped (returns None from _build_idea). The other idea ships normally so
+    the row succeeds with one video. Row only fails when BOTH ideas drop."""
+    from bulkvid.pipeline.cartoon_prompt import ShortenResult
+
+    async def _shorten(_client, *, text: str, language: str, target_words: int, **_):
+        return ShortenResult(voiceover="Still too verbose for this format.", cost_usd=0.0008)
+
+    monkeypatch.setattr(rpc, "shorten_voiceover", _shorten)
+
+    counters = _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+
+    # Custom TTS: idea 1 always overshoots (13s on both attempts) → dropped.
+    # Idea 2 starts long (13s) but the retry (5s) fits → ships.
+    overshoot_sequence = iter([13.0, 13.0, 13.0, 5.0])
+    fake_tts = _FakeTTS()
+
+    async def _synth(text, language, voice=None, style_prompt=None, country=""):
+        fake_tts.calls += 1
+        fake_tts.last_texts.append(text)
+        try:
+            duration = next(overshoot_sequence)
+        except StopIteration:
+            duration = 5.0
+        import wave
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(24_000)
+            wf.writeframes(b"\x00" * 24_000)
+        return TTSResult(
+            wav_bytes=buf.getvalue(), voice=voice or "Kore", language=language,
+            duration_seconds=duration, character_count=len(text), cost_usd=0.003,
+        )
+
+    fake_tts.synthesize = _synth    # type: ignore[method-assign]
+    clients.tts = fake_tts          # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    # One idea dropped (over-cap after retry), one shipped — row still succeeds.
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 1
+    assert result.metadata["videos_produced"] == 1
+    assert all(d == 4 for d in counters["durations"])
+
+
+@respx.mock
+async def test_cartoon_vo_shortener_no_change_drops_idea(monkeypatch) -> None:
+    """If shorten_voiceover returns the SAME text (its defensive fallback for
+    bad JSON / empty / not-actually-shorter), there's no point re-TTSing — the
+    idea is dropped immediately to spare the cost."""
+    from bulkvid.pipeline.cartoon_prompt import ShortenResult
+
+    original = "Voiceover idea 1 about cheaper cars."   # matches the test plan
+
+    async def _shorten_returns_original(_client, *, text: str, **_):
+        return ShortenResult(voiceover=text, cost_usd=0.0008)
+
+    monkeypatch.setattr(rpc, "shorten_voiceover", _shorten_returns_original)
+
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    # Both ideas overshoot, shortener gives up on both → both dropped.
+    clients.tts = _FakeTTS(duration=13.0)    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    # Both ideas dropped → row fails with VIDEO_ASSEMBLY_FAILED (existing path).
+    assert result.status == STATUS_VIDEO_ASSEMBLY_FAILED
+    assert result.video_urls == []
+    # Each idea: one initial TTS, then shortener returned the same text → no retry.
+    assert clients.tts.calls == 2
+    _ = original    # noqa: F841
+
+
+@respx.mock
+async def test_cartoon_no_vo_video_is_8s(monkeypatch) -> None:
+    """No-VO rows still get the flat 8.0s video — two 4s clips, no audio
+    overlay. Previously this was 7s (3.5s per shot); the hard cap is universal."""
     counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
@@ -349,8 +437,8 @@ async def test_cartoon_no_vo_uses_default_target(monkeypatch) -> None:
     assert result.status == STATUS_SUCCESS
     call = clients.rendi.concat_calls[0]
     assert call["audio"] is None
-    assert call["total_video_seconds"] == pytest.approx(7.0, abs=0.01)
-    assert call["per_clip"] == [pytest.approx(3.5, abs=0.01)] * 2
+    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+    assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
     assert all(d == 4 for d in counters["durations"])
 
 
