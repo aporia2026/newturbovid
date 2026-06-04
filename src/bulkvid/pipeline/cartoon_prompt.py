@@ -259,10 +259,28 @@ def _first_nonempty(d: dict, *keys: str) -> str:
 _DEFAULT_MOTION = "Subtle, natural movement."
 
 
+@dataclass
+class _DroppedFragment:
+    """A planner idea whose VO didn't end on a sentence boundary but whose
+    shots / style are otherwise valid. The caller (``generate_cartoon_plan``)
+    can attempt to recover it via ``complete_voiceover``; if that fails too,
+    the existing fallback-padding kicks in."""
+
+    voiceover_raw: str        # the original line that failed sentence-boundary validation
+    style: str
+    shots: list[CartoonShot]
+
+
 def _coerce_ideas(
     raw_ideas: list[Any], num_ideas: int, num_shots: int
-) -> list[CartoonIdea]:
-    """Normalize parsed JSON into exactly ``num_ideas`` ideas of ``num_shots`` shots.
+) -> tuple[list[CartoonIdea], list[_DroppedFragment]]:
+    """Normalize parsed JSON into ``num_ideas`` ideas of ``num_shots`` shots.
+
+    Returns ``(kept, fragments)``. ``kept`` is the list of ideas that passed
+    every validation step. ``fragments`` is the list of ideas whose shots/style
+    parsed cleanly but whose VO didn't end on a sentence boundary — caller
+    can try ``complete_voiceover`` to recover them before falling back to
+    generic padding.
 
     Defensive against the gpt-5.4-mini planner's shape drift (live runs have
     seen alternate key names and short/long shot lists):
@@ -275,10 +293,13 @@ def _coerce_ideas(
       - shot lists too short are padded by repeating the last valid shot
       - shot lists too long are trimmed to ``num_shots``
 
-    Anything that still can't yield a voiceover + at least one valid scene is
-    rejected, with the reason logged at debug for diagnosis.
+    Anything that can't yield BOTH a non-empty voiceover_raw AND at least one
+    valid scene is dropped silently with a debug log — there's nothing to
+    recover. Ideas whose only problem is an incomplete-sentence VO are
+    surfaced as ``_DroppedFragment``s for the caller to retry.
     """
-    ideas: list[CartoonIdea] = []
+    kept: list[CartoonIdea] = []
+    fragments: list[_DroppedFragment] = []
     for raw_idx, raw in enumerate(raw_ideas[:num_ideas]):
         if not isinstance(raw, dict):
             _log.debug(
@@ -307,19 +328,10 @@ def _coerce_ideas(
                 max_words=CARTOON_MAX_WORDS,
                 capped_words=len(voiceover.split()),
             )
-        # Reject VOs that don't end on a real sentence boundary. The planner
-        # prompt explicitly demands "MUST be a COMPLETE THOUGHT ending in
-        # period/question/exclamation"; this is the enforcement step.
-        # _enforce_word_cap can also return "" when truncation found no real
-        # sentence ending — same outcome here.
-        if not voiceover or not voiceover.rstrip().endswith((".", "!", "?")):
-            _log.warning(
-                "cartoon_idea_rejected_incomplete_sentence",
-                idea_index=raw_idx,
-                original_words=original_words,
-                voiceover_preview=voiceover_raw[:120],
-            )
-            continue
+
+        # Parse shots + style BEFORE the VO sentence-boundary check, so a
+        # fragment idea can still be surfaced for recovery (we need shots /
+        # style to rebuild the idea after a successful rewrite).
         style = (
             _first_nonempty(raw, "style_direction", "style", "tone", "delivery")
             or DEFAULT_STYLE_DIRECTION
@@ -358,8 +370,27 @@ def _coerce_ideas(
         while len(shots) < num_shots:
             shots.append(shots[-1])
         shots = shots[:num_shots]
-        ideas.append(CartoonIdea(voiceover=voiceover, style_direction=style, shots=shots))
-    return ideas
+
+        # Final gate: the VO must end on a real sentence boundary. If it
+        # doesn't, surface the idea as a fragment so the caller can try to
+        # recover it rather than silently losing the shots+style work.
+        if not voiceover or not voiceover.rstrip().endswith((".", "!", "?")):
+            _log.warning(
+                "cartoon_idea_fragment_for_recovery",
+                idea_index=raw_idx,
+                original_words=original_words,
+                voiceover_preview=voiceover_raw[:120],
+            )
+            fragments.append(
+                _DroppedFragment(
+                    voiceover_raw=voiceover_raw,
+                    style=style,
+                    shots=shots,
+                )
+            )
+            continue
+        kept.append(CartoonIdea(voiceover=voiceover, style_direction=style, shots=shots))
+    return kept, fragments
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -441,17 +472,75 @@ async def generate_cartoon_plan(
     )
 
     ideas: list[CartoonIdea] = []
+    fragments: list[_DroppedFragment] = []
     try:
         parsed = json.loads(result.text)
-        ideas = _coerce_ideas(parsed.get("ideas") or [], num_ideas, num_shots)
+        ideas, fragments = _coerce_ideas(
+            parsed.get("ideas") or [], num_ideas, num_shots
+        )
     except (json.JSONDecodeError, AttributeError, TypeError) as e:
         _log.error("cartoon_plan_parse_failed", error=str(e), raw_preview=result.text[:200])
+
+    # If we have fragments AND we're short on ideas, try to recover them by
+    # asking the model to rewrite the line as a complete sentence. One LLM
+    # call per fragment (~$0.001), no Seedance / TTS / Rendi cost. The recovery
+    # only runs as long as we still need ideas — once we hit ``num_ideas`` we
+    # stop (no point spending tokens on extras the row won't ship).
+    total_recovery_cost = 0.0
+    recovered_count = 0
+    for frag in fragments:
+        if len(ideas) >= num_ideas:
+            break
+        try:
+            rewrite = await complete_voiceover(
+                client,
+                text=frag.voiceover_raw,
+                language=language,
+                target_words=CARTOON_TARGET_WORDS,
+            )
+        except Exception as e:    # last-line defense — recovery is best-effort
+            _log.error(
+                "cartoon_fragment_recovery_failed",
+                voiceover_preview=frag.voiceover_raw[:80],
+                error=str(e)[:200],
+            )
+            continue
+        total_recovery_cost += rewrite.cost_usd
+        # complete_voiceover returns the original text on any failure
+        # (parse, empty, still-fragment). Same string out as in means recovery
+        # didn't take.
+        recovered = rewrite.voiceover.strip()
+        if (
+            recovered
+            and recovered != frag.voiceover_raw
+            and recovered.rstrip().endswith((".", "!", "?"))
+        ):
+            ideas.append(
+                CartoonIdea(
+                    voiceover=recovered,
+                    style_direction=frag.style,
+                    shots=frag.shots,
+                )
+            )
+            recovered_count += 1
+            _log.info(
+                "cartoon_fragment_recovered",
+                original_words=len(frag.voiceover_raw.split()),
+                rewrite_words=len(recovered.split()),
+            )
+        else:
+            _log.warning(
+                "cartoon_fragment_unrecoverable",
+                voiceover_preview=frag.voiceover_raw[:120],
+            )
 
     if len(ideas) < num_ideas:
         _log.warning(
             "cartoon_plan_incomplete_filled",
             got=len(ideas),
             wanted=num_ideas,
+            fragments_seen=len(fragments),
+            fragments_recovered=recovered_count,
             raw_preview=result.text[:300],
         )
         ideas += _fallback_plan(vertical, num_ideas - len(ideas), num_shots)
@@ -459,9 +548,105 @@ async def generate_cartoon_plan(
     _log.info(
         "cartoon_plan_ok",
         idea_count=len(ideas),
+        fragments_seen=len(fragments),
+        fragments_recovered=recovered_count,
+        cost_usd=result.cost_usd + total_recovery_cost,
+    )
+    return CartoonPlan(
+        ideas=ideas, cost_usd=result.cost_usd + total_recovery_cost
+    )
+
+
+# ── Complete a fragment VO (used when the planner returns a mid-thought line)
+
+
+async def complete_voiceover(
+    client: OpenAIClient,
+    *,
+    text: str,
+    language: str,
+    target_words: int,
+    model: str = MODEL_SCRIPT_GEN,
+) -> ShortenResult:
+    """Rewrite a planner-produced VO fragment into a complete sentence.
+
+    Used by ``generate_cartoon_plan`` when ``_coerce_ideas`` finds a VO that
+    doesn't end on a sentence boundary (period, question mark, exclamation).
+    Instead of dropping the idea, we give the LLM ONE chance to rewrite the
+    line cleanly while preserving the meaning and staying within the word
+    budget.
+
+    Differs from ``shorten_voiceover`` only in framing: there the input is
+    "too long, shorten it"; here the input is "incomplete, finish it". The
+    rewrite may legitimately be the same length or even slightly longer,
+    so we do NOT apply the "must be shorter" check.
+
+    Defensive: on parse failure, empty result, or a rewrite that still
+    doesn't end on a sentence boundary, returns the original ``text``
+    unchanged so the caller (the planner) knows to fall back to padding.
+    """
+    system = (
+        f"You rewrite voiceover lines in {language}. The user's line is "
+        "an incomplete fragment — it stops mid-thought (often on a "
+        "conjunction or preposition like 'and', 'with', 'that'). "
+        f"Rewrite it as ONE complete sentence in {target_words} words or "
+        "fewer, preserving the meaning and the language. MUST end at a "
+        "clean sentence boundary (period, question mark, or exclamation). "
+        'Return JSON: {"voiceover": "..."}.'
+    )
+    user = text.strip()
+
+    _log.info(
+        "cartoon_complete_submit",
+        target_words=target_words,
+        original_words=len(text.split()),
+    )
+
+    result = await client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=200,
+        temperature=0.3,
+    )
+
+    try:
+        parsed = json.loads(result.text)
+        new_vo = str(parsed.get("voiceover", "")).strip()
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        _log.warning(
+            "cartoon_complete_parse_failed",
+            error=str(e),
+            raw_preview=result.text[:120],
+        )
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    if not new_vo:
+        _log.warning("cartoon_complete_empty_returned_original", original=text[:80])
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    # Cap to the word budget; if the cap returns "" the rewrite landed
+    # mid-thought again — same outcome as a malformed shorten, drop signal.
+    capped = _enforce_word_cap(new_vo, target_words)
+    if not capped or not capped.rstrip().endswith((".", "!", "?")):
+        _log.warning(
+            "cartoon_complete_still_fragment_returned_original",
+            original=text[:80],
+            rewrite_preview=new_vo[:80],
+            cap_result_preview=capped[:80],
+        )
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
+
+    _log.info(
+        "cartoon_complete_ok",
+        original_words=len(text.split()),
+        returned_words=len(capped.split()),
         cost_usd=result.cost_usd,
     )
-    return CartoonPlan(ideas=ideas, cost_usd=result.cost_usd)
+    return ShortenResult(voiceover=capped, cost_usd=result.cost_usd)
 
 
 # ── Shorten a single VO (used when the synthesized TTS overshoots 8s) ───────

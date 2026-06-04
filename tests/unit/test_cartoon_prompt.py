@@ -26,6 +26,7 @@ from bulkvid.pipeline.cartoon_prompt import (
     CONSISTENCY_CLAUSE,
     NO_BRANDING,
     _enforce_word_cap,
+    complete_voiceover,
     generate_cartoon_plan,
     image_prompt_for_shot,
     shorten_voiceover,
@@ -420,6 +421,199 @@ def test_cartoon_word_constants_consistent() -> None:
     # enough to keep slow TTS deliveries inside that window most of the time.
     assert 0 < CARTOON_MIN_WORDS <= CARTOON_TARGET_WORDS <= CARTOON_MAX_WORDS
     assert CARTOON_MAX_WORDS <= 13
+
+
+# ── complete_voiceover ──────────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_complete_voiceover_happy_path() -> None:
+    """Model is given a fragment, returns a complete sentence; helper accepts."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(
+                json.dumps({"voiceover": "Homes keep grandparents close."})
+            ),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    fragment = "Homes keep grandparents close to families and"   # ends on conjunction
+    out = await complete_voiceover(
+        client, text=fragment, language="en", target_words=CARTOON_TARGET_WORDS,
+    )
+    assert out.voiceover == "Homes keep grandparents close."
+    assert out.voiceover.rstrip().endswith(".")
+    assert out.cost_usd > 0
+
+
+@respx.mock
+async def test_complete_voiceover_falls_back_on_bad_json() -> None:
+    """A non-JSON model response returns the original text — caller decides to drop."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=_chat_resp("not json"))
+    )
+    client = OpenAIClient(api_key="sk-test")
+    fragment = "Homes keep grandparents close to families and"
+    out = await complete_voiceover(
+        client, text=fragment, language="en", target_words=CARTOON_TARGET_WORDS,
+    )
+    assert out.voiceover == fragment    # unchanged on parse failure
+
+
+@respx.mock
+async def test_complete_voiceover_rejects_still_fragment_rewrite() -> None:
+    """If the model returns text that still doesn't end on .!?, we return the
+    original text (same signal as a parse failure)."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(
+                json.dumps({"voiceover": "Homes keep grandparents close with"})
+            ),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    fragment = "Homes keep grandparents close to families and"
+    out = await complete_voiceover(
+        client, text=fragment, language="en", target_words=CARTOON_TARGET_WORDS,
+    )
+    assert out.voiceover == fragment    # still a fragment -> drop signal
+
+
+@respx.mock
+async def test_complete_voiceover_empty_returns_original() -> None:
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200, json=_chat_resp(json.dumps({"voiceover": ""})),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    fragment = "Homes keep grandparents close to families and"
+    out = await complete_voiceover(
+        client, text=fragment, language="en", target_words=CARTOON_TARGET_WORDS,
+    )
+    assert out.voiceover == fragment
+
+
+# ── Fragment recovery wired into generate_cartoon_plan ──────────────────────
+
+
+@respx.mock
+async def test_plan_recovers_fragment_via_complete_voiceover() -> None:
+    """End-to-end recovery path: planner returns one fragment + one valid;
+    the recovery step rewrites the fragment as a complete sentence; both
+    ideas ship without falling back to padding."""
+    planner_response = _chat_resp(
+        json.dumps(
+            {
+                "ideas": [
+                    {
+                        # Fragment — ends on conjunction
+                        "voiceover": "Cars cheaper this spring with",
+                        "style_direction": "Upbeat.",
+                        "shots": [
+                            {"scene": "Scene A", "motion": "subtle"},
+                            {"scene": "Scene B", "motion": "subtle"},
+                        ],
+                    },
+                    {
+                        # Clean
+                        "voiceover": "Buyers find better deals before summer.",
+                        "style_direction": "Calm.",
+                        "shots": [
+                            {"scene": "Scene C", "motion": "subtle"},
+                            {"scene": "Scene D", "motion": "subtle"},
+                        ],
+                    },
+                ]
+            }
+        )
+    )
+    recovery_response = _chat_resp(
+        json.dumps({"voiceover": "Cars are cheaper this spring."})
+    )
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(200, json=planner_response),
+            httpx.Response(200, json=recovery_response),
+        ]
+    )
+    client = OpenAIClient(api_key="sk-test")
+    plan = await generate_cartoon_plan(
+        client,
+        article_body="Used car prices are dropping.",
+        country="US", vertical="automotive", language="en",
+        script_pattern="How To", open_comments=_analysis(),
+        num_ideas=2, num_shots=2,
+    )
+    assert len(plan.ideas) == 2
+    voiceovers = [idea.voiceover for idea in plan.ideas]
+    # The recovered fragment is in the result; no fallback "Here's what you
+    # should know about..." was needed.
+    assert any("Cars are cheaper this spring." in vo for vo in voiceovers)
+    assert any("better deals before summer" in vo for vo in voiceovers)
+    assert all("you should know" not in vo for vo in voiceovers)
+    # Every shipped VO ends cleanly.
+    assert all(vo.rstrip().endswith((".", "!", "?")) for vo in voiceovers)
+
+
+@respx.mock
+async def test_plan_unrecoverable_fragment_falls_back_to_padding() -> None:
+    """If recovery itself produces another fragment, the idea is left dropped
+    and the existing fallback padding fills the slot — exactly the pre-recovery
+    behaviour, just with one extra (cheap) LLM call attempted."""
+    planner_response = _chat_resp(
+        json.dumps(
+            {
+                "ideas": [
+                    {
+                        "voiceover": "Cars cheaper this spring with",
+                        "style_direction": "Upbeat.",
+                        "shots": [
+                            {"scene": "Scene A", "motion": "subtle"},
+                            {"scene": "Scene B", "motion": "subtle"},
+                        ],
+                    },
+                    {
+                        "voiceover": "Buyers find better deals before summer.",
+                        "style_direction": "Calm.",
+                        "shots": [
+                            {"scene": "Scene C", "motion": "subtle"},
+                            {"scene": "Scene D", "motion": "subtle"},
+                        ],
+                    },
+                ]
+            }
+        )
+    )
+    # Recovery LLM ALSO returns a fragment -> complete_voiceover returns the
+    # original, which signals "still a fragment" to the planner.
+    recovery_response = _chat_resp(
+        json.dumps({"voiceover": "Cars cheaper this spring with"})
+    )
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(200, json=planner_response),
+            httpx.Response(200, json=recovery_response),
+        ]
+    )
+    client = OpenAIClient(api_key="sk-test")
+    plan = await generate_cartoon_plan(
+        client,
+        article_body="Used car prices are dropping.",
+        country="US", vertical="automotive", language="en",
+        script_pattern="How To", open_comments=_analysis(),
+        num_ideas=2, num_shots=2,
+    )
+    assert len(plan.ideas) == 2
+    voiceovers = [idea.voiceover for idea in plan.ideas]
+    # Clean idea survives; fragment is replaced by the generic fallback
+    # ("Here's what you should know about ..." pattern).
+    assert any("better deals before summer" in vo for vo in voiceovers)
+    assert any("you should know" in vo for vo in voiceovers)
+    # And no fragment slips through to the shipped result.
+    assert all("Cars cheaper this spring with" not in vo for vo in voiceovers)
 
 
 # ── shorten_voiceover ───────────────────────────────────────────────────────
