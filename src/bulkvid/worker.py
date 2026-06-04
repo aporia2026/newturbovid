@@ -116,9 +116,25 @@ async def run() -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "jobs.db"
 
-    queue = JobQueue(db_path)
+    # Settings store falls back to the jobs DB token/URL when its own pair
+    # is empty (single-DB Turso deploy). Matches the rule applied in
+    # main.py::_build_state so web app and worker can't disagree.
+    settings_db_url = settings.BULKVID_SETTINGS_DB_URL or settings.BULKVID_DB_URL
+    settings_db_token = (
+        settings.BULKVID_SETTINGS_DB_AUTH_TOKEN or settings.BULKVID_DB_AUTH_TOKEN
+    )
+    queue = JobQueue(
+        db_path,
+        sync_url=settings.BULKVID_DB_URL,
+        auth_token=settings.BULKVID_DB_AUTH_TOKEN,
+        sync_interval_seconds=settings.BULKVID_DB_SYNC_INTERVAL_SECONDS,
+    )
     settings_store = SettingsStore(
-        data_dir / "settings.db", defaults=registry_defaults()
+        data_dir / "settings.db",
+        defaults=registry_defaults(),
+        sync_url=settings_db_url,
+        auth_token=settings_db_token,
+        sync_interval_seconds=settings.BULKVID_DB_SYNC_INTERVAL_SECONDS,
     )
     # Migrate the legacy single-prompt key to the per-tab keys. Web app does
     # the same on its boot; both running it is safe — the inner check skips

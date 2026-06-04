@@ -1,0 +1,59 @@
+# Keep the image lean and prevent accidental secret-leakage from the
+# build context to the Docker daemon. Plan:
+#   _plans/2026-06-04-migrate-to-hf-spaces-turso.md.
+
+# Local secrets — must never make it into the image.
+.env
+.env.*
+*.pem
+*.key
+*-key.json
+service-account*.json
+credentials*.json
+
+# Local data — the container creates a fresh /tmp/data on boot.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python build artefacts.
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# IDE + OS.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Git.
+.git/
+.gitignore
+.github/
+
+# Docs and plans — useful in repo, useless in image.
+_plans/
+docs/
+*.md
+!README.md
+
+# Tests don't ship in the runtime image.
+tests/
+
+# Apps Script lives in the sheet, not the container.
+apps_script/
+
+# PythonAnywhere legacy.
+pythonanywhere/

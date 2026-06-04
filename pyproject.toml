@@ -69,6 +69,14 @@ dev = [
     "mypy>=1.13",
     "respx>=0.21",
 ]
+# Optional extra for deploys that persist state via libSQL/Turso. Kept out
+# of the base deps because pre-built wheels don't cover every dev platform
+# (e.g. Windows on Python 3.14) and we don't want every contributor to
+# need a Rust toolchain. The Docker image installs the extra explicitly.
+# Plan: _plans/2026-06-04-migrate-to-hf-spaces-turso.md.
+turso = [
+    "libsql>=0.1",
+]
 
 [build-system]
 requires = ["hatchling"]

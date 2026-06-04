@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bulkvid.logging import get_logger
+from bulkvid.orchestrator import db as _db
 
 _log = get_logger("settings_store")
 
@@ -63,16 +64,25 @@ class SettingsStore:
         defaults: dict[str, str] | None = None,
         *,
         cache_ttl_seconds: float = 30.0,
+        sync_url: str = "",
+        auth_token: str = "",
+        sync_interval_seconds: float = 1.0,
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            timeout=30.0,
-            isolation_level=None,
+        # See ``JobQueue.__init__`` for the same backend-selection rationale.
+        # ``sync_url`` empty → plain sqlite3 (dev/tests); set → Turso via the
+        # libsql embedded replica.
+        self._conn = _db.connect(
+            self._db_path,
+            sync_url=sync_url,
+            auth_token=auth_token,
+            sync_interval_seconds=sync_interval_seconds,
         )
-        self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.row_factory = sqlite3.Row
+        except AttributeError:
+            _log.warning("row_factory_unsupported", note="dict-like row access disabled")
         self._conn.executescript("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
         self._defaults: dict[str, str] = dict(defaults or {})

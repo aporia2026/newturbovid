@@ -55,9 +55,25 @@ def _build_state(app: FastAPI) -> None:
         return
     settings = get_settings()
     data_dir = Path(settings.BULKVID_DATA_DIR)
-    app.state.queue = JobQueue(data_dir / "jobs.db")
+    # Settings store falls back to the jobs DB token/URL when its own pair
+    # is empty — a single-DB Turso deploy works without doubling the env
+    # vars. See _plans/2026-06-04-migrate-to-hf-spaces-turso.md.
+    settings_db_url = settings.BULKVID_SETTINGS_DB_URL or settings.BULKVID_DB_URL
+    settings_db_token = (
+        settings.BULKVID_SETTINGS_DB_AUTH_TOKEN or settings.BULKVID_DB_AUTH_TOKEN
+    )
+    app.state.queue = JobQueue(
+        data_dir / "jobs.db",
+        sync_url=settings.BULKVID_DB_URL,
+        auth_token=settings.BULKVID_DB_AUTH_TOKEN,
+        sync_interval_seconds=settings.BULKVID_DB_SYNC_INTERVAL_SECONDS,
+    )
     app.state.settings_store = SettingsStore(
-        data_dir / "settings.db", defaults=registry_defaults()
+        data_dir / "settings.db",
+        defaults=registry_defaults(),
+        sync_url=settings_db_url,
+        auth_token=settings_db_token,
+        sync_interval_seconds=settings.BULKVID_DB_SYNC_INTERVAL_SECONDS,
     )
     # One-shot migration: the legacy single ``script_system_prompt`` becomes
     # the per-tab ``simple_script_prompt`` + ``simple_x4_script_prompt`` so

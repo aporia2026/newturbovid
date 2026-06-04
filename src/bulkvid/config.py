@@ -30,6 +30,25 @@ class Settings(BaseSettings):
     BULKVID_LOG_LEVEL: str = "INFO"
     BULKVID_DATA_DIR: Path = Path("./data")
 
+    # ── Database backend ─────────────────────────────────────────────────
+    # When BULKVID_DB_URL is empty (default) the queue and settings store
+    # use plain sqlite3 at <BULKVID_DATA_DIR>/jobs.db and settings.db. This
+    # is local-dev and the test-suite path.
+    #
+    # When set, both stores switch to libsql embedded-replica mode against
+    # the Turso URL — reads are local-SQLite-fast, writes sync to Turso
+    # every BULKVID_DB_SYNC_INTERVAL_SECONDS so container restarts on
+    # ephemeral hosts (HuggingFace Spaces, etc.) never lose state.
+    # Plan: _plans/2026-06-04-migrate-to-hf-spaces-turso.md.
+    BULKVID_DB_URL: str = ""
+    BULKVID_DB_AUTH_TOKEN: str = ""
+    # A separate Turso DB for the admin-editable settings, so we can rotate
+    # tokens independently. Falls back to BULKVID_DB_* when empty so a
+    # single-DB deploy still works.
+    BULKVID_SETTINGS_DB_URL: str = ""
+    BULKVID_SETTINGS_DB_AUTH_TOKEN: str = ""
+    BULKVID_DB_SYNC_INTERVAL_SECONDS: float = 1.0
+
     # ── Auth ─────────────────────────────────────────────────────────────
     # Specific emails (comma-separated) — useful for individual exceptions.
     BULK_TEAM_ALLOWLIST: str = ""

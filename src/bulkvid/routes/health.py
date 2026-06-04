@@ -26,6 +26,7 @@ from bulkvid.adapters.google_credentials import (
 from bulkvid.auth import Identity
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger
+from bulkvid.orchestrator import db as _db
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.routes.jobs import get_identity, get_queue
 
@@ -56,10 +57,24 @@ async def deep_health(
 
     recent = await queue.list_jobs(user_email=None, limit=10)
 
+    # DB-ping: round-trip a SELECT 1 against the queue's own connection so
+    # admins can see when Turso latency degrades, BEFORE users feel it as
+    # slow submits. Catches its own errors so a transient DB blip doesn't
+    # 500 the health page.
+    db_backend = (
+        _db.BACKEND_LIBSQL_REPLICA if settings.BULKVID_DB_URL else _db.BACKEND_SQLITE
+    )
+    db_info: dict[str, Any] = {"backend": db_backend}
+    try:
+        db_info["ping_ms"] = round(_db.ping(queue._conn), 2)
+    except Exception as e:    # noqa: BLE001 — surface to the admin page
+        db_info["ping_error"] = str(e)[:200]
+
     return {
         "service": "bulkvid",
         "env": settings.BULKVID_ENV,
         "kill_switch": bool(settings.BULKVID_KILL_SWITCH),
+        "db": db_info,
         "vendors": {
             "openai": _present(settings.OPENAI_API_KEY),
             "kie_ai": {

@@ -34,6 +34,7 @@ from bulkvid.models.row import (
     RowResult,
     SimpleRow,
 )
+from bulkvid.orchestrator import db as _db
 
 _log = get_logger("queue")
 
@@ -184,17 +185,36 @@ def _payload_to_row(
 class JobQueue:
     """SQLite job queue. Synchronous methods; async wrappers via ``asyncio.to_thread``."""
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        sync_url: str = "",
+        auth_token: str = "",
+        sync_interval_seconds: float = 1.0,
+    ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Single shared connection per instance; SQLite is fine for our concurrency.
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            timeout=30.0,
-            isolation_level=None,        # autocommit
+        # Single shared connection per instance. ``_db.connect`` returns
+        # plain sqlite3 when ``sync_url`` is empty (dev/tests) and a libsql
+        # embedded replica otherwise (prod). The remainder of this class
+        # uses only the DB-API 2.0 surface both backends support, so it
+        # treats the connection identically. See
+        # ``_plans/2026-06-04-migrate-to-hf-spaces-turso.md``.
+        self._conn = _db.connect(
+            self._db_path,
+            sync_url=sync_url,
+            auth_token=auth_token,
+            sync_interval_seconds=sync_interval_seconds,
         )
-        self._conn.row_factory = sqlite3.Row
+        # ``row_factory = sqlite3.Row`` is a sqlite3-only extension; libsql
+        # also exposes it (DB-API 2.0 + sqlite3 compat). If a future libsql
+        # build drops it we fall back to the plain tuple cursor and adapt at
+        # read sites — flagged so the failure is loud, not silent.
+        try:
+            self._conn.row_factory = sqlite3.Row
+        except AttributeError:
+            _log.warning("row_factory_unsupported", note="dict-like row access disabled")
         self._conn.executescript("PRAGMA journal_mode=WAL;")
         self._conn.executescript(_SCHEMA)
         self._lock = asyncio.Lock()
