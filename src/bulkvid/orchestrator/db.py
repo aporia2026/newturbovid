@@ -9,20 +9,37 @@ DB-API 2.0 surface: ``execute``, ``executemany``, ``executescript``,
   - ``BULKVID_DB_URL`` empty  → plain ``sqlite3.connect(db_path, ...)``
     (current behaviour: local dev, the test suite, anywhere we don't
     need cloud persistence).
-  - ``BULKVID_DB_URL`` set    → ``libsql.connect(db_path, sync_url=...,
-    auth_token=..., sync_interval=...)`` — embedded replica mode. Reads
-    are local-SQLite-fast, writes go to the local replica and sync to
-    Turso every ``sync_interval`` seconds. Container restart restores
-    state from Turso.
+  - ``BULKVID_DB_URL`` set    → ``libsql.connect(url, auth_token=...)``
+    in REMOTE mode: every statement is an HTTPS round-trip to Turso.
+    Multi-statement transactions are still atomic because libsql
+    buffers between ``execute`` calls and flushes on ``commit()``.
+
+History note: an earlier deploy used libsql's embedded-replica mode
+(local SQLite file synced to Turso every N seconds). It died
+immediately on HuggingFace Spaces because both web and worker
+processes shared the same local file path inside the container; their
+WAL replicas corrupted each other and every query raised
+``ValueError: file is not a database``. Remote mode sidesteps this by
+having no local file at all.
 
 The libsql Python package implements DB-API 2.0 but does NOT support
 ``connection.row_factory = sqlite3.Row`` (the assignment raises
 AttributeError as of libsql 0.1.x). Its cursors return plain tuples.
-Our queue + settings-store code is full of ``row["col_name"]`` access,
-so we transparently wrap the libsql connection in a small ``_LibsqlConn``
-shim that hands back ``_DictRow`` objects — same surface area as
-``sqlite3.Row``, no caller changes. The sqlite3 path stays unwrapped
-because sqlite3.Row already gives us name-and-index access natively.
+It also reacts badly to raw ``execute("COMMIT")`` because it manages
+transactions internally. Our queue + settings-store code is full of
+``row["col_name"]`` access AND uses the sqlite3
+autocommit-with-explicit-BEGIN/COMMIT idiom, so we transparently wrap
+the libsql connection in a small ``_LibsqlConn`` shim that:
+
+  1. Hands back ``_DictRow`` objects from every ``fetch*`` — same
+     surface area as ``sqlite3.Row``, no caller changes.
+  2. Translates ``execute("BEGIN ...")`` to a no-op, ``execute("COMMIT")``
+     to ``conn.commit()``, and ``execute("ROLLBACK")`` to
+     ``conn.rollback()``.
+
+The sqlite3 path stays unwrapped because sqlite3.Row already gives us
+name-and-index access natively and the explicit-BEGIN/COMMIT idiom is
+what sqlite3 expects in the first place.
 
 Plan: ``_plans/2026-06-04-migrate-to-hf-spaces-turso.md``.
 """
@@ -41,7 +58,15 @@ _log = get_logger("db")
 # Backend names — surfaced in boot logs so a deploy can be sanity-checked
 # at a glance ("did this worker actually pick up the Turso URL?").
 BACKEND_SQLITE = "sqlite_local"
-BACKEND_LIBSQL_REPLICA = "libsql_embedded_replica"
+BACKEND_LIBSQL_REMOTE = "libsql_remote"
+# Kept for backwards-compat with any external grep / docs / older plan
+# references. The 14:13 deploy on 2026-06-04 proved embedded-replica mode
+# is unsafe when two processes (web + worker) share a single container's
+# local file path: the WAL replicas corrupted each other and every query
+# died with ``ValueError: file is not a database``. We use remote mode
+# instead — every statement is one HTTPS round-trip to Turso, no shared
+# local file. Trade ~10-30 ms per query for correctness.
+BACKEND_LIBSQL_REPLICA = "libsql_embedded_replica"    # historical; no longer selected
 
 
 # ── libsql tuple-to-dict shims ──────────────────────────────────────────────
@@ -297,28 +322,20 @@ def connect(
 
     _log.info(
         "db_backend",
-        backend=BACKEND_LIBSQL_REPLICA,
+        backend=BACKEND_LIBSQL_REMOTE,
         path=path_str,
         sync_url=_redact_host(sync_url),
-        sync_interval=sync_interval_seconds,
     )
-    raw = libsql.connect(
-        path_str,
-        sync_url=sync_url,
-        auth_token=auth_token,
-        sync_interval=sync_interval_seconds,
-    )
-    # Pull the latest remote snapshot down BEFORE the caller starts
-    # executing schema/queries — otherwise a fresh container would race
-    # the first sync_interval and see an empty DB.
-    try:
-        raw.sync()
-    except Exception as e:    # noqa: BLE001 — log and re-raise; we want the trace
-        _log.error("db_initial_sync_failed", err=str(e))
-        raise
+    # Remote mode: every statement is an HTTPS round-trip to Turso. No
+    # local file is touched — ``path_str`` is accepted for API symmetry
+    # with the sqlite3 path (callers like JobQueue compute the path for
+    # logging) but isn't passed to libsql. Multi-statement transactions
+    # are still atomic: libsql buffers them until ``commit()``, which
+    # our wrapper translates from ``execute("COMMIT")``.
+    raw = libsql.connect(sync_url, auth_token=auth_token)
     # Wrap so callers get sqlite3.Row-compatible dict-rows from every
-    # fetch*. libsql's cursors return plain tuples, which would break
-    # ``row["col_name"]`` access everywhere in queue.py/settings_store.py.
+    # fetch* and so that ``execute("BEGIN"/"COMMIT"/"ROLLBACK")`` gets
+    # translated to libsql's native commit/rollback semantics.
     return _LibsqlConn(raw)
 
 

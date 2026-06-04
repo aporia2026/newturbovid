@@ -62,7 +62,7 @@ async def deep_health(
     # slow submits. Catches its own errors so a transient DB blip doesn't
     # 500 the health page.
     db_backend = (
-        _db.BACKEND_LIBSQL_REPLICA if settings.BULKVID_DB_URL else _db.BACKEND_SQLITE
+        _db.BACKEND_LIBSQL_REMOTE if settings.BULKVID_DB_URL else _db.BACKEND_SQLITE
     )
     db_info: dict[str, Any] = {"backend": db_backend}
     try:

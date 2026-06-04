@@ -54,6 +54,9 @@ def test_backend_constants_are_strings() -> None:
     """Boot logs reference these by import; pin the spellings so a typo
     breaks tests rather than silently degrading observability."""
     assert _db.BACKEND_SQLITE == "sqlite_local"
+    assert _db.BACKEND_LIBSQL_REMOTE == "libsql_remote"
+    # Legacy constant kept for backwards compatibility with prior plan
+    # references; pinned so a rename trips this test.
     assert _db.BACKEND_LIBSQL_REPLICA == "libsql_embedded_replica"
 
 
