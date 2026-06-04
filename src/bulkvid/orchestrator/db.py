@@ -226,17 +226,17 @@ class _LibsqlConn:
         self.row_factory: Any = None
 
     def execute(self, sql: str, params: Any = ()) -> _LibsqlCursor:
-        # Translate the three transaction statements queue.py issues via
-        # raw ``execute`` into libsql's native commit/rollback. BEGIN is a
-        # no-op because libsql implicitly starts a transaction on the
-        # first DML in DEFERRED isolation mode (libsql's default).
-        if _is_begin_stmt(sql):
-            return _LibsqlCursor(_NoopCursor())
-        if _is_commit_stmt(sql):
-            self._conn.commit()
-            return _LibsqlCursor(_NoopCursor())
-        if _is_rollback_stmt(sql):
-            self._conn.rollback()
+        # In autocommit mode (set in db.connect via isolation_level=None)
+        # every statement is its own transaction. BEGIN / COMMIT /
+        # ROLLBACK become pure no-ops — we mustn't forward them to
+        # libsql at all, because libsql's behaviour on a redundant
+        # commit/rollback when there's nothing to commit varies and
+        # we've seen it cause stale-read symptoms in remote mode. Drop
+        # them on the floor; the SQL behind ``with _tx():`` blocks is
+        # already idempotent enough thanks to idempotency keys + the
+        # recover_orphaned_rows boot pass (queue.py was designed to
+        # tolerate partial writes).
+        if _is_begin_stmt(sql) or _is_commit_stmt(sql) or _is_rollback_stmt(sql):
             return _LibsqlCursor(_NoopCursor())
         return _LibsqlCursor(self._conn.execute(sql, params))
 
@@ -340,10 +340,23 @@ def connect(
     # Remote mode: every statement is an HTTPS round-trip to Turso. No
     # local file is touched — ``path_str`` is accepted for API symmetry
     # with the sqlite3 path (callers like JobQueue compute the path for
-    # logging) but isn't passed to libsql. Multi-statement transactions
-    # are still atomic: libsql buffers them until ``commit()``, which
-    # our wrapper translates from ``execute("COMMIT")``.
-    raw = libsql.connect(sync_url, auth_token=auth_token)
+    # logging) but isn't passed to libsql.
+    #
+    # ``isolation_level=None`` forces autocommit: every statement is its
+    # own transaction, no implicit session-level transaction can hold a
+    # stale snapshot. We observed a multi-minute lag between
+    # ``INSERT INTO row_queue`` on the web app and the worker's
+    # subsequent ``SELECT`` seeing it; that's the classic symptom of
+    # libsql holding a logical session and serving stale reads from it.
+    # Autocommit removes the session.
+    #
+    # The atomicity trade-off (no multi-statement transactions): mostly
+    # covered by our idempotency-key column and the
+    # recover_orphaned_rows boot pass; the queue is already designed to
+    # tolerate partial writes.
+    raw = libsql.connect(
+        sync_url, auth_token=auth_token, isolation_level=None
+    )
     # Wrap so callers get sqlite3.Row-compatible dict-rows from every
     # fetch* and so that ``execute("BEGIN"/"COMMIT"/"ROLLBACK")`` gets
     # translated to libsql's native commit/rollback semantics.

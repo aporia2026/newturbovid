@@ -291,22 +291,28 @@ def test_libsqlconn_execute_begin_is_noop(sql: str) -> None:
 
 
 @pytest.mark.parametrize("sql", ["COMMIT", "commit", "COMMIT;", "END", "END TRANSACTION"])
-def test_libsqlconn_execute_commit_translates_to_native_commit(sql: str) -> None:
+def test_libsqlconn_execute_commit_is_pure_noop_in_autocommit(sql: str) -> None:
+    """In autocommit mode (set by db.connect via isolation_level=None),
+    libsql has no transaction to commit on ``conn.commit()`` and forwarding
+    the call caused stale-read symptoms in remote mode. The wrapper drops
+    COMMIT entirely — neither forwards as execute nor calls conn.commit()."""
     fake = _FakeConn()
     wrapped = _db._LibsqlConn(fake)
     wrapped.execute(sql)
-    assert fake.committed == 1
-    # Did NOT forward as a regular execute (which would push to the
-    # ``executed`` list and trigger the libsql wal_insert_begin bug).
+    assert fake.committed == 0
+    assert fake.rolled_back == 0
     assert fake.executed == []
 
 
 @pytest.mark.parametrize("sql", ["ROLLBACK", "rollback", "ROLLBACK;", "ROLLBACK TRANSACTION"])
-def test_libsqlconn_execute_rollback_translates_to_native_rollback(sql: str) -> None:
+def test_libsqlconn_execute_rollback_is_pure_noop_in_autocommit(sql: str) -> None:
+    """Same as COMMIT — see above. In autocommit there's nothing to roll
+    back; the wrapper drops the statement."""
     fake = _FakeConn()
     wrapped = _db._LibsqlConn(fake)
     wrapped.execute(sql)
-    assert fake.rolled_back == 1
+    assert fake.rolled_back == 0
+    assert fake.committed == 0
     assert fake.executed == []
 
 
@@ -359,8 +365,14 @@ def test_libsqlconn_executemany_with_empty_seq_is_safe() -> None:
 
 def test_libsqlconn_tx_pattern_matches_queue_tx_context_manager() -> None:
     """End-to-end check: replicate exactly what queue.py's _tx() does
-    (BEGIN IMMEDIATE → work → COMMIT) and confirm we end up with one
-    libsql .commit() call and zero broken execute("COMMIT") forwards."""
+    (BEGIN IMMEDIATE → work → COMMIT) and confirm the two real INSERT
+    statements land while the transaction markers drop on the floor.
+
+    In autocommit-libsql mode (since we pass isolation_level=None),
+    each INSERT auto-commits as its own transaction — multi-statement
+    atomicity is intentionally traded away to dodge the stale-read
+    symptom we hit in remote mode. queue.py tolerates this via
+    idempotency keys + recover_orphaned_rows."""
     fake = _FakeConn()
     wrapped = _db._LibsqlConn(fake)
 
@@ -369,19 +381,25 @@ def test_libsqlconn_tx_pattern_matches_queue_tx_context_manager() -> None:
     wrapped.execute("INSERT INTO row_queue (job_id, row_num) VALUES (?, ?)", ("j1", 2))
     wrapped.execute("COMMIT")
 
-    # The two DML statements landed. The BEGIN/COMMIT were translated.
+    # The two DML statements landed.
     assert len(fake.executed) == 2
-    assert fake.committed == 1
+    # BEGIN/COMMIT did NOT cause any extra commit() or rollback() calls
+    # — they're pure no-ops at this layer.
+    assert fake.committed == 0
     assert fake.rolled_back == 0
 
 
-def test_libsqlconn_tx_pattern_with_rollback_matches_queue_tx_on_error() -> None:
-    """Same end-to-end check, error path."""
+def test_libsqlconn_tx_pattern_with_rollback_drops_rollback_on_the_floor() -> None:
+    """Error-path counterpart. In autocommit mode the prior INSERT already
+    committed, so an ``execute("ROLLBACK")`` cannot undo it. The wrapper
+    drops the ROLLBACK statement entirely rather than trying to call
+    conn.rollback() (which on an autocommit libsql conn produced odd
+    behaviour in prod)."""
     fake = _FakeConn()
     wrapped = _db._LibsqlConn(fake)
     wrapped.execute("BEGIN IMMEDIATE")
     wrapped.execute("INSERT INTO jobs (job_id) VALUES (?)", ("j1",))
     wrapped.execute("ROLLBACK")
     assert len(fake.executed) == 1
-    assert fake.rolled_back == 1
+    assert fake.rolled_back == 0
     assert fake.committed == 0

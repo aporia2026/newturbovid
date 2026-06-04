@@ -89,9 +89,22 @@ class BatchRunner:
         )
 
         try:
+            # Heartbeat counter: log every N idle polls so a stalled
+            # runner shows up in observability instead of looking
+            # identical to a healthy idle one. Set high enough (30 = ~30s
+            # at poll_idle=1s) that a busy queue doesn't spam logs.
+            _idle_polls = 0
+            _IDLE_HEARTBEAT_EVERY = 30
             while not self._shutdown.is_set():
                 queued = await self._queue.claim_next_row()
                 if queued is None:
+                    _idle_polls += 1
+                    if _idle_polls % _IDLE_HEARTBEAT_EVERY == 0:
+                        _log.info(
+                            "runner_idle_heartbeat",
+                            polls=_idle_polls,
+                            poll_idle_seconds=self._poll_idle,
+                        )
                     # Empty queue. Wait briefly, or exit if shutdown fired.
                     try:
                         await asyncio.wait_for(
@@ -100,6 +113,7 @@ class BatchRunner:
                     except TimeoutError:
                         pass
                     continue
+                _idle_polls = 0    # reset on real work
 
                 await self._sem.acquire()       # block if at max_concurrent
                 task = asyncio.create_task(self._handle_row(queued))
