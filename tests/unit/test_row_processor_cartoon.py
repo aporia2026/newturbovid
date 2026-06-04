@@ -6,14 +6,14 @@ focuses on the processor's own orchestration + graceful-degradation logic. The
 kie/planner internals have their own unit tests.
 
 Covers:
-  - Happy path -> 2 videos, STATUS_SUCCESS, tab metadata
-  - Voice Over = No -> 2 videos, no TTS
+  - Happy path -> CARTOON_NUM_IDEAS videos, STATUS_SUCCESS, tab metadata
+  - Voice Over = No -> CARTOON_NUM_IDEAS videos, no TTS
   - Article fetch failure -> STATUS_ARTICLE_FETCH_FAILED
-  - A failed LATER shot image is held (still 2 videos)
-  - A failed shot animation is gap-filled (still 2 videos)
+  - A failed LATER shot image is held (still all videos)
+  - A failed shot animation is gap-filled (still all videos)
   - All animations fail -> STATUS_VIDEO_ASSEMBLY_FAILED
-  - One idea fully fails -> the other still ships (1 video, SUCCESS)
-  - ZapCap=Yes -> 2 captioned videos
+  - One idea fully fails -> the others still ship
+  - ZapCap=Yes -> all captioned videos
 """
 
 from __future__ import annotations
@@ -253,7 +253,7 @@ def _register_downloads() -> None:
 
 
 @respx.mock
-async def test_cartoon_happy_path_two_videos(monkeypatch) -> None:
+async def test_cartoon_happy_path_all_videos(monkeypatch) -> None:
     _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
@@ -261,13 +261,13 @@ async def test_cartoon_happy_path_two_videos(monkeypatch) -> None:
     result = await process_cartoon_row(_row(), clients, job_id="jobX")
 
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
     assert result.metadata["tab"] == "cartoon"
-    assert result.metadata["videos_produced"] == 2
-    # Each idea was voiced (2 TTS calls) and stitched (2 concat calls).
-    assert clients.tts.calls == 2
-    assert len(clients.rendi.concat_calls) == 2
-    # The voiceover was wired into the stitch.
+    assert result.metadata["videos_produced"] == rpc.CARTOON_NUM_IDEAS
+    # Each idea was voiced and stitched once.
+    assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS
+    assert len(clients.rendi.concat_calls) == rpc.CARTOON_NUM_IDEAS
+    # The voiceover was wired into every stitch.
     assert all(c["audio"] is not None for c in clients.rendi.concat_calls)
 
 
@@ -305,7 +305,7 @@ async def test_cartoon_video_always_8s_when_normal_vo(monkeypatch) -> None:
     assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
     assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
     # Only one TTS call per idea — no retry was needed.
-    assert clients.tts.calls == 2
+    assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS
     assert all(d == 4 for d in counters["durations"])
 
 
@@ -327,18 +327,19 @@ async def test_cartoon_vo_too_long_triggers_shorten_then_fits(monkeypatch) -> No
     counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
-    # First TTS = 13s raw -> effective 10s (over cap). Second TTS = 5s -> 3.85s
-    # effective (under cap). Both ideas follow the same pattern in this fake.
-    clients.tts = _FakeTTS(durations=[13.0, 5.0, 13.0, 5.0])    # type: ignore[assignment]
+    # First TTS per idea = 13s raw -> effective 10s (over cap). Retry = 5s ->
+    # 3.85s effective (under cap). Every idea follows the same pattern.
+    pattern = [13.0, 5.0] * rpc.CARTOON_NUM_IDEAS
+    clients.tts = _FakeTTS(durations=pattern)    # type: ignore[assignment]
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
-    # 4 TTS calls = 2 ideas * (1 initial + 1 retry).
-    assert clients.tts.calls == 4
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
+    # N ideas * (1 initial + 1 retry) TTS calls.
+    assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS * 2
     # Shortener was invoked once per idea.
-    assert len(shorten_calls) == 2
-    # Both stitched videos are still 8.0s with uniform 4s clips.
+    assert len(shorten_calls) == rpc.CARTOON_NUM_IDEAS
+    # All stitched videos are still 8.0s with uniform 4s clips.
     for call in clients.rendi.concat_calls:
         assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
         assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
@@ -350,8 +351,8 @@ async def test_cartoon_vo_too_long_triggers_shorten_then_fits(monkeypatch) -> No
 @respx.mock
 async def test_cartoon_vo_too_long_after_retry_drops_idea(monkeypatch) -> None:
     """If the shortened TTS *still* overshoots the 8s ceiling, the idea is
-    dropped (returns None from _build_idea). The other idea ships normally so
-    the row succeeds with one video. Row only fails when BOTH ideas drop."""
+    dropped (returns None from _build_idea). The remaining ideas ship normally
+    so the row succeeds. Row only fails when ALL ideas drop."""
     from bulkvid.pipeline.cartoon_prompt import ShortenResult
 
     async def _shorten(_client, *, text: str, language: str, target_words: int, **_):
@@ -363,9 +364,13 @@ async def test_cartoon_vo_too_long_after_retry_drops_idea(monkeypatch) -> None:
     _register_downloads()
     clients = _build_clients()
 
-    # Custom TTS: idea 1 always overshoots (13s on both attempts) → dropped.
-    # Idea 2 starts long (13s) but the retry (5s) fits → ships.
-    overshoot_sequence = iter([13.0, 13.0, 13.0, 5.0])
+    # Custom TTS sequence: every idea overshoots on its first call. On retry,
+    # all-but-one still overshoot → dropped; the last retry fits → ships.
+    # Result: exactly 1 video, regardless of asyncio scheduling order between
+    # the concurrent ideas (the sequence is consumed call-by-call).
+    overshoot_initial = [13.0] * rpc.CARTOON_NUM_IDEAS
+    overshoot_retries = [13.0] * (rpc.CARTOON_NUM_IDEAS - 1) + [5.0]
+    overshoot_sequence = iter(overshoot_initial + overshoot_retries)
     fake_tts = _FakeTTS()
 
     async def _synth(text, language, voice=None, style_prompt=None, country=""):
@@ -389,7 +394,7 @@ async def test_cartoon_vo_too_long_after_retry_drops_idea(monkeypatch) -> None:
     clients.tts = fake_tts          # type: ignore[assignment]
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
-    # One idea dropped (over-cap after retry), one shipped — row still succeeds.
+    # N-1 ideas dropped (over-cap after retry), one shipped — row still succeeds.
     assert result.status == STATUS_SUCCESS
     assert len(result.video_urls) == 1
     assert result.metadata["videos_produced"] == 1
@@ -417,11 +422,11 @@ async def test_cartoon_vo_shortener_no_change_drops_idea(monkeypatch) -> None:
     clients.tts = _FakeTTS(duration=13.0)    # type: ignore[assignment]
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
-    # Both ideas dropped → row fails with VIDEO_ASSEMBLY_FAILED (existing path).
+    # All ideas dropped → row fails with VIDEO_ASSEMBLY_FAILED (existing path).
     assert result.status == STATUS_VIDEO_ASSEMBLY_FAILED
     assert result.video_urls == []
     # Each idea: one initial TTS, then shortener returned the same text → no retry.
-    assert clients.tts.calls == 2
+    assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS
     _ = original    # noqa: F841
 
 
@@ -450,7 +455,7 @@ async def test_cartoon_voice_over_no_skips_tts(monkeypatch) -> None:
 
     result = await process_cartoon_row(_row(vo=False), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
     assert clients.tts.calls == 0
     assert all(c["audio"] is None for c in clients.rendi.concat_calls)
 
@@ -472,9 +477,9 @@ async def test_cartoon_failed_later_shot_image_is_held(monkeypatch) -> None:
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
-    # Both stitches still received 2 clips.
-    assert all(len(c["clips"]) == 2 for c in clients.rendi.concat_calls)
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
+    # All stitches still received the right number of clips.
+    assert all(len(c["clips"]) == rpc.CARTOON_NUM_SHOTS for c in clients.rendi.concat_calls)
 
 
 @respx.mock
@@ -486,8 +491,8 @@ async def test_cartoon_failed_animation_is_gap_filled(monkeypatch) -> None:
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
-    assert all(len(c["clips"]) == 2 for c in clients.rendi.concat_calls)
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
+    assert all(len(c["clips"]) == rpc.CARTOON_NUM_SHOTS for c in clients.rendi.concat_calls)
 
 
 @respx.mock
@@ -502,16 +507,16 @@ async def test_cartoon_all_animations_fail(monkeypatch) -> None:
 
 
 @respx.mock
-async def test_cartoon_one_idea_fails_other_ships(monkeypatch) -> None:
+async def test_cartoon_one_idea_fails_others_ship(monkeypatch) -> None:
     # Fail the 2nd first-shot text-to-image -> exactly one idea loses shot 1 and is
-    # dropped; the other idea still produces a video.
+    # dropped; the remaining N-1 ideas still produce videos.
     _patch_kie(monkeypatch, t2i_fail_on=2)
     _register_downloads()
     clients = _build_clients()
 
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 1
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS - 1
 
 
 @respx.mock
@@ -522,7 +527,7 @@ async def test_cartoon_zapcap_applied(monkeypatch) -> None:
 
     result = await process_cartoon_row(_row(zapcap=True), clients, job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert len(result.video_urls) == 2
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
     assert result.metadata.get("zapcap_applied") is True
     # Captioned outputs were persisted.
     assert any("videos_captioned" in key for key, _ in clients.storage.calls)

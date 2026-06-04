@@ -212,10 +212,21 @@ def _fallback_plan(vertical: str, num_ideas: int, num_shots: int) -> list[Cartoo
 def _enforce_word_cap(text: str, max_words: int) -> str:
     """Truncate ``text`` to at most ``max_words`` words.
 
-    Prefers to end at the last sentence boundary (``.``, ``!``, ``?``) inside the
-    cap so the spoken line doesn't end mid-thought; otherwise trims at the word
-    boundary and adds a terminal period. Backstop for model drift past the
-    prompt's word range — see CARTOON_MAX_WORDS rationale above.
+    Returns the original (stripped) text when already within the cap. When
+    truncation is needed, prefers to end at the last sentence boundary
+    (``.``, ``!``, ``?``) inside the cap so the spoken line doesn't end
+    mid-thought.
+
+    When no real sentence boundary exists within the cap, returns the empty
+    string — signalling "this VO is incomplete, drop the idea". The previous
+    behaviour was to chop at the word boundary and append an artificial
+    period, which produced grammatically-terminated but semantically
+    incomplete VOs ("...and." / "...with."). See
+    ``refs/cartoon-debug/v1.mp4`` for an example of the failure mode and
+    the 2026-06-04 fragment-debug session for the diagnosis.
+
+    Backstop for model drift past the prompt's word range — see
+    ``CARTOON_MAX_WORDS`` rationale above.
     """
     words = text.split()
     if len(words) <= max_words:
@@ -225,7 +236,7 @@ def _enforce_word_cap(text: str, max_words: int) -> str:
     last_break = max(truncated.rfind(p) for p in ".!?")
     if last_break >= half:
         return truncated[: last_break + 1].rstrip()
-    return truncated.rstrip(",;:- ").rstrip() + "."
+    return ""
 
 
 def _first_nonempty(d: dict, *keys: str) -> str:
@@ -296,6 +307,19 @@ def _coerce_ideas(
                 max_words=CARTOON_MAX_WORDS,
                 capped_words=len(voiceover.split()),
             )
+        # Reject VOs that don't end on a real sentence boundary. The planner
+        # prompt explicitly demands "MUST be a COMPLETE THOUGHT ending in
+        # period/question/exclamation"; this is the enforcement step.
+        # _enforce_word_cap can also return "" when truncation found no real
+        # sentence ending — same outcome here.
+        if not voiceover or not voiceover.rstrip().endswith((".", "!", "?")):
+            _log.warning(
+                "cartoon_idea_rejected_incomplete_sentence",
+                idea_index=raw_idx,
+                original_words=original_words,
+                voiceover_preview=voiceover_raw[:120],
+            )
+            continue
         style = (
             _first_nonempty(raw, "style_direction", "style", "tone", "delivery")
             or DEFAULT_STYLE_DIRECTION
@@ -516,8 +540,21 @@ async def shorten_voiceover(
         )
         return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
 
-    # Hard cap to target_words in case the model went slightly over.
+    # Hard cap to target_words in case the model went slightly over. The
+    # cap returns "" when truncation lands mid-thought (no real sentence
+    # boundary inside the cap). Either way, the result must end on .!? —
+    # otherwise we'd ship a fragment, which is the bug this whole helper
+    # exists to prevent. Fall back to the original on either failure so
+    # the caller drops the idea (matches the existing "no change" path).
     capped = _enforce_word_cap(new_vo, target_words)
+    if not capped or not capped.rstrip().endswith((".", "!", "?")):
+        _log.warning(
+            "cartoon_shorten_incomplete_returned_original",
+            original=text[:80],
+            shortened_preview=new_vo[:80],
+            cap_result_preview=capped[:80],
+        )
+        return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
     _log.info(
         "cartoon_shorten_ok",
         original_words=len(text.split()),

@@ -239,14 +239,17 @@ async def test_plan_pads_short_shot_list_by_repeating_last() -> None:
 
 
 @respx.mock
-async def test_plan_voiceover_above_cap_is_truncated() -> None:
-    # Model returns voiceovers well above CARTOON_MAX_WORDS. The cap must kick
-    # in deterministically (so the TTS step never produces a clip longer than
-    # the assembled video can play). Regression for the 2026-06-03 live overshoot.
+async def test_plan_voiceover_above_cap_drops_idea_then_falls_back() -> None:
+    # Model returns voiceovers well above CARTOON_MAX_WORDS where no sentence
+    # boundary exists inside the cap. Old behaviour: truncate to N words +
+    # append a synthetic ".", producing fragments like "...inventory than they."
+    # New behaviour: _enforce_word_cap returns "" and _coerce_ideas drops the
+    # idea, the planner pads to num_ideas with the generic fallback. The row
+    # still ships, but with a fallback line rather than a chopped fragment.
     long_vo = (
         "Used car prices are dropping fast this spring as buyers grow more "
         "cautious and dealers face tighter inventory than they expected."
-    )  # 22 words
+    )  # 22 words, single sentence — no usable boundary inside the 12-word cap
     plan_json = json.dumps(
         {
             "ideas": [
@@ -264,9 +267,12 @@ async def test_plan_voiceover_above_cap_is_truncated() -> None:
     plan = await _run(plan_json)
     assert len(plan.ideas) == 2
     for idea in plan.ideas:
+        # The shipped voiceovers are all complete sentences within the cap.
         assert len(idea.voiceover.split()) <= CARTOON_MAX_WORDS
-        # Truncated line still ends cleanly (no mid-word cut, no dangling comma).
         assert idea.voiceover.rstrip().endswith((".", "!", "?"))
+        # And specifically NOT a fragment of the long source — the offending
+        # ideas were dropped, not patched up with a fake period.
+        assert "inventory than they" not in idea.voiceover
 
 
 def test_image_prompt_for_shot_first_shot() -> None:
@@ -312,23 +318,99 @@ def test_enforce_word_cap_over_limit_prefers_sentence_boundary() -> None:
     assert "holiday" not in out          # tail of sentence 2 did not bleed in
 
 
-def test_enforce_word_cap_no_sentence_boundary_falls_back_to_word_cut() -> None:
-    # A run-on with no usable sentence break — the helper trims at the word
-    # boundary and adds a terminal period so TTS reads naturally.
+def test_enforce_word_cap_no_sentence_boundary_returns_empty() -> None:
+    # A run-on with no usable sentence break used to be silently chopped at the
+    # word boundary + an artificial period appended, which produced fragments
+    # like "...with." that sounded cut. The helper now returns "" instead, so
+    # the caller (_coerce_ideas) drops the idea rather than shipping a fragment.
     text = "this is a long run on line with no punctuation anywhere at all here"
     out = _enforce_word_cap(text, max_words=6)
-    assert out.endswith(".")
-    assert len(out.rstrip(".").split()) == 6
+    assert out == ""
 
 
-def test_enforce_word_cap_strips_trailing_punctuation_before_period() -> None:
-    # A truncation that lands on a comma-ended fragment must lose the comma
-    # before the synthetic period is added (no ", ." artifacts).
+def test_enforce_word_cap_comma_fragment_returns_empty() -> None:
+    # A comma-separated run without any real sentence ending also gets dropped:
+    # appending a period to "...third part." produced a grammatically-valid but
+    # semantically incomplete VO. Returning "" lets the caller drop the idea.
     text = "first part, second part, third part, fourth part, fifth part"
     out = _enforce_word_cap(text, max_words=4)
-    assert out.endswith(".")
-    assert ", ." not in out
-    assert ",." not in out
+    assert out == ""
+
+
+# ── Sentence-boundary validation in _coerce_ideas ───────────────────────────
+
+
+@respx.mock
+async def test_plan_drops_idea_ending_on_conjunction() -> None:
+    """Planner-returned VO that ends mid-thought (e.g. on 'and') used to ship
+    via TTS and produce a video whose audio sounds cut. Now the idea is
+    rejected outright and the row falls back to padding."""
+    fragment = "Homes keep grandparents close to families and"   # ends on conjunction, no .!?
+    plan_json = json.dumps(
+        {
+            "ideas": [
+                {
+                    "voiceover": fragment,
+                    "style_direction": "Warm.",
+                    "shots": [
+                        {"scene": "Scene A", "motion": "subtle"},
+                        {"scene": "Scene B", "motion": "subtle"},
+                    ],
+                },
+                {
+                    "voiceover": "A clean complete sentence about cheap cars.",
+                    "style_direction": "Upbeat.",
+                    "shots": [
+                        {"scene": "Scene C", "motion": "subtle"},
+                        {"scene": "Scene D", "motion": "subtle"},
+                    ],
+                },
+            ]
+        }
+    )
+    plan = await _run(plan_json)
+    assert len(plan.ideas) == 2
+    # The clean idea survives; the fragment is dropped + replaced by fallback.
+    assert any("cheap cars" in idea.voiceover for idea in plan.ideas)
+    # No idea ships the fragment.
+    assert all(fragment not in idea.voiceover for idea in plan.ideas)
+    # Every shipped idea ends cleanly.
+    for idea in plan.ideas:
+        assert idea.voiceover.rstrip().endswith((".", "!", "?"))
+
+
+@respx.mock
+async def test_plan_drops_idea_with_no_terminal_punctuation() -> None:
+    """Any planner VO that lacks .!? at the end is dropped, regardless of how
+    'complete' it might sound semantically. Defensive enforcement of the
+    planner-prompt contract."""
+    plan_json = json.dumps(
+        {
+            "ideas": [
+                {
+                    "voiceover": "Cars are cheaper this spring",   # no terminal punctuation
+                    "style_direction": "Calm.",
+                    "shots": [
+                        {"scene": "Scene A", "motion": "subtle"},
+                        {"scene": "Scene B", "motion": "subtle"},
+                    ],
+                },
+                {
+                    "voiceover": "A short clean sentence about cars.",
+                    "style_direction": "Calm.",
+                    "shots": [
+                        {"scene": "Scene C", "motion": "subtle"},
+                        {"scene": "Scene D", "motion": "subtle"},
+                    ],
+                },
+            ]
+        }
+    )
+    plan = await _run(plan_json)
+    assert len(plan.ideas) == 2
+    # The unpunctuated idea is dropped; the clean idea survives.
+    assert any("short clean sentence" in idea.voiceover for idea in plan.ideas)
+    assert all("Cars are cheaper this spring" not in idea.voiceover for idea in plan.ideas)
 
 
 def test_cartoon_word_constants_consistent() -> None:
