@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     SYMPHONY_DB_SHEET_ID: str = "10NgBy7DGUOkW15HHAQC4B-BP0dcCIX5yTnRCDowMkgc"
     SYMPHONY_DB_SHEET_TAB: str = "SYMPHONY_DB"
 
+    # The bulk-team spreadsheet the local runner (``tools/run_local.py``)
+    # defaults to when ``--sheet-id`` is omitted. PA itself doesn't read
+    # this — Apps Script passes the sheet ID per-request. Set only on
+    # machines running the local CLI so the bulk user doesn't have to
+    # retype the ID every invocation.
+    BULKVID_DEFAULT_SHEET_ID: str = ""
+
     # ── Concurrency ──────────────────────────────────────────────────────
     # Default tuned for PythonAnywhere (CPU-quota-aware). Override to 40 on Hetzner.
     # See plan §5 "Concurrency model" and §12 "Performance targets".

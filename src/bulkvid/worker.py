@@ -85,24 +85,35 @@ def build_pipeline_clients(settings: Settings) -> PipelineClients:
 def build_flush_callback(settings: Settings) -> FlushCallback:
     """Pick the right write-back implementation for the environment.
 
-    Production: ``SheetsClient.batch_write_video_urls``.
-    Local dev without Sheets credentials: a noop callback that logs only —
+    Production: ``SheetsClient.batch_write_video_urls`` with credentials from
+    either ``SHEETS_SERVICE_ACCOUNT_FILE`` (a JSON path) or the inline
+    ``GOOGLE_*`` env vars — whichever is configured.
+
+    Local dev without ANY Sheets credentials: a noop callback that logs only —
     the worker still drains the queue, results are still recorded in SQLite.
     """
-    if settings.SHEETS_SERVICE_ACCOUNT_FILE:
-        sheets = SheetsClient(credentials_file=settings.SHEETS_SERVICE_ACCOUNT_FILE)
-        _log.info("sheets_writer_attached", file=settings.SHEETS_SERVICE_ACCOUNT_FILE)
-        return sheets.batch_write_video_urls
+    from bulkvid.adapters import sheets as sheets_mod
 
-    _log.warning(
-        "sheets_credentials_missing",
-        note="worker will drain queue but skip sheet write-back",
+    try:
+        sheets_client = sheets_mod.build_client_from_settings(settings)
+    except ValueError:
+        _log.warning(
+            "sheets_credentials_missing",
+            note="worker will drain queue but skip sheet write-back",
+        )
+
+        async def _noop(writes: list[PendingWrite]) -> None:
+            _log.info("sheets_writeback_skipped", count=len(writes))
+
+        return _noop
+
+    _log.info(
+        "sheets_writer_attached",
+        mode=(
+            "file" if settings.SHEETS_SERVICE_ACCOUNT_FILE else "inline_env"
+        ),
     )
-
-    async def _noop(writes: list[PendingWrite]) -> None:
-        _log.info("sheets_writeback_skipped", count=len(writes))
-
-    return _noop
+    return sheets_client.batch_write_video_urls
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────

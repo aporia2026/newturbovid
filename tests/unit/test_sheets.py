@@ -65,6 +65,126 @@ def test_constructor_rejects_empty_credentials_without_client() -> None:
         SheetsClient(credentials_file="")
 
 
+def test_constructor_rejects_all_empty() -> None:
+    with pytest.raises(ValueError, match="credentials_file|credentials_info|client"):
+        SheetsClient(credentials_file="", credentials_info=None)
+
+
+def test_constructor_accepts_credentials_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inline-env-var path: pass a dict, get a working SheetsClient.
+
+    We stub ``Credentials.from_service_account_info`` + ``gspread.authorize``
+    so the test doesn't need a real RSA key. The point of the test is wiring,
+    not crypto.
+    """
+    import bulkvid.adapters.sheets as sheets_mod
+
+    captured: dict = {}
+
+    def _fake_from_info(info, scopes):    # noqa: ANN001
+        captured["info"] = info
+        captured["scopes"] = scopes
+        return "fake-creds"
+
+    def _fake_authorize(creds):    # noqa: ANN001
+        captured["creds"] = creds
+        return MagicMock(name="fake-gspread-client")
+
+    monkeypatch.setattr(
+        sheets_mod.Credentials, "from_service_account_info", _fake_from_info
+    )
+    monkeypatch.setattr(sheets_mod.gspread, "authorize", _fake_authorize)
+
+    info = {"type": "service_account", "client_email": "x@y", "private_key": "fake"}
+    sc = SheetsClient(credentials_info=info)
+    assert sc._client is not None
+    assert captured["info"] is info
+    assert captured["scopes"] == list(sheets_mod.GSHEETS_SCOPES)
+
+
+# ── build_client_from_settings ──────────────────────────────────────────────
+
+
+def test_build_client_from_settings_uses_file_when_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """File path wins over inline env vars when both are configured."""
+    from bulkvid.adapters import sheets as sheets_mod
+    from bulkvid.config import Settings
+
+    sa = tmp_path / "sa.json"
+    sa.write_text("{}")
+    settings = Settings(
+        SHEETS_SERVICE_ACCOUNT_FILE=str(sa),
+        GOOGLE_PRIVATE_KEY="should-be-ignored",
+        GOOGLE_CLIENT_EMAIL="should-be-ignored@x",
+    )
+
+    captured: dict = {}
+
+    def _fake_from_file(path, scopes):    # noqa: ANN001
+        captured["path"] = path
+        return "creds-from-file"
+
+    def _fake_authorize(creds):    # noqa: ANN001
+        return MagicMock()
+
+    monkeypatch.setattr(
+        sheets_mod.Credentials, "from_service_account_file", _fake_from_file
+    )
+    monkeypatch.setattr(sheets_mod.gspread, "authorize", _fake_authorize)
+
+    sc = sheets_mod.build_client_from_settings(settings)
+    assert sc is not None
+    assert captured["path"] == str(sa)
+
+
+def test_build_client_from_settings_falls_back_to_inline_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When SHEETS_SERVICE_ACCOUNT_FILE is empty but GOOGLE_* vars are set,
+    the builder uses the inline-env-var path (the PA-style setup)."""
+    from bulkvid.adapters import sheets as sheets_mod
+    from bulkvid.config import Settings
+
+    settings = Settings(
+        SHEETS_SERVICE_ACCOUNT_FILE="",
+        GOOGLE_PROJECT_ID="proj",
+        GOOGLE_CLIENT_EMAIL="bot@proj.iam.gserviceaccount.com",
+        GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+        GOOGLE_CLIENT_ID="42",
+    )
+
+    captured: dict = {}
+
+    def _fake_from_info(info, scopes):    # noqa: ANN001
+        captured["info"] = info
+        return "creds-from-info"
+
+    def _fake_authorize(creds):    # noqa: ANN001
+        return MagicMock()
+
+    monkeypatch.setattr(
+        sheets_mod.Credentials, "from_service_account_info", _fake_from_info
+    )
+    monkeypatch.setattr(sheets_mod.gspread, "authorize", _fake_authorize)
+
+    sc = sheets_mod.build_client_from_settings(settings)
+    assert sc is not None
+    # The dict that reached the constructor should have the right fields.
+    assert captured["info"]["client_email"] == "bot@proj.iam.gserviceaccount.com"
+    assert captured["info"]["project_id"] == "proj"
+
+
+def test_build_client_from_settings_raises_when_neither_configured() -> None:
+    from bulkvid.adapters import sheets as sheets_mod
+    from bulkvid.config import Settings
+
+    settings = Settings(SHEETS_SERVICE_ACCOUNT_FILE="")
+    with pytest.raises(ValueError, match="not configured"):
+        sheets_mod.build_client_from_settings(settings)
+
+
 # ── read_image_vo_rows ──────────────────────────────────────────────────────
 
 
@@ -358,3 +478,96 @@ def test_column_constants_match_plan() -> None:
     # = 0-indexed col 9). 4Images at column N (col 14 = 0-indexed 13).
     assert IMAGE_VO_COLS.ready_video_start == 9
     assert FOUR_IMAGES_COLS.ready_video_start == 13
+
+
+# ── read_header_row ─────────────────────────────────────────────────────────
+
+
+async def test_read_header_row_returns_row_1() -> None:
+    # Custom client because the standard fake only mocks get_all_values.
+    ws = MagicMock()
+    ws.row_values = MagicMock(return_value=["Country", "Vertical", "Article", "Manual Image"])
+    spreadsheet = MagicMock()
+    spreadsheet.worksheet = MagicMock(return_value=ws)
+    client = MagicMock()
+    client.open_by_key = MagicMock(return_value=spreadsheet)
+
+    sc = SheetsClient(client=client)
+    headers = await sc.read_header_row("sheet-A", "Image-VO")
+    assert headers == ["Country", "Vertical", "Article", "Manual Image"]
+    ws.row_values.assert_called_once_with(1)
+
+
+# ── list_worksheets ─────────────────────────────────────────────────────────
+
+
+async def test_list_worksheets_returns_tab_titles_in_order() -> None:
+    ws_a, ws_b, ws_c = MagicMock(), MagicMock(), MagicMock()
+    ws_a.title = "image_vo"
+    ws_b.title = "simple"
+    ws_c.title = "cartoon"
+    spreadsheet = MagicMock()
+    spreadsheet.worksheets = MagicMock(return_value=[ws_a, ws_b, ws_c])
+    client = MagicMock()
+    client.open_by_key = MagicMock(return_value=spreadsheet)
+
+    sc = SheetsClient(client=client)
+    names = await sc.list_worksheets("sheet-A")
+    assert names == ["image_vo", "simple", "cartoon"]
+
+
+# ── read_processed_row_nums ─────────────────────────────────────────────────
+
+
+async def test_read_processed_row_nums_image_vo_layout() -> None:
+    # Image-VO: ready_video_start = 0-indexed col 9 (column J).
+    # Row 2 (J empty) is unprocessed; row 3 (J set) is processed.
+    sheet_data = {
+        ("sheet-A", "Image-VO"): [
+            # Header (ignored).
+            ["", "", "", "", "", "", "", "", "", "Ready Video 1"],
+            # Row 2: J empty -> unprocessed.
+            ["US", "news", "http://a", "http://img", "Yes", "No", "9:16", "", "", ""],
+            # Row 3: J set -> processed.
+            ["US", "news", "http://a", "http://img", "Yes", "No", "9:16", "", "", "http://v1"],
+            # Row 4: J empty -> unprocessed.
+            ["US", "news", "http://a", "http://img", "Yes", "No", "9:16", "", "", ""],
+            # Row 5: J set with whitespace only -> still unprocessed.
+            ["US", "news", "http://a", "http://img", "Yes", "No", "9:16", "", "", "   "],
+        ],
+    }
+    client, _ = _make_fake_client(sheet_data)
+    sc = SheetsClient(client=client)
+    processed = await sc.read_processed_row_nums(
+        "sheet-A", "Image-VO", layout=TAB_IMAGE_VO
+    )
+    assert processed == {3}
+
+
+async def test_read_processed_row_nums_four_images_layout() -> None:
+    # 4Images: ready_video_start = 0-indexed col 13 (column N).
+    sheet_data = {
+        ("sheet-B", "4Images"): [
+            # Header padded out to col N.
+            [""] * 13 + ["Ready Video 1"],
+            # Row 2: N empty -> unprocessed.
+            [""] * 13 + [""],
+            # Row 3: N set -> processed.
+            [""] * 13 + ["http://v1"],
+        ],
+    }
+    client, _ = _make_fake_client(sheet_data)
+    sc = SheetsClient(client=client)
+    processed = await sc.read_processed_row_nums(
+        "sheet-B", "4Images", layout=TAB_FOUR_IMAGES
+    )
+    assert processed == {3}
+
+
+async def test_read_processed_row_nums_unknown_layout_returns_empty() -> None:
+    client, _ = _make_fake_client({})
+    sc = SheetsClient(client=client)
+    processed = await sc.read_processed_row_nums(
+        "sheet-A", "Foo", layout="bogus"
+    )
+    assert processed == set()

@@ -117,12 +117,24 @@ def _row_is_blank(row: list[str], required_idxs: list[int]) -> bool:
 
 
 class SheetsClient:
-    """Async wrapper over gspread."""
+    """Async wrapper over gspread.
+
+    Credentials can come from any of three sources, in priority order:
+      1. A pre-built gspread ``client`` (tests inject one here).
+      2. ``credentials_file`` — path to a service-account JSON on disk.
+         Preferred when the host has a filesystem we can drop a JSON onto
+         (Hetzner Docker volume, local dev machines).
+      3. ``credentials_info`` — the parsed JSON shape as a dict. Used when
+         the JSON contents live in env vars instead of a file
+         (PythonAnywhere-friendly, mirrors how ``google_credentials.py``
+         feeds the other Google services).
+    """
 
     def __init__(
         self,
         credentials_file: str = "",
         *,
+        credentials_info: dict[str, Any] | None = None,
         client: Any | None = None,    # injectable for tests
     ) -> None:
         if client is not None:
@@ -132,9 +144,15 @@ class SheetsClient:
                 credentials_file, scopes=list(GSHEETS_SCOPES)
             )
             self._client = gspread.authorize(creds)
+        elif credentials_info is not None:
+            creds = Credentials.from_service_account_info(
+                credentials_info, scopes=list(GSHEETS_SCOPES)
+            )
+            self._client = gspread.authorize(creds)
         else:
             raise ValueError(
-                "SheetsClient requires credentials_file (or a pre-built client)"
+                "SheetsClient requires credentials_file, credentials_info, "
+                "or a pre-built client"
             )
 
     # ── Sync workers (invoked via asyncio.to_thread) ────────────────────────
@@ -147,6 +165,24 @@ class SheetsClient:
         ws = self._get_worksheet_sync(sheet_id, worksheet_name)
         return ws.get_all_values()
 
+    def _read_header_row_sync(self, sheet_id: str, worksheet_name: str) -> list[str]:
+        ws = self._get_worksheet_sync(sheet_id, worksheet_name)
+        return ws.row_values(1)
+
+    def _list_worksheets_sync(self, sheet_id: str) -> list[str]:
+        spreadsheet = self._client.open_by_key(sheet_id)
+        return [ws.title for ws in spreadsheet.worksheets()]
+
+    def _read_processed_row_nums_sync(
+        self, sheet_id: str, worksheet_name: str, ready_video_col_0based: int
+    ) -> set[int]:
+        data = self._read_all_values_sync(sheet_id, worksheet_name)
+        processed: set[int] = set()
+        for offset, raw in enumerate(data[1:], start=2):
+            if _cell(raw, ready_video_col_0based):
+                processed.add(offset)
+        return processed
+
     def _batch_update_sync(
         self, sheet_id: str, worksheet_name: str, updates: list[dict]
     ) -> None:
@@ -154,6 +190,39 @@ class SheetsClient:
         ws.batch_update(updates)
 
     # ── Public read API ─────────────────────────────────────────────────────
+
+    async def read_header_row(
+        self, sheet_id: str, worksheet_name: str
+    ) -> list[str]:
+        """Return row 1 (the column headers) as a list of strings. Used by the
+        local runner's layout auto-detection so it can fall back from
+        name-based detection to header-based detection without reading the
+        whole sheet."""
+        return await asyncio.to_thread(
+            self._read_header_row_sync, sheet_id, worksheet_name
+        )
+
+    async def list_worksheets(self, sheet_id: str) -> list[str]:
+        """Return every worksheet (tab) name in the spreadsheet, in tab order.
+        Used by the local runner's interactive tab picker."""
+        return await asyncio.to_thread(self._list_worksheets_sync, sheet_id)
+
+    async def read_processed_row_nums(
+        self, sheet_id: str, worksheet_name: str, *, layout: str
+    ) -> set[int]:
+        """Return the set of 1-indexed sheet row numbers whose ``Ready Video 1``
+        cell is non-empty — i.e. rows that have already been processed.
+        Used by the local runner so the default "process all unprocessed rows"
+        path can skip rows that already have output."""
+        if layout in (TAB_IMAGE_VO, TAB_SIMPLE, TAB_CARTOON):
+            col = IMAGE_VO_COLS.ready_video_start
+        elif layout == TAB_FOUR_IMAGES:
+            col = FOUR_IMAGES_COLS.ready_video_start
+        else:
+            return set()
+        return await asyncio.to_thread(
+            self._read_processed_row_nums_sync, sheet_id, worksheet_name, col
+        )
 
     async def read_image_vo_rows(
         self, sheet_id: str, worksheet_name: str
@@ -372,7 +441,21 @@ class SheetsClient:
 
 
 def build_client_from_settings(settings: Settings | None = None) -> SheetsClient:
+    """Construct ``SheetsClient`` from settings, accepting either auth mode:
+    a JSON file path (``SHEETS_SERVICE_ACCOUNT_FILE``) or the inline
+    ``GOOGLE_*`` env vars used by ``google_credentials.build_credentials_info``.
+    Raises ``ValueError`` only when neither is configured."""
+    from bulkvid.adapters.google_credentials import build_credentials_info
+
     s = settings or get_settings()
-    if not s.SHEETS_SERVICE_ACCOUNT_FILE:
-        raise ValueError("SHEETS_SERVICE_ACCOUNT_FILE is empty; cannot build SheetsClient")
-    return SheetsClient(credentials_file=s.SHEETS_SERVICE_ACCOUNT_FILE)
+    if s.SHEETS_SERVICE_ACCOUNT_FILE:
+        return SheetsClient(credentials_file=s.SHEETS_SERVICE_ACCOUNT_FILE)
+    info = build_credentials_info(s)
+    if info is not None:
+        return SheetsClient(credentials_info=info)
+    raise ValueError(
+        "Google Sheets credentials not configured: set "
+        "SHEETS_SERVICE_ACCOUNT_FILE to a JSON path, OR set the inline "
+        "GOOGLE_* env vars (GOOGLE_PRIVATE_KEY, GOOGLE_CLIENT_EMAIL, "
+        "GOOGLE_PROJECT_ID, etc.)."
+    )
