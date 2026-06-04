@@ -594,6 +594,118 @@ def test_poll_path_not_swallowed_by_job_id_route(client: TestClient) -> None:
     assert "jobs" in r.json()
 
 
+# ── Idempotency on POST /jobs (rule 18) ─────────────────────────────────────
+# Plan: _plans/2026-06-04-submit-500-defensive-fix.md §"Change 1".
+# A submit POST that PA's frontend dropped on the way back to the Apps Script
+# is retried with the SAME key — we must return the SAME job_id, no duplicate.
+
+
+def test_submit_idempotency_replay_returns_same_job(client: TestClient) -> None:
+    payload = _image_vo_payload()
+    payload["idempotency_key"] = "sub-12345-abcdef"
+    r1 = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    r2 = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["job_id"] == r2.json()["job_id"]
+    # Only ONE job was actually created.
+    r_list = client.get("/jobs", headers=_auth("tok-bulk1"))
+    assert len(r_list.json()) == 1
+
+
+def test_submit_idempotency_scoped_per_user(client: TestClient) -> None:
+    """User B replaying user A's key must NOT receive user A's job."""
+    payload = _image_vo_payload()
+    payload["idempotency_key"] = "sub-shared-key"
+    r_a = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    r_b = client.post("/jobs", json=payload, headers=_auth("tok-bulk2"))
+    assert r_a.status_code == 200
+    assert r_b.status_code == 200
+    # Different jobs — the scoping prevented a cross-user idempotency hit.
+    assert r_a.json()["job_id"] != r_b.json()["job_id"]
+
+
+def test_submit_idempotency_malformed_key_returns_400(client: TestClient) -> None:
+    payload = _image_vo_payload()
+    payload["idempotency_key"] = "has spaces and weird $%^ chars"
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
+
+
+def test_submit_idempotency_oversized_key_returns_400(client: TestClient) -> None:
+    payload = _image_vo_payload()
+    payload["idempotency_key"] = "x" * 65    # one over the 64-char cap
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
+
+
+def test_submit_without_idempotency_key_still_works(client: TestClient) -> None:
+    """Backward compat: old Apps Script clients that don't send the key must
+    keep working exactly as before."""
+    payload = _image_vo_payload()
+    # No idempotency_key field at all.
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    assert r.json()["job_id"].startswith("job-")
+
+
+def test_submit_different_keys_create_separate_jobs(client: TestClient) -> None:
+    """Different keys = different submits — even from the same user."""
+    p1 = _image_vo_payload()
+    p1["idempotency_key"] = "sub-aaa"
+    p2 = _image_vo_payload()
+    # Different row_num so the (sheet, worksheet, row_num) dedup doesn't merge.
+    p2["rows_image_vo"][0]["row_num"] = 3
+    p2["idempotency_key"] = "sub-bbb"
+    r1 = client.post("/jobs", json=p1, headers=_auth("tok-bulk1"))
+    r2 = client.post("/jobs", json=p2, headers=_auth("tok-bulk1"))
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+
+
+# ── QueueBusy → 503 mapping (rule 18) ───────────────────────────────────────
+# Plan: _plans/2026-06-04-submit-500-defensive-fix.md §"Change 3".
+# SQLite OperationalError under lock contention must surface as 503 with
+# Retry-After, so the Apps Script retries instead of showing a 500 toast.
+
+
+def _patch_queue_to_raise_queuebusy(app: FastAPI, *, on_method: str) -> None:
+    """Replace ``app.state.queue.<on_method>`` with a coroutine that raises
+    ``QueueBusy`` — simulates SQLite contention without touching the DB."""
+    from bulkvid.orchestrator.queue import QueueBusy
+
+    async def _raises(*_args, **_kwargs):    # noqa: ANN002, ANN003
+        raise QueueBusy("database is locked (simulated)")
+
+    setattr(app.state.queue, on_method, _raises)
+
+
+def test_submit_503_on_queue_busy(app: FastAPI, client: TestClient) -> None:
+    _patch_queue_to_raise_queuebusy(app, on_method="enqueue")
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "5"
+    # Body is generic; OperationalError details stay server-side only.
+    assert "busy" in r.json()["detail"].lower()
+
+
+def test_kill_503_on_queue_busy(app: FastAPI, client: TestClient) -> None:
+    # First submit so there's a job to kill, BEFORE patching enqueue.
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    _patch_queue_to_raise_queuebusy(app, on_method="kill_job")
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "5"
+
+
+def test_kill_all_503_on_queue_busy(app: FastAPI, client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    _patch_queue_to_raise_queuebusy(app, on_method="kill_all_jobs")
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk1"))
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "5"
+
+
 # ── Helper: run a coroutine from a sync test ────────────────────────────────
 
 

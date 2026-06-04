@@ -14,6 +14,7 @@ Plan §7 (Security), §13 Phase 4.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -33,7 +34,14 @@ from bulkvid.orchestrator.queue import (
     TAB_SIMPLE,
     Job,
     JobQueue,
+    QueueBusy,
 )
+
+# Idempotency keys come from the Apps Script and are opaque to us. The format
+# guard rejects oversized / non-ASCII payloads so a malicious client cannot
+# bloat the idempotency table with a giant key. UUID-ish: alnum, dash,
+# underscore, 1-64 chars.
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _log = get_logger("route.jobs")
 
@@ -93,6 +101,11 @@ class SubmitJobIn(BaseModel):
     rows_simple: list[ImageVORowIn] | None = None
     # The cartoon tab generates animated videos from text (no seed image).
     rows_cartoon: list[CartoonRowIn] | None = None
+    # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
+    # the POST safely when PA's frontend drops the response — the server
+    # returns the SAME job_id for a key it has already seen for this user.
+    # Optional for backward compat with old Apps Script clients.
+    idempotency_key: str | None = None
 
 
 class SubmitJobOut(BaseModel):
@@ -269,13 +282,42 @@ async def submit_job(
     if not rows:
         raise HTTPException(400, "no rows provided")
 
-    job_id = await queue.enqueue(
-        user_email=identity.email,
-        sheet_id=payload.sheet_id,
-        worksheet=payload.worksheet,
-        tab_type=payload.tab_type,
-        rows=rows,
-    )
+    # Optional idempotency key — guard format before it touches the DB so a
+    # malformed/oversized key can't bloat the idempotency table.
+    idem_key = payload.idempotency_key
+    if idem_key is not None:
+        if not _IDEMPOTENCY_KEY_RE.match(idem_key):
+            _log.info(
+                "idempotency_key_rejected",
+                user_email=identity.email,
+                reason="malformed",
+                length=len(idem_key),
+            )
+            raise HTTPException(
+                400,
+                "idempotency_key must match [A-Za-z0-9_-]{1,64}",
+            )
+
+    try:
+        job_id = await queue.enqueue(
+            user_email=identity.email,
+            sheet_id=payload.sheet_id,
+            worksheet=payload.worksheet,
+            tab_type=payload.tab_type,
+            rows=rows,
+            idempotency_key=idem_key,
+        )
+    except QueueBusy as e:
+        _log.warning(
+            "queue_busy_503",
+            endpoint="submit_job",
+            user_email=identity.email,
+            original_error=str(e),
+        )
+        raise HTTPException(
+            503, "queue temporarily busy", headers={"Retry-After": "5"}
+        ) from e
+
     _log.info(
         "job_submit",
         job_id=job_id,
@@ -415,7 +457,18 @@ async def kill_all_jobs(
     """Clear the queue: kill all active jobs. Bulk users clear their own;
     admins clear everyone's. In-flight rows finish; pending rows stop."""
     scope = None if identity.is_admin else identity.email
-    killed = await queue.kill_all_jobs(user_email=scope)
+    try:
+        killed = await queue.kill_all_jobs(user_email=scope)
+    except QueueBusy as e:
+        _log.warning(
+            "queue_busy_503",
+            endpoint="kill_all_jobs",
+            user_email=identity.email,
+            original_error=str(e),
+        )
+        raise HTTPException(
+            503, "queue temporarily busy", headers={"Retry-After": "5"}
+        ) from e
     _log.info("jobs_kill_all", by=identity.email, scope=scope or "ALL", killed=killed)
     return {"killed": killed}
 
@@ -427,6 +480,17 @@ async def kill_job(
     queue: JobQueue = Depends(get_queue),
 ) -> dict[str, Any]:
     await _require_owned_job(job_id, identity, queue)
-    killed = await queue.kill_job(job_id)
+    try:
+        killed = await queue.kill_job(job_id)
+    except QueueBusy as e:
+        _log.warning(
+            "queue_busy_503",
+            endpoint="kill_job",
+            user_email=identity.email,
+            original_error=str(e),
+        )
+        raise HTTPException(
+            503, "queue temporarily busy", headers={"Retry-After": "5"}
+        ) from e
     _log.info("job_kill", job_id=job_id, by=identity.email, killed=killed)
     return {"job_id": job_id, "killed": killed}

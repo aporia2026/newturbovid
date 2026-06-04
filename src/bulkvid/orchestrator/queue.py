@@ -57,6 +57,13 @@ TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
 TAB_CARTOON = "cartoon"
 
+# Idempotency-key replay window. A submit POST that PA's frontend dropped on
+# the way back to the client gets retried by the Apps Script, with the SAME
+# key — we use that to return the original job_id instead of double-enqueueing.
+# 24h is comfortably larger than any plausible user retry interval; older rows
+# are pruned opportunistically on every enqueue.
+IDEMPOTENCY_TTL_SECONDS = 86_400
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -88,10 +95,33 @@ CREATE TABLE IF NOT EXISTS row_queue (
     FOREIGN KEY (job_id) REFERENCES jobs(job_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_row_queue_status ON row_queue(status);
-CREATE INDEX IF NOT EXISTS idx_row_queue_job    ON row_queue(job_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key          TEXT NOT NULL,
+    user_email   TEXT NOT NULL,
+    job_id       TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    PRIMARY KEY (user_email, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_row_queue_status      ON row_queue(status);
+CREATE INDEX IF NOT EXISTS idx_row_queue_job         ON row_queue(job_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status           ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_ts   ON idempotency_keys(created_ts);
 """
+
+
+class QueueBusy(RuntimeError):
+    """Raised when SQLite returns ``OperationalError`` while we hold (or are
+    waiting on) the write lock — i.e. the queue is genuinely too busy to
+    accept the write right now. Mapped to HTTP 503 + ``Retry-After`` in the
+    route layer so the Apps Script client retries instead of bubbling a 500.
+
+    Defense in depth: we have not actually observed ``OperationalError`` in
+    prod (see ``_plans/2026-06-04-fix-sidebar-500s.md``), but the mapping
+    means the day it does happen the user sees a polite retry-prompt rather
+    than a cryptic toast.
+    """
 
 
 @dataclass
@@ -219,6 +249,30 @@ class JobQueue:
         )
         return {r["row_num"] for r in cur.fetchall()}
 
+    def _lookup_idempotency_sync(
+        self, user_email: str, key: str
+    ) -> str | None:
+        """Return the ``job_id`` previously recorded for this (user, key), or
+        ``None`` if the pair has not been seen. Scoped per user so user A
+        cannot replay user B's key."""
+        cur = self._conn.execute(
+            "SELECT job_id FROM idempotency_keys "
+            "WHERE user_email = ? AND key = ?",
+            (user_email, key),
+        )
+        row = cur.fetchone()
+        return row["job_id"] if row is not None else None
+
+    def _prune_idempotency_sync(self, *, ttl_seconds: int) -> int:
+        """Delete idempotency rows older than ``ttl_seconds``. Cheap; one
+        indexed range delete. Called opportunistically on each enqueue so the
+        table can't grow unbounded even with no explicit maintenance."""
+        cutoff = time.time() - ttl_seconds
+        cur = self._conn.execute(
+            "DELETE FROM idempotency_keys WHERE created_ts < ?", (cutoff,)
+        )
+        return cur.rowcount
+
     def _enqueue_sync(
         self,
         *,
@@ -227,39 +281,89 @@ class JobQueue:
         worksheet: str,
         tab_type: str,
         rows: list[ImageVORow] | list[FourImagesVO2Row] | list[SimpleRow] | list[CartoonRow],
-    ) -> str:
-        job_id = _new_job_id()
-        now = _now_iso()
-        with self._tx():
-            # Drop rows already queued/processing for this sheet+worksheet in an
-            # active job, so a double-submit or overlapping batch can't reprocess
-            # and overwrite a row.
-            dupes = self._active_duplicate_row_nums(
-                sheet_id, worksheet, [r.row_num for r in rows]
-            )
-            kept = [r for r in rows if r.row_num not in dupes]
-            # If nothing is left to do, record a finished job (0 rows) rather
-            # than a job that would hang forever as queued 0/0.
-            status = JOB_QUEUED if kept else JOB_COMPLETED
-            finished = None if kept else now
-            self._conn.execute(
-                "INSERT INTO jobs "
-                "(job_id, user_email, sheet_id, worksheet, tab_type, status, "
-                "row_count, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    job_id, user_email, sheet_id, worksheet, tab_type, status,
-                    len(kept), now, finished,
-                ),
-            )
-            if kept:
-                self._conn.executemany(
-                    "INSERT INTO row_queue (job_id, row_num, payload, status) "
-                    "VALUES (?,?,?,?)",
-                    [
-                        (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
-                        for r in kept
-                    ],
+        idempotency_key: str | None = None,
+    ) -> tuple[str, bool]:
+        """Enqueue ``rows`` and return ``(job_id, idempotency_hit)``.
+
+        If ``idempotency_key`` is supplied and matches a previously recorded
+        (user, key) pair, the prior ``job_id`` is returned with
+        ``idempotency_hit=True`` — no new rows are inserted. This makes the
+        submit POST safe to retry when PA's frontend drops the response on
+        the way back to the Apps Script (see
+        ``_plans/2026-06-04-submit-500-defensive-fix.md``).
+        """
+        try:
+            if idempotency_key:
+                # Cheap read OUTSIDE the write tx — if hit, we can short-circuit
+                # without taking the write lock at all. Concurrent submits with
+                # the same key are still safe: the PRIMARY KEY (user_email, key)
+                # makes the second INSERT fail, and we re-read on conflict.
+                prior = self._lookup_idempotency_sync(user_email, idempotency_key)
+                if prior is not None:
+                    return prior, True
+
+            job_id = _new_job_id()
+            now = _now_iso()
+            with self._tx():
+                # Re-check inside the tx — closes the race where two concurrent
+                # retries of the same key both miss the pre-check above.
+                if idempotency_key:
+                    prior = self._lookup_idempotency_sync(user_email, idempotency_key)
+                    if prior is not None:
+                        return prior, True
+
+                # Drop rows already queued/processing for this sheet+worksheet
+                # in an active job, so a double-submit or overlapping batch
+                # can't reprocess and overwrite a row.
+                dupes = self._active_duplicate_row_nums(
+                    sheet_id, worksheet, [r.row_num for r in rows]
                 )
+                kept = [r for r in rows if r.row_num not in dupes]
+                # If nothing is left to do, record a finished job (0 rows)
+                # rather than a job that would hang forever as queued 0/0.
+                status = JOB_QUEUED if kept else JOB_COMPLETED
+                finished = None if kept else now
+                self._conn.execute(
+                    "INSERT INTO jobs "
+                    "(job_id, user_email, sheet_id, worksheet, tab_type, status, "
+                    "row_count, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        job_id, user_email, sheet_id, worksheet, tab_type, status,
+                        len(kept), now, finished,
+                    ),
+                )
+                if kept:
+                    self._conn.executemany(
+                        "INSERT INTO row_queue (job_id, row_num, payload, status) "
+                        "VALUES (?,?,?,?)",
+                        [
+                            (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
+                            for r in kept
+                        ],
+                    )
+                if idempotency_key:
+                    # Recorded INSIDE the same tx as the jobs/row_queue inserts:
+                    # a crash mid-write rolls back both, so we never end up
+                    # with an idempotency row pointing at a non-existent job.
+                    self._conn.execute(
+                        "INSERT INTO idempotency_keys "
+                        "(key, user_email, job_id, created_at, created_ts) "
+                        "VALUES (?,?,?,?,?)",
+                        (idempotency_key, user_email, job_id, now, time.time()),
+                    )
+            # Opportunistic cleanup AFTER the tx commits, so a slow prune
+            # never blocks an enqueue. Failures here are non-fatal.
+            try:
+                pruned = self._prune_idempotency_sync(
+                    ttl_seconds=IDEMPOTENCY_TTL_SECONDS
+                )
+                if pruned:
+                    _log.debug("idempotency_pruned", removed=pruned)
+            except sqlite3.OperationalError:
+                pass
+        except sqlite3.OperationalError as e:
+            raise QueueBusy(str(e)) from e
+
         if dupes:
             _log.info(
                 "enqueue_skipped_duplicates",
@@ -267,7 +371,7 @@ class JobQueue:
                 skipped=len(dupes),
                 row_nums=sorted(dupes),
             )
-        return job_id
+        return job_id, False
 
     def _claim_next_row_sync(self) -> QueuedRow | None:
         """Atomically pull the next pending row and mark it processing.
@@ -396,32 +500,38 @@ class JobQueue:
         return out
 
     def _kill_job_sync(self, job_id: str) -> bool:
-        with self._tx():
-            cur = self._conn.execute(
-                "UPDATE jobs SET status = ?, finished_at = ? "
-                "WHERE job_id = ? AND status IN (?, ?)",
-                (JOB_KILLED, _now_iso(), job_id, JOB_QUEUED, JOB_RUNNING),
-            )
-            return cur.rowcount > 0
+        try:
+            with self._tx():
+                cur = self._conn.execute(
+                    "UPDATE jobs SET status = ?, finished_at = ? "
+                    "WHERE job_id = ? AND status IN (?, ?)",
+                    (JOB_KILLED, _now_iso(), job_id, JOB_QUEUED, JOB_RUNNING),
+                )
+                return cur.rowcount > 0
+        except sqlite3.OperationalError as e:
+            raise QueueBusy(str(e)) from e
 
     def _kill_all_sync(self, user_email: str | None = None) -> int:
         """Kill every active (queued/running) job — for one user, or all when
         ``user_email`` is None (admin). In-flight rows finish; pending rows stop
         being claimed (see ``_claim_next_row_sync``)."""
-        with self._tx():
-            if user_email:
-                cur = self._conn.execute(
-                    "UPDATE jobs SET status = ?, finished_at = ? "
-                    "WHERE user_email = ? AND status IN (?, ?)",
-                    (JOB_KILLED, _now_iso(), user_email, JOB_QUEUED, JOB_RUNNING),
-                )
-            else:
-                cur = self._conn.execute(
-                    "UPDATE jobs SET status = ?, finished_at = ? "
-                    "WHERE status IN (?, ?)",
-                    (JOB_KILLED, _now_iso(), JOB_QUEUED, JOB_RUNNING),
-                )
-            return cur.rowcount
+        try:
+            with self._tx():
+                if user_email:
+                    cur = self._conn.execute(
+                        "UPDATE jobs SET status = ?, finished_at = ? "
+                        "WHERE user_email = ? AND status IN (?, ?)",
+                        (JOB_KILLED, _now_iso(), user_email, JOB_QUEUED, JOB_RUNNING),
+                    )
+                else:
+                    cur = self._conn.execute(
+                        "UPDATE jobs SET status = ?, finished_at = ? "
+                        "WHERE status IN (?, ?)",
+                        (JOB_KILLED, _now_iso(), JOB_QUEUED, JOB_RUNNING),
+                    )
+                return cur.rowcount
+        except sqlite3.OperationalError as e:
+            raise QueueBusy(str(e)) from e
 
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
@@ -449,23 +559,42 @@ class JobQueue:
         worksheet: str,
         tab_type: str,
         rows: list[ImageVORow] | list[FourImagesVO2Row] | list[SimpleRow] | list[CartoonRow],
+        idempotency_key: str | None = None,
     ) -> str:
+        """Enqueue ``rows`` and return the resulting ``job_id``.
+
+        When ``idempotency_key`` is supplied and the (user, key) pair has been
+        recorded by a prior call, the **prior** ``job_id`` is returned and no
+        new rows are inserted — so the Apps Script can safely retry a submit
+        whose response PA's frontend dropped without creating a duplicate job
+        (see ``_plans/2026-06-04-submit-500-defensive-fix.md``).
+        """
         async with self._lock:
-            job_id = await asyncio.to_thread(
+            job_id, hit = await asyncio.to_thread(
                 self._enqueue_sync,
                 user_email=user_email,
                 sheet_id=sheet_id,
                 worksheet=worksheet,
                 tab_type=tab_type,
                 rows=rows,
+                idempotency_key=idempotency_key,
             )
-        _log.info(
-            "job_enqueued",
-            job_id=job_id,
-            user_email=user_email,
-            tab_type=tab_type,
-            row_count=len(rows),
-        )
+        if hit:
+            _log.info(
+                "idempotency_hit",
+                job_id=job_id,
+                user_email=user_email,
+                key=idempotency_key,
+            )
+        else:
+            _log.info(
+                "job_enqueued",
+                job_id=job_id,
+                user_email=user_email,
+                tab_type=tab_type,
+                row_count=len(rows),
+                idempotency_key=idempotency_key or "",
+            )
         return job_id
 
     async def claim_next_row(self) -> QueuedRow | None:

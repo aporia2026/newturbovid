@@ -16,6 +16,21 @@ const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
 
+// Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
+// its uWSGI dispatcher cannot find a free worker quickly (cold-start, recycle,
+// concurrent polls saturating the small pool). The Apps Script retries the
+// submit with the same idempotency key — server returns the original job_id,
+// no duplicate. 6 attempts × backoff = ~31s total, comfortably wider than a
+// PA worker recycle window. See _plans/2026-06-04-submit-500-defensive-fix.md.
+const SUBMIT_MAX_ATTEMPTS = 6;
+const SUBMIT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
+
+// Optional pre-warm: fire GET /health a moment before the submit so a cold PA
+// worker has a chance to lazy-init. Submit fires regardless of pre-warm
+// outcome — pre-warm is purely a nudge.
+const PREWARM_ENABLED = true;
+const PREWARM_COOLDOWN_MS = 60 * 1000;
+
 /** Column maps — MUST match src/bulkvid/adapters/sheets.py (1-indexed for Sheets). */
 const IMAGE_VO_COLS = {
   country: 1, vertical: 2, article: 3, manualImage: 4,
@@ -352,15 +367,11 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else payload.rows_image_vo = rows;
 
-  var body;
-  try {
-    body = _fetchJson('/jobs', {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(payload),
-    });
-  } catch (e) {
-    SpreadsheetApp.getUi().alert('Submit failed:\n' + String((e && e.message) || e));
+  const body = _submitJobWithRetry_(payload);
+  if (body === null) {
+    // User cancelled the "Backend is busy" dialog. The pending idempotency
+    // key remains stashed in DocumentProperties so the next click resumes
+    // the same submit (no duplicate).
     return;
   }
 
@@ -385,37 +396,144 @@ function showJobsSidebar() {
 }
 
 
-/** Authenticated fetch with retry. Retries up to 3 times on 5xx / network
- *  errors with a short backoff, so a transient backend blip self-heals instead
- *  of surfacing in the sidebar as an error. 4xx are real (auth / not-found) and
- *  are NOT retried. Returns parsed JSON (or null for an empty body); throws with
- *  a readable message after exhausting retries. */
-function _fetchJson(path, options) {
+/** Authenticated fetch with retry. Retries on 5xx / network errors with a
+ *  short backoff so a transient backend blip self-heals; 4xx are real
+ *  (auth / not-found) and are NOT retried. Returns parsed JSON (or null for an
+ *  empty body); throws with a readable message after exhausting retries.
+ *
+ *  ``retryOpts`` (optional) overrides the default 3-attempt × [0.6s, 1.2s]
+ *  policy. Used by the submit POST to widen the window to ~31s
+ *  (SUBMIT_MAX_ATTEMPTS × SUBMIT_BACKOFF_MS) because PA's frontend can take
+ *  longer than 1.8s to recover a recycling uWSGI worker. */
+function _fetchJson(path, options, retryOpts) {
   const backendUrl = _getBackendUrl();
   const opts = options || {};
   opts.headers = opts.headers || {};
   opts.headers['Authorization'] = 'Bearer ' + ScriptApp.getIdentityToken();
   opts.muteHttpExceptions = true;
 
+  const maxAttempts = (retryOpts && retryOpts.maxAttempts) || 3;
+  const backoffMs = (retryOpts && retryOpts.backoffMs) || [600, 1200];
+  const onAttempt = retryOpts && retryOpts.onAttempt;
+
   var lastErr = '';
-  for (var attempt = 1; attempt <= 3; attempt++) {
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const resp = UrlFetchApp.fetch(backendUrl + path, opts);
       const code = resp.getResponseCode();
       const text = resp.getContentText();
       if (code >= 200 && code < 300) {
+        if (onAttempt) onAttempt(attempt, 'ok', code);
         return text ? JSON.parse(text) : null;
       }
       if (code >= 400 && code < 500) {
         throw new Error('HTTP ' + code + ': ' + text.substring(0, 200));
       }
       lastErr = 'HTTP ' + code + ': ' + text.substring(0, 200);
+      if (onAttempt) onAttempt(attempt, 'retry', code);
     } catch (e) {
       lastErr = String((e && e.message) || e);
+      if (onAttempt) onAttempt(attempt, 'error', 0);
     }
-    if (attempt < 3) Utilities.sleep(600 * attempt);    // 0.6s, then 1.2s
+    if (attempt < maxAttempts) {
+      const sleep = backoffMs[attempt - 1] != null
+        ? backoffMs[attempt - 1]
+        : backoffMs[backoffMs.length - 1];    // cap at last entry
+      Utilities.sleep(sleep);
+    }
   }
   throw new Error(lastErr || 'request failed');
+}
+
+
+/** Light "pre-warm" hint — fires a GET /health so PA's uWSGI has a chance to
+ *  wake up a cold worker before we send the real submit POST. Submit fires
+ *  regardless of whether this succeeds. Cooldown'd via DocumentProperties so
+ *  rapid clicks don't pre-warm every time. */
+function _prewarmBackend_() {
+  if (!PREWARM_ENABLED) return;
+  const props = PropertiesService.getDocumentProperties();
+  const last = parseInt(props.getProperty('LAST_PREWARM_MS') || '0', 10);
+  const now = Date.now();
+  if (now - last < PREWARM_COOLDOWN_MS) {
+    console.info('[bulkvid prewarm] skip cooldown', { sinceMs: now - last });
+    return;
+  }
+  props.setProperty('LAST_PREWARM_MS', String(now));
+  try {
+    // /health is open and cheap; we don't need auth here. Catch BACKEND_URL
+    // misconfig too — pre-warm failures are never actionable; the real
+    // submit's retry policy will surface the user-facing error.
+    const url = _getBackendUrl() + '/health';
+    UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    console.info('[bulkvid prewarm] hit', { url: url });
+  } catch (e) {
+    console.info('[bulkvid prewarm] error', { err: String((e && e.message) || e) });
+  }
+}
+
+
+/** Submit a job batch with idempotency-safe retry. Stashes the idempotency
+ *  key in DocumentProperties BEFORE sending so a mid-call Apps Script crash
+ *  leaves the key recoverable; the server returns the SAME job_id for a
+ *  repeated key, so a retry never creates a duplicate. On final failure,
+ *  shows a clear Retry/Cancel dialog rather than the cryptic "HTTP 500"
+ *  toast. */
+function _submitJobWithRetry_(payload) {
+  const props = PropertiesService.getDocumentProperties();
+  // Reuse an in-flight key if one was stashed (previous submit attempt died
+  // mid-call). Otherwise mint a fresh one.
+  var key = props.getProperty('PENDING_SUBMIT_KEY') || '';
+  if (!key) {
+    key = 'sub-' + Date.now() + '-' + Utilities.getUuid().replace(/-/g, '').slice(0, 8);
+    props.setProperty('PENDING_SUBMIT_KEY', key);
+  }
+  payload.idempotency_key = key;
+  console.info('[bulkvid submit] start', { key: key, rows: _rowCountForPayload_(payload) });
+
+  _prewarmBackend_();
+
+  while (true) {
+    try {
+      const body = _fetchJson('/jobs', {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+      }, {
+        maxAttempts: SUBMIT_MAX_ATTEMPTS,
+        backoffMs: SUBMIT_BACKOFF_MS,
+        onAttempt: function (n, outcome, code) {
+          console.info('[bulkvid submit] attempt', { n: n, outcome: outcome, http: code });
+        },
+      });
+      // Success — clear the stashed key so the next click mints a fresh one.
+      props.deleteProperty('PENDING_SUBMIT_KEY');
+      console.info('[bulkvid submit] ok', { jobId: body && body.job_id });
+      return body;
+    } catch (e) {
+      console.info('[bulkvid submit] final-fail', { err: String((e && e.message) || e) });
+      // Friendly retry/cancel dialog. The SAME key is reused on Retry, so a
+      // submit that actually succeeded but whose response PA dropped is
+      // idempotent — no duplicate job. Cancel leaves the key in place so the
+      // user's next manual click resumes.
+      const ui = SpreadsheetApp.getUi();
+      const ans = ui.alert(
+        'Backend is busy',
+        'PythonAnywhere is temporarily overloaded and the submit could not get '
+        + 'through after ' + SUBMIT_MAX_ATTEMPTS + ' attempts.\n\n'
+        + 'Click YES to retry, or NO to try again later from the menu.',
+        ui.ButtonSet.YES_NO
+      );
+      if (ans === ui.Button.YES) continue;
+      return null;    // user cancelled; key persists for next click
+    }
+  }
+}
+
+
+function _rowCountForPayload_(payload) {
+  return (payload.rows_image_vo || payload.rows_four_images
+    || payload.rows_simple || payload.rows_cartoon || []).length;
 }
 
 
