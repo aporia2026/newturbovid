@@ -36,6 +36,7 @@ from bulkvid.orchestrator.queue import (
     JobQueue,
     QueueBusy,
 )
+from bulkvid.step_extractor import extract_current_step
 
 # Idempotency keys come from the Apps Script and are opaque to us. The format
 # guard rejects oversized / non-ASCII payloads so a malicious client cannot
@@ -136,6 +137,14 @@ class JobRowOut(BaseModel):
     status: str
     error: str | None = None
     video_urls: list[str] = []
+    # New for sidebar UX overhaul (plan §Phase 1): the human-readable
+    # current pipeline step (e.g. "Synthesizing voice") for rows in
+    # ``processing``, plus the ISO timestamp the worker claimed the row
+    # so the client can render a live elapsed counter without an extra
+    # round-trip. Both are None for ``pending`` / ``done`` / ``failed``
+    # rows where there's nothing meaningful to render.
+    current_step: str | None = None
+    started_at: str | None = None
 
 
 class JobRowsOut(BaseModel):
@@ -183,6 +192,41 @@ def _job_to_out(job: Job) -> JobOut:
         started_at=job.started_at,
         finished_at=job.finished_at,
         error=job.error,
+    )
+
+
+# Per-row statuses where the human-readable step is meaningful. ``pending``
+# rows haven't started; ``done`` / ``failed`` rows have a final status that
+# the sidebar already surfaces directly. Limiting the extractor call to
+# ``processing`` keeps the poll cycle from doing a log-tail parse for every
+# row in a 200-row batch.
+_ROW_STATUSES_WITH_STEP = {"processing"}
+
+
+def _row_to_out(job_id: str, raw: dict[str, Any]) -> JobRowOut:
+    """Build a ``JobRowOut`` from the queue's row dict, enriching with
+    the current pipeline step for rows actively being processed.
+
+    See ``_plans/2026-06-04-sidebar-ux-overhaul.md`` §Phase 1.
+    """
+    step: str | None = None
+    if raw.get("status") in _ROW_STATUSES_WITH_STEP:
+        try:
+            step = extract_current_step(job_id, raw["row_num"])
+        except Exception as e:    # noqa: BLE001 — never let a UI nicety 500 a poll
+            _log.warning(
+                "step_extract_failed",
+                job_id=job_id,
+                row_num=raw.get("row_num"),
+                err=str(e)[:200],
+            )
+    return JobRowOut(
+        row_num=raw["row_num"],
+        status=raw["status"],
+        started_at=raw.get("started_at"),
+        error=raw.get("error"),
+        video_urls=raw.get("video_urls", []),
+        current_step=step,
     )
 
 
@@ -369,7 +413,9 @@ async def poll_jobs(
     for job in jobs:
         if job.status == JOB_RUNNING:
             raw_rows = await queue.list_rows(job.job_id)
-            rows_by_job[job.job_id] = [JobRowOut(**r) for r in raw_rows]
+            rows_by_job[job.job_id] = [
+                _row_to_out(job.job_id, r) for r in raw_rows
+            ]
 
     # Log tails: only for job IDs the caller owns AND requested. A malicious
     # ``logs=<other_user_job_id>`` is silently ignored (not 403'd) — matches
@@ -418,7 +464,10 @@ async def get_job_rows(
     sidebar show live per-row progress instead of a single job-level counter."""
     await _require_owned_job(job_id, identity, queue)
     rows = await queue.list_rows(job_id)
-    return JobRowsOut(job_id=job_id, rows=[JobRowOut(**r) for r in rows])
+    return JobRowsOut(
+        job_id=job_id,
+        rows=[_row_to_out(job_id, r) for r in rows],
+    )
 
 
 @router.get("/{job_id}/log", response_model=JobLogOut)

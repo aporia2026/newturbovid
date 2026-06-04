@@ -41,6 +41,24 @@
     .rs-failed     { color: #d93025; text-align: right; word-break: break-word; }
     .rs-processing { color: #1a73e8; }
     .rs-pending    { color: #5f6368; }
+
+    /* Phase 1 of sidebar UX overhaul: live row status with step + elapsed.
+       See _plans/2026-06-04-sidebar-ux-overhaul.md. */
+    .rowline.processing { display: block; padding: 4px 0; }
+    .rowline.processing .row-head { display: flex; justify-content: space-between; }
+    .rowline.processing .row-step { color: #1a73e8; font-weight: 500; margin-top: 2px; font-size: 12px; }
+    .rowline.processing .row-elapsed { color: #5f6368; font-variant-numeric: tabular-nums; }
+    .step-ellipsis::after {
+      content: '...';
+      display: inline-block;
+      animation: dot-fade 1.4s steps(4, end) infinite;
+      width: 1.2em; text-align: left;
+    }
+    @keyframes dot-fade {
+      0%   { content: '.';   }
+      33%  { content: '..';  }
+      66%  { content: '...'; }
+    }
     .logwrap { margin-top: 6px; }
     .logbar { margin-bottom: 4px; }
     pre.log { background: #202124; color: #e8eaed; font-size: 11px; padding: 8px; border-radius: 4px;
@@ -159,6 +177,11 @@
       document.getElementById('summary').textContent =
         active.length ? (active.length + ' active · ' + remaining + ' rows remaining') : '';
 
+      // Auto-open the log pane on rows that just entered processing so
+      // the user doesn't have to babysit "View logs". Phase 1 of the
+      // sidebar UX overhaul (plan §Phase 1).
+      _maybeAutoOpenLogs(active);
+
       document.getElementById('active').innerHTML = active.length
         ? active.map(_activeCard).join('')
         : '<div class="empty">No active jobs. Submit one from the menu.</div>';
@@ -167,8 +190,24 @@
         ? archive.map(_archRow).join('')
         : '<div class="empty">No finished jobs yet.</div>';
 
-      // No follow-up fetches: pollAll() already populated _rowsCache and
-      // _logCache before render() ran. Reads from cache only.
+      // Auto-scroll any open log pane to the bottom so the freshest
+      // pipeline lines stay visible. The user can scroll up to inspect
+      // — _tickElapsed doesn't reach into log content so that scroll
+      // position survives between polls.
+      Object.keys(_openLogs).forEach(function (jid) {
+        if (!_openLogs[jid]) return;
+        var pane = document.getElementById('log-' + jid);
+        var pre = pane && pane.querySelector('pre');
+        if (pre) pre.scrollTop = pre.scrollHeight;
+      });
+    }
+
+    function _formatElapsed(ms) {
+      if (ms == null || isNaN(ms) || ms < 0) return '';
+      var s = Math.floor(ms / 1000);
+      var m = Math.floor(s / 60);
+      var sec = s % 60;
+      return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
     }
 
     function _rowsHtml(rows) {
@@ -176,6 +215,28 @@
       if (!rows.length) return '<div class="small">No rows.</div>';
       return rows.map(function (r) {
         var st = r.status || 'pending';
+
+        if (st === 'processing') {
+          // Live row: header line (Row N · elapsed) + step underneath.
+          // ``started_at`` is server-side ISO; we recompute elapsed on
+          // every tick from the client clock so it advances smoothly
+          // even between polls. The data-* attributes let the ticker
+          // refresh the elapsed text without re-rendering the whole card.
+          var startMs = r.started_at ? Date.parse(r.started_at) : NaN;
+          var elapsed = isFinite(startMs) ? _formatElapsed(Date.now() - startMs) : '';
+          var step = r.current_step
+            ? '<span class="step-ellipsis">' + _escape(r.current_step) + '</span>'
+            : '<span class="step-ellipsis">Starting</span>';
+          return '<div class="rowline processing"' +
+                 ' data-row-elapsed="' + (isFinite(startMs) ? startMs : '') + '">' +
+                   '<div class="row-head">' +
+                     '<span class="value">Row ' + r.row_num + '</span>' +
+                     '<span class="row-elapsed">' + _escape(elapsed) + '</span>' +
+                   '</div>' +
+                   '<div class="row-step">' + step + '</div>' +
+                 '</div>';
+        }
+
         var right;
         if (st === 'done') {
           right = (r.video_urls && r.video_urls.length)
@@ -186,14 +247,48 @@
             : 'done';
         } else if (st === 'failed') {
           right = _escape(r.error ? String(r.error).substring(0, 140) : 'failed');
-        } else if (st === 'processing') {
-          right = 'working…';
         } else {
           right = st;
         }
         return '<div class="rowline"><span class="value">Row ' + r.row_num + '</span>' +
                '<span class="rs-' + st + '">' + right + '</span></div>';
       }).join('');
+    }
+
+    // Phase 1 ticker: every 1 s, walk every visible processing row and
+    // update its elapsed display in place. We DON'T re-render the whole
+    // card — that would lose focus / scroll position / open <details>.
+    function _tickElapsed() {
+      var els = document.querySelectorAll('.rowline.processing[data-row-elapsed]');
+      var now = Date.now();
+      els.forEach(function (el) {
+        var startMs = parseInt(el.getAttribute('data-row-elapsed'), 10);
+        if (!isFinite(startMs)) return;
+        var counterEl = el.querySelector('.row-elapsed');
+        if (counterEl) counterEl.textContent = _formatElapsed(now - startMs);
+      });
+    }
+    setInterval(_tickElapsed, 1000);
+
+    // Phase 1: auto-open the log pane the first time we observe a row
+    // in ``processing`` on a job. Once auto-opened, we leave the user's
+    // toggle preference alone (closing it shouldn't re-open every cycle).
+    var _autoOpenedLogs = {};
+    function _maybeAutoOpenLogs(jobs) {
+      jobs.forEach(function (j) {
+        if (j.status !== 'running') return;
+        if (_autoOpenedLogs[j.job_id]) return;
+        var rows = _rowsCache[j.job_id] || [];
+        var anyProcessing = rows.some(function (r) { return r.status === 'processing'; });
+        if (!anyProcessing) return;
+        _autoOpenedLogs[j.job_id] = true;
+        if (!_openLogs[j.job_id]) {
+          _openLogs[j.job_id] = true;
+          // The next render call will see _openLogs[jid]=true and
+          // include the log block; loadLogFor pulls the actual content.
+          loadLogFor(j.job_id);
+        }
+      });
     }
 
     function _logInner(jid) {
@@ -207,9 +302,15 @@
       var pct = _pct(j);
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
       var open = !!_openLogs[jid];
-      var rowsBlock = (j.status === 'running')
-        ? '<div class="rows" id="rows-' + jid + '">' + _rowsHtml(_rowsCache[jid]) + '</div>'
-        : '<div class="rows"><div class="small">Waiting in queue…</div></div>';
+      // ``queued`` jobs honestly say so. ``running`` jobs render the
+      // row list (which now shows live per-step status from the server
+      // via current_step + started_at). Plan §Phase 1.
+      var rowsBlock;
+      if (j.status === 'queued') {
+        rowsBlock = '<div class="rows"><div class="small">Waiting for the next free worker slot…</div></div>';
+      } else {
+        rowsBlock = '<div class="rows" id="rows-' + jid + '">' + _rowsHtml(_rowsCache[jid]) + '</div>';
+      }
       return '' +
         '<div class="job">' +
           '<div class="job-id">' + jid + ' · ' + (j.worksheet || '') + '</div>' +

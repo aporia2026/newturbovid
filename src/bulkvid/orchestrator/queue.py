@@ -502,7 +502,7 @@ class JobQueue:
 
     def _list_rows_sync(self, job_id: str) -> list[dict[str, Any]]:
         cur = self._conn.execute(
-            "SELECT row_num, status, result FROM row_queue "
+            "SELECT row_num, status, started_at, result FROM row_queue "
             "WHERE job_id = ? ORDER BY row_num",
             (job_id,),
         )
@@ -513,6 +513,12 @@ class JobQueue:
                 {
                     "row_num": r["row_num"],
                     "status": r["status"],
+                    # ``started_at`` is the moment the worker claimed the
+                    # row — the sidebar uses it for the live elapsed
+                    # counter. ``current_step`` is filled in at the route
+                    # layer from the per-job log (it'd be wrong to import
+                    # the log reader here, that's a presentation concern).
+                    "started_at": r["started_at"],
                     "error": result.get("error"),
                     "video_urls": result.get("video_urls", []),
                 }
