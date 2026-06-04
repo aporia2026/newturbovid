@@ -20,7 +20,7 @@ Usage:
     python tools/run_local.py --help
 
 ``--worksheet`` is the literal tab name at the bottom of the Sheet (whatever
-the bulk team labelled it). ``--layout`` is which of the four row layouts to
+the bulk team labeled it). ``--layout`` is which of the four row layouts to
 use (the column structure), independent of the tab name.
 """
 
@@ -434,7 +434,7 @@ def _is_interactive() -> bool:
     refuse to prompt and ask the caller to pass args explicitly."""
     try:
         return sys.stdin.isatty()
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         return False
 
 
@@ -666,7 +666,10 @@ async def run_batch(
         )
         for r in rows
     ]
-    results: list[RowResult] = await asyncio.gather(*tasks)
+    # ``asyncio.gather`` returns a list at runtime, but its stubs type the
+    # return as ``tuple[Any, ...]``. Wrap in ``list(...)`` so the annotation
+    # is satisfied without a cast.
+    results: list[RowResult] = list(await asyncio.gather(*tasks))
     elapsed = time.monotonic() - start
 
     succeeded = sum(1 for r in results if r.status == STATUS_SUCCESS)
