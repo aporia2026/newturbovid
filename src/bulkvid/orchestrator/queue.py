@@ -525,6 +525,54 @@ class JobQueue:
             )
         return out
 
+    def _eta_medians_sync(self, *, sample_size: int = 50) -> dict[str, float]:
+        """Median ``finished_at - started_at`` in seconds, grouped by
+        ``tab_type``, over the last ``sample_size`` successfully-done
+        rows per tab. Used by the sidebar to show a rough ETA next to
+        the elapsed counter.
+
+        Plan: ``_plans/2026-06-04-sidebar-ux-overhaul.md`` §Phase 3.
+        """
+        # libSQL/sqlite both expose strftime, so we compute the delta
+        # in SQL rather than parsing ISO strings in Python. The window
+        # function lets us cap per-tab samples at ``sample_size``.
+        cur = self._conn.execute(
+            "WITH ranked AS ("
+            "  SELECT "
+            "    j.tab_type AS tab_type,"
+            "    (strftime('%s', rq.finished_at) - strftime('%s', rq.started_at)) AS secs,"
+            "    ROW_NUMBER() OVER ("
+            "      PARTITION BY j.tab_type ORDER BY rq.finished_at DESC"
+            "    ) AS rn"
+            "  FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+            "  WHERE rq.status = ? "
+            "    AND rq.started_at IS NOT NULL "
+            "    AND rq.finished_at IS NOT NULL"
+            ") "
+            "SELECT tab_type, secs FROM ranked WHERE rn <= ? ORDER BY tab_type, secs",
+            (ROW_DONE, sample_size),
+        )
+        # Bucket by tab_type and median client-side — SQLite has no
+        # built-in MEDIAN aggregate.
+        by_tab: dict[str, list[float]] = {}
+        for r in cur.fetchall():
+            tab = r["tab_type"]
+            try:
+                by_tab.setdefault(tab, []).append(float(r["secs"]))
+            except (TypeError, ValueError):
+                continue
+        medians: dict[str, float] = {}
+        for tab, secs in by_tab.items():
+            if not secs:
+                continue
+            secs_sorted = sorted(secs)
+            mid = len(secs_sorted) // 2
+            if len(secs_sorted) % 2:
+                medians[tab] = secs_sorted[mid]
+            else:
+                medians[tab] = (secs_sorted[mid - 1] + secs_sorted[mid]) / 2.0
+        return medians
+
     def _kill_job_sync(self, job_id: str) -> bool:
         try:
             with self._tx():
@@ -641,6 +689,13 @@ class JobQueue:
 
     async def list_rows(self, job_id: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_rows_sync, job_id)
+
+    async def eta_medians(self, *, sample_size: int = 50) -> dict[str, float]:
+        """Median per-tab row processing time in seconds. See
+        ``_eta_medians_sync``."""
+        return await asyncio.to_thread(
+            self._eta_medians_sync, sample_size=sample_size
+        )
 
     async def kill_job(self, job_id: str) -> bool:
         async with self._lock:

@@ -169,11 +169,18 @@ class PollOut(BaseModel):
     Replaces what used to take three separate auth-gated requests per poll
     cycle (``list_jobs`` + ``get_job_rows`` per running job + ``get_job_log``
     per open log pane). See ``_plans/2026-06-04-fix-sidebar-500s.md``.
+
+    ``eta_medians_by_tab`` carries the median elapsed-seconds per
+    ``tab_type`` over the last ~50 successful rows; the sidebar uses it
+    to render a rough "~3:30 est" next to the live elapsed counter so
+    the user has a sense of how long a row is going to take. Plan:
+    ``_plans/2026-06-04-sidebar-ux-overhaul.md`` §Phase 3.
     """
 
     jobs: list[JobOut]
     rows_by_job: dict[str, list[JobRowOut]]
     logs_by_job: dict[str, PollLogOut]
+    eta_medians_by_tab: dict[str, float] = {}
 
 
 def _job_to_out(job: Job) -> JobOut:
@@ -437,10 +444,22 @@ async def poll_jobs(
         elapsed_ms=elapsed_ms,
     )
 
+    # ETA medians: cheap aggregate query against rows already in the
+    # queue, hand it back as part of the poll bundle so the sidebar
+    # doesn't need a second round-trip. ETA only renders when the
+    # median is well-defined (≥10 samples) — the client handles that
+    # filtering.
+    try:
+        eta_medians = await queue.eta_medians()
+    except Exception as e:    # noqa: BLE001 — never let an ETA aggregate 500 a poll
+        _log.warning("eta_medians_failed", err=str(e)[:200])
+        eta_medians = {}
+
     return PollOut(
         jobs=[_job_to_out(j) for j in jobs],
         rows_by_job=rows_by_job,
         logs_by_job=logs_by_job,
+        eta_medians_by_tab=eta_medians,
     )
 
 

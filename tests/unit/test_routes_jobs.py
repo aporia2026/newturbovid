@@ -495,7 +495,16 @@ def test_poll_empty_state(client: TestClient) -> None:
     r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
     assert r.status_code == 200
     body = r.json()
-    assert body == {"jobs": [], "rows_by_job": {}, "logs_by_job": {}}
+    # ``eta_medians_by_tab`` was added in the Phase 3 sidebar UX
+    # overhaul and is always present (empty when there are no
+    # completed rows yet). Plan:
+    # _plans/2026-06-04-sidebar-ux-overhaul.md §Phase 3.
+    assert body == {
+        "jobs": [],
+        "rows_by_job": {},
+        "logs_by_job": {},
+        "eta_medians_by_tab": {},
+    }
 
 
 def test_poll_rows_only_populated_for_running_jobs(

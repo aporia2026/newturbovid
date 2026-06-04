@@ -4,50 +4,137 @@
   <base target="_top">
   <meta charset="utf-8">
   <style>
+    /* Sidebar UX overhaul — Phase 2 polish (typography, hierarchy,
+       error display, empty states). See
+       _plans/2026-06-04-sidebar-ux-overhaul.md. */
+
+    :root {
+      --c-text:        #202124;
+      --c-muted:       #5f6368;
+      --c-subtle:      #80868b;
+      --c-border:      #dadce0;
+      --c-border-soft: #e8eaed;
+      --c-bg:          #ffffff;
+      --c-bg-alt:      #f8f9fa;
+      --c-blue:        #1a73e8;
+      --c-blue-soft:   #e8f0fe;
+      --c-green:       #1e8e3e;
+      --c-green-soft:  #e6f4ea;
+      --c-red:         #d93025;
+      --c-red-soft:    #fce8e6;
+      --c-amber:       #b06000;
+      --c-amber-soft:  #fef7e0;
+    }
+
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                    "Helvetica Neue", Arial, sans-serif;
-      padding: 12px; color: #202124; font-size: 13px;
+      padding: 12px; color: var(--c-text); font-size: 13px;
+      font-variant-numeric: tabular-nums;
     }
-    h3 { margin: 0 0 4px 0; font-size: 14px; }
-    h4 { margin: 14px 0 6px 0; font-size: 12px; color: #5f6368; text-transform: uppercase; letter-spacing: .04em; }
-    .job { border: 1px solid #dadce0; padding: 10px; border-radius: 6px; background: #fff; margin-bottom: 8px; }
-    .job-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #5f6368; word-break: break-all; }
-    .row { display: flex; justify-content: space-between; margin: 3px 0; }
-    .label { color: #5f6368; }
-    .value { font-weight: 500; }
-    .status-queued     { color: #5f6368; }
-    .status-running    { color: #1a73e8; font-weight: 600; }
-    .status-completed  { color: #1e8e3e; font-weight: 600; }
-    .status-failed     { color: #d93025; font-weight: 600; }
-    .status-killed     { color: #b06000; font-weight: 600; }
-    .progress-bar { width: 100%; height: 6px; background: #e8eaed; border-radius: 3px; margin: 6px 0; overflow: hidden; }
-    .progress-bar-fill { height: 100%; background: #1a73e8; transition: width 0.3s ease; }
-    .empty { color: #5f6368; font-style: italic; padding: 8px 0; }
-    .arch { border-bottom: 1px solid #eee; padding: 6px 0; font-size: 12px; }
-    .arch .top { display: flex; justify-content: space-between; }
-    button { padding: 5px 9px; border: 1px solid #dadce0; background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; color: #1a73e8; }
-    button:hover { background: #f8f9fa; }
-    button.danger { color: #d93025; }
-    .small { font-size: 11px; color: #5f6368; margin-top: 4px; }
-    .summary-line { font-size: 12px; color: #5f6368; margin: 2px 0 6px 0; }
-    .reconnect { color: #b06000; }
-    details { margin-top: 6px; }
-    summary { cursor: pointer; color: #1a73e8; font-size: 12px; }
-    .rows { margin: 6px 0 2px 0; border-top: 1px dashed #e8eaed; padding-top: 4px; }
-    .rowline { display: flex; justify-content: space-between; gap: 8px; margin: 2px 0; font-size: 12px; }
-    .rowline a { color: #1e8e3e; }
-    .rs-done       { color: #1e8e3e; text-align: right; }
-    .rs-failed     { color: #d93025; text-align: right; word-break: break-word; }
-    .rs-processing { color: #1a73e8; }
-    .rs-pending    { color: #5f6368; }
+    h3 { margin: 0 0 4px 0; font-size: 14px; font-weight: 600; }
+    h4 { margin: 14px 0 6px 0; font-size: 11px; color: var(--c-muted);
+         text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
 
-    /* Phase 1 of sidebar UX overhaul: live row status with step + elapsed.
-       See _plans/2026-06-04-sidebar-ux-overhaul.md. */
-    .rowline.processing { display: block; padding: 4px 0; }
-    .rowline.processing .row-head { display: flex; justify-content: space-between; }
-    .rowline.processing .row-step { color: #1a73e8; font-weight: 500; margin-top: 2px; font-size: 12px; }
-    .rowline.processing .row-elapsed { color: #5f6368; font-variant-numeric: tabular-nums; }
+    .job {
+      border: 1px solid var(--c-border);
+      padding: 12px; border-radius: 8px; background: var(--c-bg);
+      margin-bottom: 10px;
+      transition: border-color 0.2s ease;
+    }
+    .job:has(.status-running) { border-color: var(--c-blue-soft); }
+    .job:has(.status-failed)  { border-color: var(--c-red-soft); }
+
+    .job-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+              font-size: 11px; color: var(--c-subtle); word-break: break-all;
+              margin-bottom: 8px; }
+    .row { display: flex; justify-content: space-between; margin: 4px 0; }
+    .label { color: var(--c-muted); }
+    .value { font-weight: 500; }
+    .status-queued     { color: var(--c-muted); font-weight: 500; }
+    .status-running    { color: var(--c-blue);  font-weight: 600; }
+    .status-completed  { color: var(--c-green); font-weight: 600; }
+    .status-failed     { color: var(--c-red);   font-weight: 600; }
+    .status-killed     { color: var(--c-amber); font-weight: 600; }
+
+    .progress-bar {
+      width: 100%; height: 6px; background: var(--c-border-soft);
+      border-radius: 3px; margin: 8px 0; overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%; background: var(--c-blue);
+      transition: width 0.4s ease;
+    }
+    /* Subtle pulse on running progress so the user knows it's live. */
+    .job:has(.status-running) .progress-bar-fill {
+      animation: progress-pulse 2s ease-in-out infinite;
+    }
+    @keyframes progress-pulse {
+      0%, 100% { opacity: 1.0; }
+      50%      { opacity: 0.7; }
+    }
+
+    .empty {
+      color: var(--c-muted); padding: 12px 8px;
+      background: var(--c-bg-alt); border-radius: 6px;
+      text-align: center;
+    }
+    .empty .empty-title { font-weight: 500; color: var(--c-text); margin-bottom: 2px; }
+    .empty .empty-hint  { font-size: 12px; color: var(--c-subtle); }
+
+    .arch {
+      border-bottom: 1px solid var(--c-border-soft);
+      padding: 8px 4px; font-size: 12px;
+    }
+    .arch:last-child { border-bottom: none; }
+    .arch .top { display: flex; justify-content: space-between; align-items: center; }
+
+    button {
+      padding: 6px 10px; border: 1px solid var(--c-border);
+      background: var(--c-bg); border-radius: 4px; cursor: pointer;
+      font-size: 12px; color: var(--c-blue); font-weight: 500;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    button:hover { background: var(--c-bg-alt); border-color: var(--c-blue); }
+    button.danger { color: var(--c-red); }
+    button.danger:hover { border-color: var(--c-red); background: var(--c-red-soft); }
+    button.ghost  { color: var(--c-muted); }
+    button.ghost:hover { border-color: var(--c-muted); }
+
+    .small { font-size: 11px; color: var(--c-muted); margin-top: 4px; }
+    .summary-line { font-size: 12px; color: var(--c-muted); margin: 2px 0 8px 0; }
+    .reconnect { color: var(--c-amber); }
+
+    details { margin-top: 6px; }
+    summary { cursor: pointer; color: var(--c-blue); font-size: 12px; user-select: none; }
+
+    .rows {
+      margin: 8px 0 4px 0; border-top: 1px dashed var(--c-border-soft);
+      padding-top: 6px;
+    }
+    .rowline {
+      display: flex; justify-content: space-between; gap: 8px;
+      margin: 4px 0; font-size: 12px;
+    }
+    .rowline a { color: var(--c-green); font-weight: 500; }
+    .rowline a:hover { text-decoration: underline; }
+    .rs-done       { color: var(--c-green); text-align: right; font-weight: 500; }
+    .rs-failed     { color: var(--c-red);   text-align: right; word-break: break-word; }
+    .rs-processing { color: var(--c-blue); }
+    .rs-pending    { color: var(--c-muted); }
+
+    /* Phase 1: live row status with step + elapsed. */
+    .rowline.processing { display: block; padding: 6px 0; }
+    .rowline.processing .row-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .rowline.processing .row-step {
+      color: var(--c-blue); font-weight: 500; margin-top: 3px; font-size: 12px;
+    }
+    .rowline.processing .row-elapsed {
+      color: var(--c-muted); font-variant-numeric: tabular-nums;
+      font-size: 11px;
+    }
     .step-ellipsis::after {
       content: '...';
       display: inline-block;
@@ -59,10 +146,41 @@
       33%  { content: '..';  }
       66%  { content: '...'; }
     }
-    .logwrap { margin-top: 6px; }
-    .logbar { margin-bottom: 4px; }
-    pre.log { background: #202124; color: #e8eaed; font-size: 11px; padding: 8px; border-radius: 4px;
-              max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+
+    /* Phase 2: inline error display. */
+    .error-block {
+      background: var(--c-red-soft); border-radius: 4px;
+      padding: 8px 10px; margin: 6px 0;
+      font-size: 12px; color: var(--c-red);
+      word-break: break-word;
+    }
+    .error-block .error-head {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 4px;
+    }
+    .error-block .error-head .error-label {
+      font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+      font-size: 10px;
+    }
+    .error-block .copy-btn {
+      padding: 2px 8px; font-size: 11px; color: var(--c-red);
+      border-color: var(--c-red-soft); background: transparent;
+    }
+    .error-block .copy-btn:hover { background: var(--c-bg); }
+    .error-block pre {
+      margin: 0; white-space: pre-wrap; word-break: break-word;
+      font-family: inherit; font-size: 12px;
+    }
+
+    .logwrap { margin-top: 8px; }
+    .logbar { margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
+    .logbar .log-status { font-size: 11px; color: var(--c-subtle); margin-left: auto; }
+    pre.log {
+      background: #202124; color: #e8eaed; font-size: 11px; padding: 10px;
+      border-radius: 4px; max-height: 240px; overflow: auto;
+      white-space: pre-wrap; word-break: break-word; margin: 0;
+      line-height: 1.45;
+    }
   </style>
 </head>
 <body>
@@ -95,6 +213,16 @@
     var _failCount = 0;
     var _timer = null;
 
+    // Phase 3: per-tab median elapsed seconds. Populated by pollAll and
+    // used to render "~3:30 est" next to the live elapsed counter. Map
+    // of tab_type → seconds. The sidebar also caches job.tab_type so
+    // _rowsHtml can look up the right median per active row.
+    var _etaMediansByTab = {};
+    var _tabTypeByJob = {};
+    // Don't render an estimate until we've got at least this many
+    // samples for the tab — for low-volume tabs the median is noise.
+    var ETA_MIN_SAMPLES = 1;
+
     function _escape(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
@@ -121,10 +249,20 @@
     function onPoll(response) {
       _failCount = 0;
       _lastJobs = (response && response.jobs) || [];
+      // Phase 3: stash per-tab medians and tab_type per job so
+      // _rowsHtml can look up the right ETA per active row.
+      _etaMediansByTab = (response && response.eta_medians_by_tab) || {};
+      _lastJobs.forEach(function (j) {
+        if (j.tab_type) _tabTypeByJob[j.job_id] = j.tab_type;
+      });
       // Feed the per-row cache directly from the bundled response so render()
       // does not have to issue any follow-up calls.
       var rowsByJob = (response && response.rows_by_job) || {};
       Object.keys(rowsByJob).forEach(function (jid) {
+        // Annotate each row with its parent job's tab_type so the
+        // renderer doesn't need a second lookup per row.
+        var tab = _tabTypeByJob[jid] || '';
+        (rowsByJob[jid] || []).forEach(function (r) { r._tab = tab; });
         _rowsCache[jid] = rowsByJob[jid];
       });
       // Feed the per-log cache the same way. Format the lines exactly as
@@ -184,11 +322,17 @@
 
       document.getElementById('active').innerHTML = active.length
         ? active.map(_activeCard).join('')
-        : '<div class="empty">No active jobs. Submit one from the menu.</div>';
+        : '<div class="empty">' +
+            '<div class="empty-title">No active jobs.</div>' +
+            '<div class="empty-hint">Select rows in the sheet, then Aporia Bulk Video → Generate selected rows.</div>' +
+          '</div>';
 
       document.getElementById('archive').innerHTML = archive.length
         ? archive.map(_archRow).join('')
-        : '<div class="empty">No finished jobs yet.</div>';
+        : '<div class="empty">' +
+            '<div class="empty-title">No finished jobs yet.</div>' +
+            '<div class="empty-hint">Completed and failed jobs show up here.</div>' +
+          '</div>';
 
       // Auto-scroll any open log pane to the bottom so the freshest
       // pipeline lines stay visible. The user can scroll up to inspect
@@ -217,21 +361,35 @@
         var st = r.status || 'pending';
 
         if (st === 'processing') {
-          // Live row: header line (Row N · elapsed) + step underneath.
-          // ``started_at`` is server-side ISO; we recompute elapsed on
-          // every tick from the client clock so it advances smoothly
-          // even between polls. The data-* attributes let the ticker
-          // refresh the elapsed text without re-rendering the whole card.
+          // Live row: header line (Row N · elapsed · est) + step
+          // underneath. ``started_at`` is server-side ISO; we recompute
+          // elapsed on every tick from the client clock so it advances
+          // smoothly between polls. The data-* attributes let the
+          // ticker refresh the elapsed text without re-rendering the
+          // whole card. Phase 3: append "~M:SS est" from the per-tab
+          // median when available, suppressed once elapsed overshoots
+          // the median by 2× (the estimate is wrong, hiding is honest).
           var startMs = r.started_at ? Date.parse(r.started_at) : NaN;
-          var elapsed = isFinite(startMs) ? _formatElapsed(Date.now() - startMs) : '';
+          var elapsedMs = isFinite(startMs) ? (Date.now() - startMs) : NaN;
+          var elapsed = isFinite(elapsedMs) ? _formatElapsed(elapsedMs) : '';
+          var tab = r._tab || '';
+          var etaSec = (tab && _etaMediansByTab[tab]) || 0;
+          var etaTxt = '';
+          if (etaSec >= ETA_MIN_SAMPLES && isFinite(elapsedMs)) {
+            if (elapsedMs < etaSec * 1000 * 2) {
+              etaTxt = ' · ~' + _formatElapsed(etaSec * 1000) + ' est';
+            }
+          }
           var step = r.current_step
             ? '<span class="step-ellipsis">' + _escape(r.current_step) + '</span>'
             : '<span class="step-ellipsis">Starting</span>';
           return '<div class="rowline processing"' +
-                 ' data-row-elapsed="' + (isFinite(startMs) ? startMs : '') + '">' +
+                 ' data-row-elapsed="' + (isFinite(startMs) ? startMs : '') + '"' +
+                 ' data-eta-secs="' + (etaSec || '') + '"' +
+                 ' data-row-tab="' + _escape(tab) + '">' +
                    '<div class="row-head">' +
                      '<span class="value">Row ' + r.row_num + '</span>' +
-                     '<span class="row-elapsed">' + _escape(elapsed) + '</span>' +
+                     '<span class="row-elapsed">' + _escape(elapsed) + _escape(etaTxt) + '</span>' +
                    '</div>' +
                    '<div class="row-step">' + step + '</div>' +
                  '</div>';
@@ -255,17 +413,26 @@
       }).join('');
     }
 
-    // Phase 1 ticker: every 1 s, walk every visible processing row and
-    // update its elapsed display in place. We DON'T re-render the whole
-    // card — that would lose focus / scroll position / open <details>.
+    // Phase 1+3 ticker: every 1 s, walk every visible processing row
+    // and update its elapsed display in place (plus the trailing
+    // "~M:SS est" suffix once the ETA stops being meaningful). We
+    // DON'T re-render the whole card — that would lose focus / scroll
+    // position / open <details>.
     function _tickElapsed() {
       var els = document.querySelectorAll('.rowline.processing[data-row-elapsed]');
       var now = Date.now();
       els.forEach(function (el) {
         var startMs = parseInt(el.getAttribute('data-row-elapsed'), 10);
         if (!isFinite(startMs)) return;
+        var elapsedMs = now - startMs;
         var counterEl = el.querySelector('.row-elapsed');
-        if (counterEl) counterEl.textContent = _formatElapsed(now - startMs);
+        if (!counterEl) return;
+        var etaSec = parseFloat(el.getAttribute('data-eta-secs')) || 0;
+        var txt = _formatElapsed(elapsedMs);
+        if (etaSec >= ETA_MIN_SAMPLES && elapsedMs < etaSec * 1000 * 2) {
+          txt += ' · ~' + _formatElapsed(etaSec * 1000) + ' est';
+        }
+        counterEl.textContent = txt;
       });
     }
     setInterval(_tickElapsed, 1000);
@@ -302,15 +469,48 @@
       var pct = _pct(j);
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
       var open = !!_openLogs[jid];
+
       // ``queued`` jobs honestly say so. ``running`` jobs render the
-      // row list (which now shows live per-step status from the server
-      // via current_step + started_at). Plan §Phase 1.
+      // row list (which shows live per-step status from the server via
+      // current_step + started_at). Plan §Phase 1.
       var rowsBlock;
       if (j.status === 'queued') {
         rowsBlock = '<div class="rows"><div class="small">Waiting for the next free worker slot…</div></div>';
       } else {
         rowsBlock = '<div class="rows" id="rows-' + jid + '">' + _rowsHtml(_rowsCache[jid]) + '</div>';
       }
+
+      // Phase 2: hide the zero-counters until something actually
+      // completes or fails — visual noise on a typical single-row job.
+      // They reappear the moment either counter goes non-zero.
+      var counts = '';
+      var hasAny = (j.completed_rows || 0) + (j.failed_rows || 0) > 0;
+      if (hasAny) {
+        counts =
+          '<div class="row"><span class="label">Succeeded</span>' +
+            '<span class="value" style="color:var(--c-green)">' + (j.completed_rows || 0) + '</span></div>' +
+          '<div class="row"><span class="label">Failed</span>' +
+            '<span class="value" style="color:var(--c-red)">' + (j.failed_rows || 0) + '</span></div>';
+      }
+
+      // Phase 2: inline error block for jobs with failed rows. Pulls
+      // the freshest failed row's error from _rowsCache.
+      var errorBlock = '';
+      var failedRow = (_rowsCache[jid] || []).filter(function (r) {
+        return r.status === 'failed' && r.error;
+      }).slice(-1)[0];
+      if (failedRow) {
+        var errId = 'err-' + jid;
+        errorBlock =
+          '<div class="error-block">' +
+            '<div class="error-head">' +
+              '<span class="error-label">Error on row ' + failedRow.row_num + '</span>' +
+              '<button class="copy-btn" onclick="_copyText(\'' + errId + '\', this)">Copy</button>' +
+            '</div>' +
+            '<pre id="' + errId + '">' + _escape(String(failedRow.error)) + '</pre>' +
+          '</div>';
+      }
+
       return '' +
         '<div class="job">' +
           '<div class="job-id">' + jid + ' · ' + (j.worksheet || '') + '</div>' +
@@ -318,12 +518,12 @@
             '<span class="value status-' + j.status + '">' + j.status + '</span></div>' +
           '<div class="progress-bar"><div class="progress-bar-fill" style="width:' + pct + '%"></div></div>' +
           '<div class="row"><span class="label">Progress</span><span class="value">' + done + ' / ' + (j.row_count || 0) + ' (' + pct + '%)</span></div>' +
-          '<div class="row"><span class="label">Succeeded</span><span class="value" style="color:#1e8e3e">' + (j.completed_rows || 0) + '</span></div>' +
-          '<div class="row"><span class="label">Failed</span><span class="value" style="color:#d93025">' + (j.failed_rows || 0) + '</span></div>' +
+          counts +
           '<div class="row"><span class="label">Cost</span><span class="value">$' + (j.cost_usd || 0).toFixed(4) + '</span></div>' +
           rowsBlock +
-          '<div style="margin-top:6px">' +
-            '<button class="danger" onclick="killJob(\'' + jid + '\')">Kill job</button> ' +
+          errorBlock +
+          '<div style="margin-top:8px; display:flex; gap:6px;">' +
+            '<button class="danger" onclick="killJob(\'' + jid + '\')">Kill job</button>' +
             '<button onclick="toggleLog(\'' + jid + '\')">' + (open ? 'Hide logs' : 'View logs') + '</button>' +
           '</div>' +
           '<div class="logwrap" id="log-' + jid + '" style="display:' + (open ? 'block' : 'none') + '">' +
@@ -331,6 +531,31 @@
           '</div>' +
         '</div>';
     }
+
+    // Phase 2: copy-to-clipboard for the inline error block. Falls
+    // back to execCommand because Apps Script's iframe sandbox blocks
+    // the modern Clipboard API in some Sheets contexts.
+    function _copyText(elId, btnEl) {
+      var src = document.getElementById(elId);
+      if (!src) return;
+      try {
+        var sel = window.getSelection();
+        var range = document.createRange();
+        range.selectNodeContents(src);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        var ok = document.execCommand('copy');
+        sel.removeAllRanges();
+        if (btnEl) {
+          var original = btnEl.textContent;
+          btnEl.textContent = ok ? 'Copied' : 'Copy failed';
+          setTimeout(function () { btnEl.textContent = original; }, 1500);
+        }
+      } catch (e) {
+        if (btnEl) btnEl.textContent = 'Copy failed';
+      }
+    }
+    window._copyText = _copyText;
 
     function _archRow(j) {
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
