@@ -36,7 +36,12 @@ from bulkvid.models.row import (
     CartoonRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
-from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
+from bulkvid.orchestrator.row_processor_cartoon import (
+    MAX_EFFECTIVE_VO_SECONDS,
+    SPEECH_ATEMPO_MIN,
+    compute_atempo,
+    process_cartoon_row,
+)
 from bulkvid.pipeline.cartoon_prompt import CartoonIdea, CartoonPlan, CartoonShot
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
@@ -118,7 +123,7 @@ class _FakeRendi:
     async def concat_clips_with_audio(
         self, clip_urls, audio_url, per_clip_seconds,
         output_filename="out.mp4", *, aspect_ratio="9:16",
-        total_video_seconds=None, **_,
+        total_video_seconds=None, atempo=None, **_,
     ) -> RendiOutput:
         self.concat_calls.append(
             {
@@ -127,6 +132,7 @@ class _FakeRendi:
                 "per_clip": per_clip_seconds,
                 "out": output_filename,
                 "total_video_seconds": total_video_seconds,
+                "atempo": atempo,
             }
         )
         return RendiOutput(
@@ -249,6 +255,54 @@ def _register_downloads() -> None:
     )
 
 
+# ── compute_atempo ──────────────────────────────────────────────────────────
+
+
+def test_compute_atempo_short_vo_plays_at_natural_speed() -> None:
+    # Raw 4s VO comfortably fits in 7.5s window -> no speedup needed.
+    # Previously this case played at 1.3x (3.08s effective, 4.9s of dwell);
+    # now it plays at 1.0x (4.0s effective, 4.0s of dwell). The remaining
+    # dwell is the structural floor and is unavoidable without variable
+    # video length.
+    atempo, effective = compute_atempo(4.0)
+    assert atempo == pytest.approx(1.0)
+    assert effective == pytest.approx(4.0)
+
+
+def test_compute_atempo_medium_vo_plays_at_natural_speed() -> None:
+    # 6.27s raw was the v2 case from the field report — old behavior gave
+    # 4.82s effective (3.18s dwell). New behavior: 6.27s effective (1.73s
+    # dwell). That's the win.
+    atempo, effective = compute_atempo(6.27)
+    assert atempo == pytest.approx(1.0)
+    assert effective == pytest.approx(6.27)
+
+
+def test_compute_atempo_at_threshold_uses_natural_speed() -> None:
+    # Exactly 7.5s raw — at the boundary, no speedup.
+    atempo, effective = compute_atempo(MAX_EFFECTIVE_VO_SECONDS)
+    assert atempo == pytest.approx(SPEECH_ATEMPO_MIN)
+    assert effective == pytest.approx(MAX_EFFECTIVE_VO_SECONDS)
+
+
+def test_compute_atempo_long_vo_speeds_up_just_enough() -> None:
+    # 9.0s raw > 7.5s cap. atempo = 9.0 / 7.5 = 1.2 (less than 1.3 max),
+    # effective lands at exactly 7.5s.
+    atempo, effective = compute_atempo(9.0)
+    assert atempo == pytest.approx(1.2)
+    assert effective == pytest.approx(MAX_EFFECTIVE_VO_SECONDS)
+
+
+def test_compute_atempo_very_long_vo_caps_at_1_3() -> None:
+    # 12s raw can't fit at 1.3x either (12 / 1.3 = 9.23 > 7.5). atempo
+    # caps at 1.3 and effective stays above the cap — caller sees
+    # `effective > MAX_EFFECTIVE_VO_SECONDS` and triggers the shorten path.
+    atempo, effective = compute_atempo(12.0)
+    assert atempo == pytest.approx(1.3)
+    assert effective > MAX_EFFECTIVE_VO_SECONDS
+    assert effective == pytest.approx(12.0 / 1.3)
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -286,14 +340,16 @@ async def test_cartoon_video_always_8s_when_short_vo(monkeypatch) -> None:
     call = clients.rendi.concat_calls[0]
     assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
     assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
+    # Short VO -> atempo stays at 1.0 (natural pace). No artificial speedup.
+    assert call["atempo"] == pytest.approx(1.0)
     # All Seedance calls used the 4s tier — no 8s last-shot mode anywhere.
     assert all(d == 4 for d in counters["durations"])
 
 
 @respx.mock
 async def test_cartoon_video_always_8s_when_normal_vo(monkeypatch) -> None:
-    # Raw 7s VO -> effective ~5.38s, comfortably under MAX_EFFECTIVE_VO_SECONDS
-    # (7.5s). Video is exactly 8.0s, two 4s clips. No shortening needed.
+    # Raw 7s VO -> fits at natural speed (atempo=1.0, effective 7s, dwell 1s).
+    # Video still exactly 8.0s, two 4s clips. No shortening needed.
     counters = _patch_kie(monkeypatch)
     _register_downloads()
     clients = _build_clients()
@@ -304,6 +360,29 @@ async def test_cartoon_video_always_8s_when_normal_vo(monkeypatch) -> None:
     call = clients.rendi.concat_calls[0]
     assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
     assert call["per_clip"] == [pytest.approx(4.0, abs=0.01)] * 2
+    # 7s raw is still under the 7.5s cap -> natural speed, no speedup.
+    assert call["atempo"] == pytest.approx(1.0)
+
+
+@respx.mock
+async def test_cartoon_long_vo_speeds_up_to_fit(monkeypatch) -> None:
+    # Raw 9s VO -> can't fit at 1.0x. atempo bumps to 9/7.5 = 1.2 so the
+    # effective played length lands at exactly 7.5s. Shortener NOT called.
+    counters = _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+    clients.tts = _FakeTTS(duration=9.0)    # type: ignore[assignment]
+
+    result = await process_cartoon_row(_row(), clients, job_id="j")
+    assert result.status == STATUS_SUCCESS
+    call = clients.rendi.concat_calls[0]
+    assert call["total_video_seconds"] == pytest.approx(8.0, abs=0.01)
+    # 9 / 7.5 = 1.2, capped at 1.3.
+    assert call["atempo"] == pytest.approx(1.2, abs=0.01)
+    # Only one TTS call — the new range covers this without invoking the
+    # shortener.
+    assert clients.tts.calls == 2    # both ideas, no retries
+    assert all(d == 4 for d in counters["durations"])
     # Only one TTS call per idea — no retry was needed.
     assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS
     assert all(d == 4 for d in counters["durations"])

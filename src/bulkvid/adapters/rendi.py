@@ -689,6 +689,7 @@ class RendiClient:
         *,
         aspect_ratio: str = "9:16",
         total_video_seconds: float | None = None,
+        atempo: float = SPEECH_ATEMPO,
         max_attempts: int = 120,
         delay_seconds: float = 5.0,
     ) -> RendiOutput:
@@ -696,12 +697,15 @@ class RendiClient:
 
         Used by the cartoon pipeline: each Seedance clip is trimmed and forced to
         the target aspect, the clips are concatenated in order, and — when
-        ``audio_url`` is given — the voiceover is sped up and muxed in. Output
-        length is controlled by ``total_video_seconds``: when set the video is
-        forced to exactly that duration (audio cut with a short fade-out when
-        the VO overruns), otherwise the legacy ``-shortest`` mode is used and
-        the video tracks the VO length. ``audio_url=None`` yields a silent
-        stitch. Auto-retried.
+        ``audio_url`` is given — the voiceover is sped up by ``atempo`` and
+        muxed in. Output length is controlled by ``total_video_seconds``: when
+        set the video is forced to exactly that duration (audio cut with a short
+        fade-out when the VO overruns), otherwise the legacy ``-shortest`` mode
+        is used and the video tracks the VO length. ``audio_url=None`` yields a
+        silent stitch. ``atempo`` defaults to ``SPEECH_ATEMPO`` (1.3) but the
+        cartoon row processor passes a per-row value derived from the raw TTS
+        length, so a short VO plays at natural speed (1.0×) instead of being
+        artificially rushed. Auto-retried.
         """
         if not clip_urls:
             raise ValueError("concat_clips_with_audio requires at least one clip")
@@ -709,6 +713,7 @@ class RendiClient:
         command = render_cartoon_concat_command(
             len(clip_urls), per_clip_seconds, width, height,
             audio=audio_url is not None,
+            tempo=atempo,
             total_video_seconds=total_video_seconds,
         )
         inputs = {f"in_{i + 1}": url for i, url in enumerate(clip_urls)}

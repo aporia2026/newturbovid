@@ -87,6 +87,41 @@ MAX_EFFECTIVE_VO_SECONDS = TARGET_VIDEO_SECONDS - VO_TAIL_SECONDS    # 7.5s
 VO_SHORTEN_MIN_WORDS = 6
 VO_SHORTEN_STEP = 3
 
+# Per-row playback speed for the VO. The default ``SPEECH_ATEMPO`` (1.3) was
+# tuned for "Gemini TTS reads too slowly" — but fast TTS deliveries (short
+# lines, energetic style) come out 3–5s raw and don't need to be sped up.
+# ``compute_atempo`` picks the smallest atempo (>=1.0) that still lets the
+# raw audio fit inside ``MAX_EFFECTIVE_VO_SECONDS``, capped at ``SPEECH_ATEMPO``
+# to protect voice quality. Net: short VOs play at natural speed and fill more
+# of the 8s window; long VOs still get sped up just enough to fit.
+SPEECH_ATEMPO_MIN = 1.0
+
+
+def compute_atempo(raw_seconds: float) -> tuple[float, float]:
+    """Pick a per-row atempo for the VO.
+
+    Returns ``(atempo, effective_seconds)`` where ``effective_seconds`` is the
+    actual played length of the VO after ffmpeg applies the ``atempo`` filter.
+
+    Logic:
+      - Raw audio ≤ MAX_EFFECTIVE_VO_SECONDS (7.5s): no speedup needed, atempo=1.0.
+        The VO plays at natural pace, which sounds better and fills more of the
+        8s video — directly addresses the "v2-style" 3-second trailing-silence
+        bug.
+      - Raw audio > 7.5s but ≤ 7.5 × 1.3 (=9.75s): speed up just enough to fit.
+        ``atempo = raw / 7.5``; effective lands at exactly 7.5s.
+      - Raw audio > 9.75s: even max speedup (1.3) doesn't fit. Return (1.3,
+        raw/1.3) — the caller will see ``effective > MAX_EFFECTIVE_VO_SECONDS``
+        and trigger the shorten-and-retry path.
+    """
+    if raw_seconds <= 0:
+        return SPEECH_ATEMPO, 0.0
+    if raw_seconds <= MAX_EFFECTIVE_VO_SECONDS:
+        return SPEECH_ATEMPO_MIN, raw_seconds
+    needed = raw_seconds / MAX_EFFECTIVE_VO_SECONDS
+    atempo = min(needed, SPEECH_ATEMPO)
+    return atempo, raw_seconds / atempo
+
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:
     async with httpx.AsyncClient(timeout=timeout) as c:
@@ -219,6 +254,10 @@ async def process_cartoon_row(
                 seedance_durations: list[int] = [SEEDANCE_DURATION_SHORT] * CARTOON_NUM_SHOTS
                 per_clip_seconds: list[float] = [float(SEEDANCE_DURATION_SHORT)] * CARTOON_NUM_SHOTS
                 target_video_seconds = TARGET_VIDEO_SECONDS
+                # Per-row playback speed for the VO. SPEECH_ATEMPO is the
+                # default for the silent path (no audio); when there's a VO
+                # we replace it with compute_atempo's per-row pick.
+                vo_atempo = SPEECH_ATEMPO
 
                 if row.voice_over:
                     final_text = idea.voiceover
@@ -229,9 +268,11 @@ async def process_cartoon_row(
                         country=row.country,
                     )
                     costs.tts += tts.cost_usd
-                    # The concat command speeds the VO up by SPEECH_ATEMPO, so
-                    # the effective played length is shorter than the raw WAV.
-                    effective = tts.duration_seconds / SPEECH_ATEMPO
+                    # Pick the lowest atempo (>=1.0) that still lets the raw
+                    # audio fit in the 7.5s effective window. Short VOs play
+                    # at natural speed and fill more of the 8s video; long
+                    # VOs get just enough speedup to fit.
+                    vo_atempo, effective = compute_atempo(tts.duration_seconds)
                     original_effective = effective
                     shortened = False
 
@@ -275,7 +316,7 @@ async def process_cartoon_row(
                             country=row.country,
                         )
                         costs.tts += tts.cost_usd
-                        effective = tts.duration_seconds / SPEECH_ATEMPO
+                        vo_atempo, effective = compute_atempo(tts.duration_seconds)
                         shortened = True
 
                         if effective > MAX_EFFECTIVE_VO_SECONDS:
@@ -304,6 +345,10 @@ async def process_cartoon_row(
                         vo_words=len(final_text.split()),
                         vo_raw_seconds=round(tts.duration_seconds, 3),
                         vo_effective_seconds=round(effective, 3),
+                        vo_atempo=round(vo_atempo, 3),
+                        vo_dwell_seconds=round(
+                            target_video_seconds - effective, 3
+                        ),
                         target_video_seconds=target_video_seconds,
                         per_clip_seconds=[round(p, 3) for p in per_clip_seconds],
                         seedance_durations=list(seedance_durations),
@@ -394,6 +439,7 @@ async def process_cartoon_row(
                     output_filename=f"v{idx + 1}.mp4",
                     aspect_ratio=aspect,
                     total_video_seconds=target_video_seconds,
+                    atempo=vo_atempo,
                 )
                 costs.rendi += stitched.cost_usd
 

@@ -468,7 +468,11 @@ async def generate_cartoon_plan(
         ],
         response_format={"type": "json_object"},
         max_tokens=1200,
-        temperature=0.8,
+        # 0.5 (was 0.8). Lower temperature pushes the planner toward more
+        # conventional sentence endings — fewer "independent" / "different"
+        # bare-adjective closings that pass the grammar gate but sound
+        # unfinished. Two ideas per row still get enough variety.
+        temperature=0.5,
     )
 
     ideas: list[CartoonIdea] = []

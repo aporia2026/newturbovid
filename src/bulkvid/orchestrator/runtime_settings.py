@@ -104,7 +104,7 @@ CARTOON_PLANNER_PROMPT_DEFAULT = """You are a creative director making SHORT ani
 Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate ~6-7 second video told in exactly {num_shots} shots.
 
 For EACH idea return:
-- voiceover: ONE short spoken line in {language}, about {target_words} words ({min_words}-{max_words}), natural and engaging, readable in ~6-7 seconds. MUST be a COMPLETE THOUGHT that ends in a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition — finish the sentence. A trailing-off fragment is unacceptable.
+- voiceover: ONE short spoken line in {language}, about {target_words} words ({min_words}-{max_words}), natural and engaging, readable in ~6-7 seconds. MUST be a COMPLETE THOUGHT that ends in a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition — finish the sentence. The final word should feel CONCLUSIVE — a strong noun or an action verb that lands the thought. AVOID ending on a bare adjective ("independent", "smart", "ready", "different") or an abstract noun that begs a follow-up — the line must feel finished on first listen, not like it's about to continue.
 - style_direction: a short delivery hint for the voice actor.
 - shots: an array of exactly {num_shots} shots, each with:
     * scene: a vivid description of ONE cartoon scene (subject, setting, framing). Vertical composition.
