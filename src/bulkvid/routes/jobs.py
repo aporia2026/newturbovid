@@ -14,6 +14,7 @@ Plan §7 (Security), §13 Phase 4.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -24,6 +25,8 @@ from bulkvid.config import get_settings
 from bulkvid.logging import get_logger, read_job_log_lines
 from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow, SimpleRow
 from bulkvid.orchestrator.queue import (
+    JOB_QUEUED,
+    JOB_RUNNING,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
@@ -131,6 +134,24 @@ class JobLogOut(BaseModel):
     job_id: str
     exists: bool
     lines: list[str]
+
+
+class PollLogOut(BaseModel):
+    exists: bool
+    lines: list[str]
+
+
+class PollOut(BaseModel):
+    """Single-response bundle for the sidebar.
+
+    Replaces what used to take three separate auth-gated requests per poll
+    cycle (``list_jobs`` + ``get_job_rows`` per running job + ``get_job_log``
+    per open log pane). See ``_plans/2026-06-04-fix-sidebar-500s.md``.
+    """
+
+    jobs: list[JobOut]
+    rows_by_job: dict[str, list[JobRowOut]]
+    logs_by_job: dict[str, PollLogOut]
 
 
 def _job_to_out(job: Job) -> JobOut:
@@ -263,6 +284,76 @@ async def submit_job(
         row_count=len(rows),
     )
     return SubmitJobOut(job_id=job_id, status="queued", row_count=len(rows))
+
+
+@router.get("/poll", response_model=PollOut)
+async def poll_jobs(
+    limit: int = 100,
+    logs: str = "",
+    log_tail: int = 200,
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> PollOut:
+    """Single-call sidebar poll.
+
+    Returns the same data as ``list_jobs`` + per-row status for *running* jobs
+    + log tails for the panes the caller has open — in **one** authenticated
+    request. This is what the Apps Script sidebar should call on every poll
+    cycle instead of firing three separate requests per cycle. Cuts backend
+    auth/request volume by ~5x. Ownership filtering is identical to the
+    individual endpoints (bulk user sees own; admin sees all).
+
+    Plan: ``_plans/2026-06-04-fix-sidebar-500s.md``.
+    """
+    started = time.monotonic()
+
+    limit = max(1, min(limit, 500))
+    log_tail = max(1, min(log_tail, 2000))
+
+    requested_log_ids = [j.strip() for j in logs.split(",") if j.strip()]
+    # Cap the requested log list so a malformed/abusive caller cannot trigger
+    # an unbounded number of log file reads inside a single request.
+    if len(requested_log_ids) > 50:
+        raise HTTPException(400, "too many log ids requested (max 50)")
+
+    filter_email = None if identity.is_admin else identity.email
+    jobs = await queue.list_jobs(user_email=filter_email, limit=limit)
+    owned_job_ids = {j.job_id for j in jobs}
+
+    # Per-row detail only for running jobs — matches the sidebar's existing
+    # behavior (queued jobs show "waiting in queue", archive rows don't need
+    # refresh). Cuts per-poll DB work when there's a long archive list.
+    rows_by_job: dict[str, list[JobRowOut]] = {}
+    for job in jobs:
+        if job.status == JOB_RUNNING:
+            raw_rows = await queue.list_rows(job.job_id)
+            rows_by_job[job.job_id] = [JobRowOut(**r) for r in raw_rows]
+
+    # Log tails: only for job IDs the caller owns AND requested. A malicious
+    # ``logs=<other_user_job_id>`` is silently ignored (not 403'd) — matches
+    # the policy of never confirming the existence of other users' jobs.
+    logs_by_job: dict[str, PollLogOut] = {}
+    for jid in requested_log_ids:
+        if jid in owned_job_ids:
+            lines, exists = read_job_log_lines(jid, row=None, tail=log_tail)
+            logs_by_job[jid] = PollLogOut(exists=exists, lines=lines)
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    _log.info(
+        "poll_request",
+        user_email=identity.email,
+        active_jobs=sum(1 for j in jobs if j.status in (JOB_QUEUED, JOB_RUNNING)),
+        archive_jobs=sum(1 for j in jobs if j.status not in (JOB_QUEUED, JOB_RUNNING)),
+        logs_requested=len(requested_log_ids),
+        logs_returned=len(logs_by_job),
+        elapsed_ms=elapsed_ms,
+    )
+
+    return PollOut(
+        jobs=[_job_to_out(j) for j in jobs],
+        rows_by_job=rows_by_job,
+        logs_by_job=logs_by_job,
+    )
 
 
 @router.get("/{job_id}", response_model=JobOut)

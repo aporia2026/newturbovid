@@ -451,3 +451,50 @@ async def test_kill_all_jobs_scoped_to_one_user(queue: JobQueue) -> None:
     assert killed == 1
     assert (await queue.get_job(j_a)).status == JOB_KILLED
     assert (await queue.get_job(j_b)).status == JOB_QUEUED
+
+
+# ── _tx() transaction boundaries ────────────────────────────────────────────
+
+
+def test_tx_commits_multi_statement_block(queue: JobQueue) -> None:
+    """Two inserts inside one _tx() block must both be visible after commit."""
+    with queue._tx():
+        queue._conn.execute(
+            "INSERT INTO jobs (job_id, user_email, sheet_id, worksheet, "
+            "tab_type, status, row_count, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            ("tx-test-1", "u@x.com", "s", "w", TAB_IMAGE_VO, JOB_QUEUED, 1, "2026-06-04T00:00:00+00:00"),
+        )
+        queue._conn.execute(
+            "INSERT INTO row_queue (job_id, row_num, payload, status) "
+            "VALUES (?,?,?,?)",
+            ("tx-test-1", 2, '{"x": 1}', "pending"),
+        )
+    job_rows = queue._conn.execute(
+        "SELECT job_id FROM jobs WHERE job_id = ?", ("tx-test-1",)
+    ).fetchall()
+    queue_rows = queue._conn.execute(
+        "SELECT row_num FROM row_queue WHERE job_id = ?", ("tx-test-1",)
+    ).fetchall()
+    assert len(job_rows) == 1
+    assert len(queue_rows) == 1
+
+
+def test_tx_rolls_back_on_exception(queue: JobQueue) -> None:
+    """An exception inside _tx() must undo every statement in the block —
+    confirms the new explicit BEGIN IMMEDIATE / ROLLBACK actually works
+    instead of the autocommit no-op the code had before."""
+    with pytest.raises(RuntimeError, match="boom"):
+        with queue._tx():
+            queue._conn.execute(
+                "INSERT INTO jobs (job_id, user_email, sheet_id, worksheet, "
+                "tab_type, status, row_count, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                ("tx-rollback", "u@x.com", "s", "w", TAB_IMAGE_VO, JOB_QUEUED, 1, "2026-06-04T00:00:00+00:00"),
+            )
+            raise RuntimeError("boom")
+
+    rows = queue._conn.execute(
+        "SELECT job_id FROM jobs WHERE job_id = ?", ("tx-rollback",)
+    ).fetchall()
+    assert rows == []                          # rolled back, never persisted

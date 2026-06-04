@@ -88,14 +88,37 @@
     }
 
     // ── Polling (adaptive, never blanks the panel on a transient failure) ──
+    //
+    // ONE authenticated request per cycle via pollAll() — jobs + per-row status
+    // for running jobs + log tails for open panes. The old three-call pattern
+    // (listJobs + per-job getJobRows + per-pane getJobLog) fanned out to ~5
+    // hits per 3-second cycle and saturated the backend's worker pool, causing
+    // HTTP 500 toasts. See _plans/2026-06-04-fix-sidebar-500s.md.
 
     function refresh() {
-      google.script.run.withSuccessHandler(onJobs).withFailureHandler(onFail).listJobs();
+      var openIds = Object.keys(_openLogs).filter(function (jid) { return _openLogs[jid]; });
+      google.script.run.withSuccessHandler(onPoll).withFailureHandler(onFail).pollAll(openIds);
     }
 
-    function onJobs(jobs) {
+    function onPoll(response) {
       _failCount = 0;
-      _lastJobs = jobs || [];
+      _lastJobs = (response && response.jobs) || [];
+      // Feed the per-row cache directly from the bundled response so render()
+      // does not have to issue any follow-up calls.
+      var rowsByJob = (response && response.rows_by_job) || {};
+      Object.keys(rowsByJob).forEach(function (jid) {
+        _rowsCache[jid] = rowsByJob[jid];
+      });
+      // Feed the per-log cache the same way. Format the lines exactly as
+      // loadLogFor() does so the existing render path stays identical.
+      var logsByJob = (response && response.logs_by_job) || {};
+      Object.keys(logsByJob).forEach(function (jid) {
+        var entry = logsByJob[jid] || {};
+        var lines = entry.lines || [];
+        _logCache[jid] = lines.length
+          ? lines.join('\n')
+          : (entry.exists ? '(no log lines yet)' : '(no log file yet)');
+      });
       render(_lastJobs, null);
       scheduleNext();
     }
@@ -110,7 +133,10 @@
     function scheduleNext() {
       if (_timer) clearTimeout(_timer);
       var active = (_lastJobs || []).some(function (j) { return ACTIVE[j.status]; });
-      _timer = setTimeout(refresh, active ? 3000 : 12000);
+      // 3s when something is happening; 30s when idle. Slower idle cadence
+      // cuts background load without affecting how fast a user sees a running
+      // job advance.
+      _timer = setTimeout(refresh, active ? 3000 : 30000);
     }
 
     // ── Rendering ──────────────────────────────────────────────────────────
@@ -141,11 +167,8 @@
         ? archive.map(_archRow).join('')
         : '<div class="empty">No finished jobs yet.</div>';
 
-      // Pull live per-row status for running jobs; refresh any open log panes.
-      active.forEach(function (j) {
-        if (j.status === 'running') loadRowsFor(j.job_id);
-        if (_openLogs[j.job_id]) loadLogFor(j.job_id);
-      });
+      // No follow-up fetches: pollAll() already populated _rowsCache and
+      // _logCache before render() ran. Reads from cache only.
     }
 
     function _rowsHtml(rows) {

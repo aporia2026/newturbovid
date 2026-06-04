@@ -419,23 +419,46 @@ function _fetchJson(path, options) {
 }
 
 
+/** Called from Sidebar.html on EVERY poll cycle: jobs + per-row status for
+ *  running jobs + log tails for open panes, all in ONE authenticated request.
+ *
+ *  Replaces what used to take three separate calls (listJobs + per-job
+ *  getJobRows + per-pane getJobLog), which fanned out to ~5 backend hits per
+ *  3-second cycle and saturated PA's small uWSGI worker pool. See
+ *  _plans/2026-06-04-fix-sidebar-500s.md.
+ *
+ *  ``openLogIds`` — array of job IDs the sidebar currently has its log pane
+ *  open on. Pass [] when no logs are open. */
+function pollAll(openLogIds) {
+  var qs = '/jobs/poll?limit=100';
+  if (openLogIds && openLogIds.length) {
+    // Cap client-side too (server caps at 50 and 400s above that).
+    var capped = openLogIds.slice(0, 50).map(encodeURIComponent).join(',');
+    qs += '&logs=' + capped;
+  }
+  return _fetchJson(qs, { method: 'get' });
+}
+
+
 /** Called from Sidebar.html: list this user's jobs (active + finished archive).
- *  Backed by GET /jobs, which returns the full job history. The sidebar splits
- *  them into Active (queued/running) and Archive (completed/failed/killed). */
+ *  Backed by GET /jobs. Kept alongside pollAll() for compatibility with any
+ *  out-of-band caller (admin scripts, monitoring); the sidebar itself uses
+ *  pollAll() now. */
 function listJobs() {
   return _fetchJson('/jobs?limit=100', { method: 'get' });
 }
 
 
-/** Called from Sidebar.html: per-row status for one job (row_num, status,
- *  video_urls, error) so the sidebar shows live per-row progress. */
+/** Called from Sidebar.html: per-row status for one job. Kept for compat;
+ *  pollAll() includes the same data for the running set. */
 function getJobRows(jobId) {
   if (!jobId) return { job_id: '', rows: [] };
   return _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/rows', { method: 'get' });
 }
 
 
-/** Called from Sidebar.html: tail of a job's log (optionally one row). */
+/** Called from Sidebar.html: tail of a job's log (optionally one row). Kept
+ *  for compat; pollAll() includes log tails for the panes currently open. */
 function getJobLog(jobId, rowNum) {
   if (!jobId) return { job_id: '', exists: false, lines: [] };
   var path = '/jobs/' + encodeURIComponent(jobId) + '/log?tail=200';

@@ -451,3 +451,159 @@ def test_kill_all_as_admin_kills_everyones(client: TestClient) -> None:
     r = client.post("/jobs/kill-all", headers=_auth("tok-admin"))
     assert r.status_code == 200
     assert r.json()["killed"] >= 1
+
+
+# ── GET /jobs/poll ──────────────────────────────────────────────────────────
+# The batched-poll endpoint the sidebar uses on every cycle. Replaces three
+# separate authenticated requests with one. Plan:
+# _plans/2026-06-04-fix-sidebar-500s.md.
+
+
+def test_poll_without_auth_returns_401(client: TestClient) -> None:
+    r = client.get("/jobs/poll")
+    assert r.status_code == 401
+
+
+def test_poll_owner_returns_only_own_jobs(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk2"))
+
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["jobs"]) == 1
+    assert body["jobs"][0]["user_email"] == "bulk1@aporia.com"
+    assert body["rows_by_job"] == {}            # job is queued, not running
+    assert body["logs_by_job"] == {}
+
+
+def test_poll_as_admin_returns_all_jobs(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk2"))
+
+    r = client.get("/jobs/poll", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["jobs"]) == 2
+    assert {j["user_email"] for j in body["jobs"]} == {
+        "bulk1@aporia.com",
+        "bulk2@aporia.com",
+    }
+
+
+def test_poll_empty_state(client: TestClient) -> None:
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"jobs": [], "rows_by_job": {}, "logs_by_job": {}}
+
+
+def test_poll_rows_only_populated_for_running_jobs(
+    client: TestClient, app: FastAPI
+) -> None:
+    """Queued jobs must NOT carry per-row detail in the poll response. That
+    matches what the sidebar shows ("Waiting in queue…") and keeps the per-poll
+    DB work proportional to the active set."""
+    # Two jobs enqueued in order. FIFO claim takes the first one and promotes
+    # it to RUNNING. The second one stays QUEUED until its turn.
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    first_id = r.json()["job_id"]
+    r = client.post("/jobs", json=_four_images_payload(), headers=_auth("tok-bulk1"))
+    second_id = r.json()["job_id"]
+
+    claimed = await_(app.state.queue.claim_next_row())
+    assert claimed is not None
+    assert claimed.job_id == first_id            # FIFO
+
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    # The running job carries its rows; the still-queued job does NOT.
+    assert first_id in body["rows_by_job"]
+    assert len(body["rows_by_job"][first_id]) >= 1
+    assert second_id not in body["rows_by_job"]
+
+
+def test_poll_logs_only_for_owned_and_requested_jobs(client: TestClient) -> None:
+    """The ``logs=`` query param filters to a) jobs the caller owns AND b)
+    job IDs the caller explicitly requested. A malicious caller naming another
+    user's job ID gets nothing back — silently, not a 403, so we don't leak
+    job existence."""
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    own_id = r.json()["job_id"]
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk2"))
+    other_id = r.json()["job_id"]
+
+    # Owner asks for their own log + someone else's log.
+    r = client.get(
+        f"/jobs/poll?logs={own_id},{other_id}",
+        headers=_auth("tok-bulk1"),
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # Own job's log entry is present (file doesn't exist in tests, but the key
+    # is there with exists=False and lines=[]).
+    assert own_id in body["logs_by_job"]
+    assert body["logs_by_job"][own_id] == {"exists": False, "lines": []}
+    # Other user's job is silently absent.
+    assert other_id not in body["logs_by_job"]
+
+
+def test_poll_log_tail_clamped(client: TestClient) -> None:
+    """``log_tail`` cap matches ``read_job_log_lines`` (max 2000). Caller cannot
+    request an unbounded log slice via the poll endpoint."""
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    jid = r.json()["job_id"]
+    # log_tail well above the cap; endpoint should not error.
+    r = client.get(
+        f"/jobs/poll?logs={jid}&log_tail=999999",
+        headers=_auth("tok-bulk1"),
+    )
+    assert r.status_code == 200
+
+
+def test_poll_rejects_too_many_log_ids(client: TestClient) -> None:
+    """Bounded fan-out: >50 log IDs in a single poll is rejected before any
+    file I/O happens."""
+    fake_ids = ",".join(f"job-{i}" for i in range(51))
+    r = client.get(
+        f"/jobs/poll?logs={fake_ids}",
+        headers=_auth("tok-bulk1"),
+    )
+    assert r.status_code == 400
+
+
+def test_poll_limit_clamped(client: TestClient) -> None:
+    """``limit`` is clamped to [1, 500]. Caller cannot exhaust the DB via a
+    massive single response."""
+    r = client.get("/jobs/poll?limit=99999", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200            # accepted, just clamped
+
+
+# ── /jobs/poll routing: 'poll' must not be matched as {job_id} ─────────────
+
+
+def test_poll_path_not_swallowed_by_job_id_route(client: TestClient) -> None:
+    """``GET /jobs/poll`` must hit the poll handler — not the
+    ``GET /jobs/{job_id}`` route looking up a job called "poll". This guards
+    against an accidental route-order regression that would 404 every poll."""
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    # 200 (empty state) confirms poll handler hit, not 404 from "job 'poll'
+    # not found".
+    assert r.status_code == 200
+    assert "jobs" in r.json()
+
+
+# ── Helper: run a coroutine from a sync test ────────────────────────────────
+
+
+def await_(coro):    # noqa: ANN001
+    """Tiny adapter — these route tests are sync ``TestClient`` tests, but the
+    JobQueue API is async. Drive the coroutine on the running loop or a new one.
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    return loop.run_until_complete(coro)

@@ -19,6 +19,8 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -168,6 +170,31 @@ class JobQueue:
         self._lock = asyncio.Lock()
         _log.info("queue_init", db_path=str(self._db_path))
 
+    # ── Transactions ────────────────────────────────────────────────────────
+
+    @contextmanager
+    def _tx(self) -> Iterator[None]:
+        """Open an explicit write transaction.
+
+        The connection is in autocommit mode (``isolation_level=None``), so the
+        plain ``with self._conn:`` block does NOT issue ``BEGIN`` — it only
+        runs an end-of-block commit/rollback that has no effect when no
+        transaction is open. Multi-statement blocks were therefore committing
+        per-statement, leaving the door open for another process (the worker)
+        to interleave between our statements and observe torn intermediate
+        state. Wrapping the block in ``BEGIN IMMEDIATE`` ... ``COMMIT`` closes
+        that gap. IMMEDIATE acquires the write lock up front so we don't fail
+        mid-transaction with SQLITE_BUSY on the first write.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        else:
+            self._conn.execute("COMMIT")
+
     # ── Sync helpers (called via to_thread) ─────────────────────────────────
 
     def _active_duplicate_row_nums(
@@ -203,7 +230,7 @@ class JobQueue:
     ) -> str:
         job_id = _new_job_id()
         now = _now_iso()
-        with self._conn:                    # implicit transaction
+        with self._tx():
             # Drop rows already queued/processing for this sheet+worksheet in an
             # active job, so a double-submit or overlapping batch can't reprocess
             # and overwrite a row.
@@ -249,7 +276,7 @@ class JobQueue:
         killing a job — or clearing the queue — immediately stops its pending
         rows instead of the worker draining them anyway.
         """
-        with self._conn:
+        with self._tx():
             cur = self._conn.execute(
                 "SELECT rq.id, rq.job_id, rq.row_num, rq.payload "
                 "FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
@@ -293,7 +320,7 @@ class JobQueue:
             ensure_ascii=False,
         )
         ok = result.status == "SUCCESS" or result.status == "ZAPCAP_FAILED_KEPT_NO_CAPTIONS"
-        with self._conn:
+        with self._tx():
             cur = self._conn.execute(
                 "SELECT job_id FROM row_queue WHERE id = ?", (queue_id,)
             )
@@ -369,7 +396,7 @@ class JobQueue:
         return out
 
     def _kill_job_sync(self, job_id: str) -> bool:
-        with self._conn:
+        with self._tx():
             cur = self._conn.execute(
                 "UPDATE jobs SET status = ?, finished_at = ? "
                 "WHERE job_id = ? AND status IN (?, ?)",
@@ -381,7 +408,7 @@ class JobQueue:
         """Kill every active (queued/running) job — for one user, or all when
         ``user_email`` is None (admin). In-flight rows finish; pending rows stop
         being claimed (see ``_claim_next_row_sync``)."""
-        with self._conn:
+        with self._tx():
             if user_email:
                 cur = self._conn.execute(
                     "UPDATE jobs SET status = ?, finished_at = ? "
@@ -398,7 +425,7 @@ class JobQueue:
 
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
-        with self._conn:
+        with self._tx():
             cur = self._conn.execute(
                 "UPDATE row_queue SET status = ?, started_at = NULL "
                 "WHERE status = ?",
