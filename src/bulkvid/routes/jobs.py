@@ -145,6 +145,11 @@ class JobRowOut(BaseModel):
     # rows where there's nothing meaningful to render.
     current_step: str | None = None
     started_at: str | None = None
+    # Default-template selector pick. Set when the row had a blank
+    # script_pattern and the selector chose a library entry. Empty
+    # otherwise. Plan
+    # ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §B.
+    chosen_template_id: str | None = None
 
 
 class JobRowsOut(BaseModel):
@@ -234,6 +239,7 @@ def _row_to_out(job_id: str, raw: dict[str, Any]) -> JobRowOut:
         error=raw.get("error"),
         video_urls=raw.get("video_urls", []),
         current_step=step,
+        chosen_template_id=raw.get("chosen_template_id") or None,
     )
 
 

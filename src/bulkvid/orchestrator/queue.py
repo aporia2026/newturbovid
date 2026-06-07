@@ -509,6 +509,7 @@ class JobQueue:
         out: list[dict[str, Any]] = []
         for r in cur.fetchall():
             result = json.loads(r["result"]) if r["result"] else {}
+            meta = result.get("metadata") or {}
             out.append(
                 {
                     "row_num": r["row_num"],
@@ -521,6 +522,11 @@ class JobQueue:
                     "started_at": r["started_at"],
                     "error": result.get("error"),
                     "video_urls": result.get("video_urls", []),
+                    # Surfaces which default-library template was picked
+                    # for a blank-cell row. Empty when script_pattern was
+                    # filled in or the selector didn't pick anything.
+                    # Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §B.
+                    "chosen_template_id": meta.get("chosen_template_id") or "",
                 }
             )
         return out

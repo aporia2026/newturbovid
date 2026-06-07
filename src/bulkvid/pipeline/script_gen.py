@@ -61,6 +61,11 @@ class ScriptResult:
     word_count: int
     cost_usd: float
     used_override: bool
+    # Filled when the blank-cell template selector picked a library entry.
+    # Empty when the row had a non-blank script_pattern, the OVERRIDE
+    # short-circuit fired, or the selector fell back to the literal default.
+    # Surfaces in the sidebar so operators can see which seed got picked.
+    chosen_template_id: str = ""
 
 
 # The full default lives in runtime_settings.py so the admin panel can edit it
@@ -262,6 +267,7 @@ async def generate_script(
     # anomaly (selector failure, empty library, master switch off).
     # Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §B.
     effective_script_pattern = script_pattern
+    chosen_template_id = ""
     if not script_pattern.strip() and settings_store is not None:
         chosen = await _maybe_select_template(
             client,
@@ -273,6 +279,7 @@ async def generate_script(
         )
         if chosen is not None:
             effective_script_pattern = chosen.body
+            chosen_template_id = chosen.id
 
     system = _format_system_prompt(
         template,
@@ -339,6 +346,7 @@ async def generate_script(
             word_count=_word_count(script_text),
             cost_usd=result.cost_usd,
             used_override=False,
+            chosen_template_id=chosen_template_id,
         )
 
     script = str(parsed.get("script") or "").strip()
@@ -366,4 +374,5 @@ async def generate_script(
         word_count=wc,
         cost_usd=result.cost_usd,
         used_override=False,
+        chosen_template_id=chosen_template_id,
     )

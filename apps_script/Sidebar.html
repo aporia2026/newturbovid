@@ -147,6 +147,20 @@
       66%  { content: '...'; }
     }
 
+    /* Default-template selector pick. Surfaces the chosen library entry id
+       so operators can see which seed got used (and refine the library when
+       they spot bad picks). Subtle by design — never compete with status. */
+    .row-template {
+      display: block; margin-top: 2px;
+      font-size: 11px; color: var(--c-subtle);
+      font-style: italic;
+    }
+    .row-template .label { color: var(--c-subtle); font-style: normal; }
+    .row-template code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-style: normal;
+    }
+
     /* Phase 2: inline error display. */
     .error-block {
       background: var(--c-red-soft); border-radius: 4px;
@@ -360,6 +374,17 @@
       return rows.map(function (r) {
         var st = r.status || 'pending';
 
+        // When the blank-cell selector picked a library entry, surface the
+        // id under the row so operators can spot bad picks and refine the
+        // library. Empty for rows that had script_pattern filled in OR
+        // where the selector didn't run.
+        var tplCaption = r.chosen_template_id
+          ? '<div class="row-template">' +
+              '<span class="label">Template:</span> ' +
+              '<code>' + _escape(r.chosen_template_id) + '</code>' +
+            '</div>'
+          : '';
+
         if (st === 'processing') {
           // Live row: header line (Row N · elapsed · est) + step
           // underneath. ``started_at`` is server-side ISO; we recompute
@@ -392,7 +417,7 @@
                      '<span class="row-elapsed">' + _escape(elapsed) + _escape(etaTxt) + '</span>' +
                    '</div>' +
                    '<div class="row-step">' + step + '</div>' +
-                 '</div>';
+                 '</div>' + tplCaption;
         }
 
         var right;
@@ -409,7 +434,8 @@
           right = st;
         }
         return '<div class="rowline"><span class="value">Row ' + r.row_num + '</span>' +
-               '<span class="rs-' + st + '">' + right + '</span></div>';
+               '<span class="rs-' + st + '">' + right + '</span></div>' +
+               tplCaption;
       }).join('');
     }
 

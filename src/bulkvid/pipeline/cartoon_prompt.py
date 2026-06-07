@@ -112,6 +112,11 @@ class CartoonIdea:
 class CartoonPlan:
     ideas: list[CartoonIdea]
     cost_usd: float
+    # Set when the blank-cell template selector picked a library entry for
+    # this row. Empty when script_pattern was non-blank or the selector
+    # didn't run. Surfaced to the sidebar so operators see which seed was
+    # used. Plan §B.
+    chosen_template_id: str = ""
 
 
 @dataclass
@@ -501,6 +506,7 @@ async def generate_cartoon_plan(
     # Cartoon shares the same library as the script tabs (Yoav 2026-06-07,
     # answer 3 in the open-questions block).
     effective_pattern = script_pattern.strip()
+    chosen_template_id = ""
     if not effective_pattern and settings_store is not None:
         chosen = await _maybe_select_cartoon_template(
             client,
@@ -512,6 +518,7 @@ async def generate_cartoon_plan(
         )
         if chosen is not None:
             effective_pattern = chosen.body.strip()
+            chosen_template_id = chosen.id
     if effective_pattern:
         system += f"\n\nPreferred opening style: {effective_pattern}."
     system = append_safety_block(system, safety, safety_block)
@@ -630,7 +637,9 @@ async def generate_cartoon_plan(
         cost_usd=result.cost_usd + total_recovery_cost,
     )
     return CartoonPlan(
-        ideas=ideas, cost_usd=result.cost_usd + total_recovery_cost
+        ideas=ideas,
+        cost_usd=result.cost_usd + total_recovery_cost,
+        chosen_template_id=chosen_template_id,
     )
 
 

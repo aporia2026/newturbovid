@@ -728,3 +728,40 @@ def await_(coro):    # noqa: ANN001
     except RuntimeError:
         return asyncio.run(coro)
     return loop.run_until_complete(coro)
+
+
+# ── chosen_template_id flows through the poll route ─────────────────────────
+
+
+def test_row_to_out_forwards_chosen_template_id() -> None:
+    """The queue's row dict carries ``chosen_template_id``; the route maps it
+    into JobRowOut so the sidebar receives it on every poll cycle."""
+    from bulkvid.routes.jobs import _row_to_out
+
+    raw = {
+        "row_num": 7,
+        "status": "done",
+        "started_at": "2026-06-07T12:00:00+00:00",
+        "error": None,
+        "video_urls": ["http://v1.mp4"],
+        "chosen_template_id": "factual_hook",
+    }
+    out = _row_to_out("job-X", raw)
+    assert out.chosen_template_id == "factual_hook"
+
+
+def test_row_to_out_blank_chosen_template_id_becomes_none() -> None:
+    """Empty string from the queue collapses to None on the wire — the sidebar
+    treats null and missing identically and skips the caption."""
+    from bulkvid.routes.jobs import _row_to_out
+
+    raw = {
+        "row_num": 7,
+        "status": "done",
+        "started_at": None,
+        "error": None,
+        "video_urls": [],
+        "chosen_template_id": "",
+    }
+    out = _row_to_out("job-X", raw)
+    assert out.chosen_template_id is None

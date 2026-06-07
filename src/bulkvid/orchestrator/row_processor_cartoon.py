@@ -250,6 +250,8 @@ async def process_cartoon_row(
             costs.plan += plan.cost_usd
             metadata["language"] = lang.language
             metadata["open_comments_mode"] = analysis.mode.value
+            if plan.chosen_template_id:
+                metadata["chosen_template_id"] = plan.chosen_template_id
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 

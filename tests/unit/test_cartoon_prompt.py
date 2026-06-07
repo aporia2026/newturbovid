@@ -776,6 +776,9 @@ async def test_cartoon_blank_script_pattern_uses_selected_template() -> None:
     assert len(captured) == 2
     planner_system = captured[-1]["messages"][0]["content"]
     assert "Preferred opening style: ALPHA_BODY" in planner_system
+    # Chosen id is carried on the plan so the cartoon row processor can
+    # forward it to the sidebar.
+    assert plan.chosen_template_id == "alpha"
 
 
 @respx.mock

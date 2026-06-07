@@ -446,7 +446,8 @@ async def test_blank_script_pattern_falls_back_to_literal_without_settings_store
 @respx.mock
 async def test_blank_script_pattern_uses_selected_template_body() -> None:
     """Blank cell + selector enabled → the template body is substituted into
-    the system prompt as the SCRIPT PATTERN."""
+    the system prompt as the SCRIPT PATTERN, and the chosen id is returned
+    on the ScriptResult so the sidebar can show it."""
     from bulkvid.orchestrator.runtime_settings import (
         SETTING_SCRIPT_TEMPLATE_LIBRARY,
         SETTING_TEMPLATE_SELECTOR_ENABLED,
@@ -503,7 +504,7 @@ async def test_blank_script_pattern_uses_selected_template_body() -> None:
     )
 
     async with OpenAIClient(api_key=API_KEY) as client:
-        await generate_script(
+        result = await generate_script(
             client,
             article_body="Some article body content.",
             country="US",
@@ -519,6 +520,31 @@ async def test_blank_script_pattern_uses_selected_template_body() -> None:
     # The selected template body shows up in the final system prompt.
     final_system = captured[-1]["messages"][0]["content"]
     assert "BODY_FOR_B" in final_system
+    # The chosen id rides back on the result so the sidebar can render it.
+    assert result.chosen_template_id == "tone_b"
+
+
+@respx.mock
+async def test_filled_script_pattern_leaves_chosen_template_id_empty() -> None:
+    """A row that supplied its own pattern never engages the selector, so
+    the result's chosen_template_id stays empty (sidebar shows nothing)."""
+    respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_response(
+                json.dumps({"script": "x", "style_direction": "Warm."})
+            ),
+        )
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await generate_script(
+            client,
+            article_body="x",
+            country="US", vertical="tech", language="en",
+            script_pattern="How To",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+        )
+    assert result.chosen_template_id == ""
 
 
 @respx.mock

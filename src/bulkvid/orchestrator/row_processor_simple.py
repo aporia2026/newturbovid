@@ -172,6 +172,8 @@ async def process_simple_row(
             metadata["open_comments_mode"] = analysis.mode.value
             metadata["script_word_count"] = script.word_count
             metadata["script_used_override"] = script.used_override
+            if script.chosen_template_id:
+                metadata["chosen_template_id"] = script.chosen_template_id
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 
