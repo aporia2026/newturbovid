@@ -395,3 +395,277 @@ async def test_word_count_is_computed() -> None:
 def test_default_target_words_sensible() -> None:
     # Target ~10-12s spoken ≈ ~15-20 words at the observed (~1.5 words/sec) TTS rate.
     assert 14 <= DEFAULT_TARGET_WORDS <= 24
+
+
+# ── Template selector integration ───────────────────────────────────────────
+#
+# When script_pattern is blank AND the settings store provides a library +
+# enabled flag, the selector runs and its chosen body becomes the effective
+# script_pattern.
+
+
+class _FakeSettingsStore:
+    """Async-shaped settings store stub.
+
+    Real ``SettingsStore`` needs SQLite + Turso setup; this stub returns
+    canned values for the keys script_gen consults.
+    """
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+
+    async def get(self, key: str, default: str | None = None) -> str:
+        return self._values.get(key, default if default is not None else "")
+
+
+@respx.mock
+async def test_blank_script_pattern_falls_back_to_literal_without_settings_store() -> None:
+    """Without a settings store the selector cannot run, and the existing
+    literal "natural conversational opener" fallback in _format_system_prompt
+    kicks in. Pinned so a future settings-store wiring change doesn't silently
+    regress this contract."""
+    captured: list[dict] = []
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_capture_handler(captured))
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await generate_script(
+            client,
+            article_body="An article body here.",
+            country="US",
+            vertical="tech",
+            language="en",
+            script_pattern="",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+            settings_store=None,
+        )
+
+    system_msg = captured[0]["messages"][0]["content"]
+    assert "natural conversational opener" in system_msg
+
+
+@respx.mock
+async def test_blank_script_pattern_uses_selected_template_body() -> None:
+    """Blank cell + selector enabled → the template body is substituted into
+    the system prompt as the SCRIPT PATTERN."""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    library_json = json.dumps(
+        {
+            "version": 1,
+            "templates": [
+                {
+                    "id": "tone_a",
+                    "name": "A",
+                    "hint": "warm",
+                    "body": "BODY_FOR_A",
+                },
+                {
+                    "id": "tone_b",
+                    "name": "B",
+                    "hint": "punchy",
+                    "body": "BODY_FOR_B",
+                },
+            ],
+        }
+    )
+
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        # First call = selector; second call = generator.
+        if any("routing assistant" in m.get("content", "") for m in body["messages"]):
+            return httpx.Response(
+                200,
+                json=_chat_response(
+                    json.dumps({"template_id": "tone_b", "reason": "punchy fits"})
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_chat_response(
+                json.dumps({"script": "Some 10 second script.",
+                            "style_direction": "Warm."})
+            ),
+        )
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "true",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await generate_script(
+            client,
+            article_body="Some article body content.",
+            country="US",
+            vertical="news",
+            language="en",
+            script_pattern="",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+            settings_store=store,    # type: ignore[arg-type]
+        )
+
+    # Two OpenAI calls were made: the selector and the script gen.
+    assert len(captured) == 2
+    # The selected template body shows up in the final system prompt.
+    final_system = captured[-1]["messages"][0]["content"]
+    assert "BODY_FOR_B" in final_system
+
+
+@respx.mock
+async def test_blank_script_pattern_with_selector_disabled_uses_literal() -> None:
+    """Master switch ``template_selector_enabled=false`` reverts to the literal
+    fallback even when a library is configured."""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    captured: list[dict] = []
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_capture_handler(captured))
+
+    library_json = json.dumps(
+        {"version": 1, "templates": [
+            {"id": "x", "name": "X", "hint": "h", "body": "BODY_FOR_X"},
+            {"id": "y", "name": "Y", "hint": "h", "body": "BODY_FOR_Y"},
+        ]}
+    )
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "false",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await generate_script(
+            client,
+            article_body="body",
+            country="US",
+            vertical="news",
+            language="en",
+            script_pattern="",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+            settings_store=store,    # type: ignore[arg-type]
+        )
+
+    # Only one call (the script gen), no selector call.
+    assert len(captured) == 1
+    system_msg = captured[0]["messages"][0]["content"]
+    assert "natural conversational opener" in system_msg
+    assert "BODY_FOR_" not in system_msg
+
+
+@respx.mock
+async def test_non_blank_script_pattern_skips_selector() -> None:
+    """Existing behavior must not regress: a filled script_pattern column never
+    triggers the selector."""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    captured: list[dict] = []
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_capture_handler(captured))
+
+    library_json = json.dumps(
+        {"version": 1, "templates": [
+            {"id": "x", "name": "X", "hint": "h", "body": "BODY_FOR_X"},
+            {"id": "y", "name": "Y", "hint": "h", "body": "BODY_FOR_Y"},
+        ]}
+    )
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "true",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await generate_script(
+            client,
+            article_body="body",
+            country="US",
+            vertical="news",
+            language="en",
+            script_pattern="How To",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+            settings_store=store,    # type: ignore[arg-type]
+        )
+
+    # Only one call — no selector hop.
+    assert len(captured) == 1
+    system_msg = captured[0]["messages"][0]["content"]
+    assert "How To" in system_msg
+    assert "BODY_FOR_" not in system_msg
+
+
+@respx.mock
+async def test_selector_failure_falls_back_to_literal() -> None:
+    """If the selector returns invalid JSON, generation proceeds with the
+    literal default — never blocks the row."""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    library_json = json.dumps(
+        {"version": 1, "templates": [
+            {"id": "x", "name": "X", "hint": "h", "body": "BODY_FOR_X"},
+            {"id": "y", "name": "Y", "hint": "h", "body": "BODY_FOR_Y"},
+        ]}
+    )
+
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        if any("routing assistant" in m.get("content", "") for m in body["messages"]):
+            # Selector returns garbage.
+            return httpx.Response(
+                200, json=_chat_response("not actually json")
+            )
+        return httpx.Response(
+            200,
+            json=_chat_response(
+                json.dumps({"script": "ok", "style_direction": "Warm."})
+            ),
+        )
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "true",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await generate_script(
+            client,
+            article_body="body",
+            country="US",
+            vertical="news",
+            language="en",
+            script_pattern="",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+            settings_store=store,    # type: ignore[arg-type]
+        )
+
+    # Two calls: failed selector + generator. Generator's system prompt fell
+    # through to the literal default.
+    assert len(captured) == 2
+    final_system = captured[-1]["messages"][0]["content"]
+    assert "natural conversational opener" in final_system
+    assert result.script == "ok"

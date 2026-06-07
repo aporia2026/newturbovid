@@ -24,12 +24,19 @@ from bulkvid.adapters.openai_client import MODEL_SCRIPT_GEN, OpenAIClient
 from bulkvid.logging import get_logger
 from bulkvid.orchestrator.runtime_settings import (
     SCRIPT_SYSTEM_PROMPT_DEFAULT,
+    SETTING_SCRIPT_TEMPLATE_LIBRARY,
     SETTING_SENSITIVE_APPAREL_RULES,
     SETTING_SIMPLE_SCRIPT_PROMPT,
+    SETTING_TEMPLATE_SELECTOR_ENABLED,
 )
 from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.pipeline.open_comments import OpenCommentsAnalysis, OpenCommentsMode
 from bulkvid.pipeline.safety import SAFE, SafetyContext, append_safety_block
+from bulkvid.pipeline.template_selector import (
+    TemplateLibraryParseError,
+    parse_library,
+    select_default_template,
+)
 
 _log = get_logger("script")
 
@@ -131,6 +138,59 @@ def _word_count(text: str) -> int:
     return len([w for w in text.split() if w.strip()])
 
 
+async def _maybe_select_template(
+    client: OpenAIClient,
+    *,
+    settings_store: SettingsStore,
+    vertical: str,
+    country: str,
+    article_body: str,
+    safety: SafetyContext,
+):    # -> Template | None — return type is local to template_selector
+    """Run the blank-cell template selector if it's enabled.
+
+    Returns the chosen template or ``None`` whenever the caller should fall
+    through to the literal default. This helper is intentionally noisy in
+    logs at the warning level so failures are visible without grep-fu.
+    """
+    enabled_raw = await settings_store.get(
+        SETTING_TEMPLATE_SELECTOR_ENABLED, default="true"
+    )
+    if enabled_raw.strip().lower() not in {"true", "1", "yes", "on"}:
+        _log.info("template_selector_disabled")
+        return None
+
+    library_raw = await settings_store.get(
+        SETTING_SCRIPT_TEMPLATE_LIBRARY, default=""
+    )
+    try:
+        library = parse_library(library_raw)
+    except TemplateLibraryParseError as e:
+        _log.warning("template_library_parse_failed", error=str(e))
+        return None
+
+    if not library.enabled_templates():
+        _log.info("template_library_empty")
+        return None
+
+    # Derive a tiny "title" from the first non-empty line of the article body
+    # — selectors don't get the URL or a real title, but a sentence helps GPT.
+    body = (article_body or "").strip()
+    first_line = body.splitlines()[0].strip() if body else ""
+    article_title = first_line[:200]
+    article_excerpt = body[:600]
+
+    return await select_default_template(
+        client,
+        library=library,
+        vertical=vertical,
+        country=country,
+        article_title=article_title,
+        article_excerpt=article_excerpt,
+        safety=safety,
+    )
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -195,12 +255,31 @@ async def generate_script(
                 SETTING_SENSITIVE_APPAREL_RULES
             )
 
+    # When the row's script_pattern column is blank, ask gpt-5.4-mini to pick
+    # the best template from the admin-edited library. The picked template's
+    # body becomes the effective script_pattern for the rest of this call.
+    # Falls back to the literal default in ``_format_system_prompt`` on any
+    # anomaly (selector failure, empty library, master switch off).
+    # Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §B.
+    effective_script_pattern = script_pattern
+    if not script_pattern.strip() and settings_store is not None:
+        chosen = await _maybe_select_template(
+            client,
+            settings_store=settings_store,
+            vertical=vertical,
+            country=country,
+            article_body=article_body,
+            safety=safety,
+        )
+        if chosen is not None:
+            effective_script_pattern = chosen.body
+
     system = _format_system_prompt(
         template,
         language=language,
         country=country,
         vertical=vertical,
-        script_pattern=script_pattern,
+        script_pattern=effective_script_pattern,
         target_words=target_words,
     )
     system = append_safety_block(system, safety, safety_block)

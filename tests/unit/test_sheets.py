@@ -571,3 +571,121 @@ async def test_read_processed_row_nums_unknown_layout_returns_empty() -> None:
         "sheet-A", "Foo", layout="bogus"
     )
     assert processed == set()
+
+
+# ── Retry behavior ──────────────────────────────────────────────────────────
+
+
+class _FakeAPIError(Exception):
+    """Stand-in shape for gspread.exceptions.APIError carrying a status_code."""
+
+    def __init__(self, status_code: int, message: str = "fake") -> None:
+        super().__init__(message)
+        self.response = MagicMock()
+        self.response.status_code = status_code
+
+
+def _make_flaky_read_client(
+    failures_before_success: int, sheet_data: list[list[str]]
+) -> tuple[MagicMock, MagicMock]:
+    """Build a client whose ``get_all_values`` raises 429 N times then returns data."""
+    ws = MagicMock()
+    call_log: list[int] = []
+
+    def _side_effect() -> list[list[str]]:
+        call_log.append(1)
+        if len(call_log) <= failures_before_success:
+            raise _FakeAPIError(429, "rate limited")
+        return sheet_data
+
+    ws.get_all_values = MagicMock(side_effect=_side_effect)
+    spreadsheet = MagicMock()
+    spreadsheet.worksheet = MagicMock(return_value=ws)
+    client = MagicMock()
+    client.open_by_key = MagicMock(return_value=spreadsheet)
+    return client, ws
+
+
+@pytest.fixture
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    from bulkvid.adapters import _retry
+
+    async def _instant(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", _instant)
+
+
+async def test_read_retries_on_429_then_succeeds(_no_sleep: None) -> None:
+    # One header row + one data row Image-VO shape (need article + manual image).
+    data = [
+        ["country", "vertical", "article", "manual_image", "voice_over", "zapcap",
+         "aspect", "pattern", "comments"],
+        ["US", "fashion", "http://a", "http://i", "Yes", "No",
+         "9:16", "How To", ""],
+    ]
+    client, ws = _make_flaky_read_client(failures_before_success=2, sheet_data=data)
+    sc = SheetsClient(client=client)
+
+    rows = await sc.read_image_vo_rows("sheet-A", "Image-VO")
+    assert len(rows) == 1
+    assert ws.get_all_values.call_count == 3
+
+
+async def test_read_exhausts_then_raises_rate_limit(_no_sleep: None) -> None:
+    from bulkvid.adapters.sheets import SheetsRateLimitError
+
+    client, ws = _make_flaky_read_client(failures_before_success=10, sheet_data=[])
+    sc = SheetsClient(client=client)
+
+    with pytest.raises(SheetsRateLimitError):
+        await sc.read_image_vo_rows("sheet-A", "Image-VO")
+
+    # Default attempts=3 for reads.
+    assert ws.get_all_values.call_count == 3
+
+
+async def test_write_retries_at_most_once(_no_sleep: None) -> None:
+    """Writes are NOT idempotent — cap retries at 1 to avoid double-writes."""
+    from bulkvid.adapters.sheets import SheetsRateLimitError
+
+    ws = MagicMock()
+    ws.batch_update = MagicMock(side_effect=_FakeAPIError(429))
+    spreadsheet = MagicMock()
+    spreadsheet.worksheet = MagicMock(return_value=ws)
+    client = MagicMock()
+    client.open_by_key = MagicMock(return_value=spreadsheet)
+
+    sc = SheetsClient(client=client)
+    write = PendingWrite(
+        job_id="job-1",
+        sheet_id="sheet-A",
+        worksheet="Image-VO",
+        tab_type=TAB_IMAGE_VO,
+        row_num=2,
+        video_urls=["http://v1.mp4"],
+        status="done",
+        error="",
+    )
+    with pytest.raises(SheetsRateLimitError):
+        await sc.batch_write_video_urls([write])
+
+    # attempts=2 → 1 original + 1 retry = 2 calls.
+    assert ws.batch_update.call_count == 2
+
+
+async def test_read_does_not_retry_on_unknown_error(_no_sleep: None) -> None:
+    # An unrelated exception (ValueError) is left alone by the classifier; the
+    # read fails on attempt 1.
+    ws = MagicMock()
+    ws.get_all_values = MagicMock(side_effect=ValueError("you messed up"))
+    spreadsheet = MagicMock()
+    spreadsheet.worksheet = MagicMock(return_value=ws)
+    client = MagicMock()
+    client.open_by_key = MagicMock(return_value=spreadsheet)
+
+    sc = SheetsClient(client=client)
+    with pytest.raises(ValueError):
+        await sc.read_image_vo_rows("sheet-A", "Image-VO")
+
+    assert ws.get_all_values.call_count == 1

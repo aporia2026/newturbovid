@@ -23,6 +23,7 @@ from typing import Any
 
 import openai
 
+from bulkvid.adapters._retry import with_retry
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
 
@@ -61,11 +62,19 @@ class OpenAIAuthError(OpenAIError):
 
 
 class OpenAIRateLimitError(OpenAIError):
-    """429 — token / RPM bucket exhausted."""
+    """429 — token / RPM bucket exhausted. Retryable via the ``_retry`` helper."""
 
 
 class OpenAITimeoutError(OpenAIError):
-    """Request exceeded ``timeout``."""
+    """Request exceeded ``timeout``. Retryable."""
+
+
+class OpenAIServerError(OpenAIError):
+    """5xx from OpenAI. Retryable — server-side hiccup, not our request."""
+
+
+class OpenAIConnectionError(OpenAIError):
+    """Network blew up before the request reached OpenAI. Retryable."""
 
 
 # ── Result type ──────────────────────────────────────────────────────────────
@@ -110,10 +119,16 @@ class OpenAIClient:
         if not api_key:
             raise ValueError("OpenAIClient requires an api_key")
         self._owned = client is None
+        # ``max_retries=0`` disables the SDK's built-in retry (default 2 with
+        # internal exponential backoff). We own retries via ``_retry.with_retry``
+        # so the policy is consistent across adapters and the log shape is
+        # uniform. Without this, a single failing call could trigger 2 SDK
+        # retries × 3 wrapper retries = 6 round-trips with hidden latency.
         self._client = client or openai.AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            max_retries=0,
         )
 
     async def aclose(self) -> None:
@@ -160,16 +175,46 @@ class OpenAIClient:
             response_format=bool(response_format),
         )
 
-        try:
-            resp = await self._client.chat.completions.create(**kwargs)
-        except openai.AuthenticationError as e:
-            raise OpenAIAuthError(str(e)) from e
-        except openai.RateLimitError as e:
-            raise OpenAIRateLimitError(str(e)) from e
-        except openai.APITimeoutError as e:
-            raise OpenAITimeoutError(str(e)) from e
-        except openai.APIError as e:
-            raise OpenAIError(str(e)) from e
+        async def _call() -> Any:
+            try:
+                return await self._client.chat.completions.create(**kwargs)
+            except openai.AuthenticationError as e:
+                # Terminal — a wrong key won't fix itself on retry.
+                raise OpenAIAuthError(str(e)) from e
+            except openai.BadRequestError as e:
+                # Terminal — 400/422; the prompt itself is wrong.
+                raise OpenAIError(str(e)) from e
+            except openai.PermissionDeniedError as e:
+                # Terminal — 403.
+                raise OpenAIError(str(e)) from e
+            except openai.RateLimitError as e:
+                # Retryable.
+                raise OpenAIRateLimitError(str(e)) from e
+            except openai.APITimeoutError as e:
+                # Retryable — the request didn't get a response in time.
+                raise OpenAITimeoutError(str(e)) from e
+            except openai.InternalServerError as e:
+                # Retryable — 5xx, server-side hiccup.
+                raise OpenAIServerError(str(e)) from e
+            except openai.APIConnectionError as e:
+                # Retryable — the network died before OpenAI answered.
+                raise OpenAIConnectionError(str(e)) from e
+            except openai.APIError as e:
+                # Unknown — fail closed as terminal so we don't burn budget
+                # retrying something the helper has no opinion on.
+                raise OpenAIError(str(e)) from e
+
+        resp = await with_retry(
+            _call,
+            op="openai chat",
+            retryable=(
+                OpenAIRateLimitError,
+                OpenAITimeoutError,
+                OpenAIServerError,
+                OpenAIConnectionError,
+            ),
+            extract_retry_after=_extract_openai_retry_after,
+        )
 
         text = (resp.choices[0].message.content or "").strip()
         usage = resp.usage
@@ -229,6 +274,31 @@ class OpenAIClient:
         ]
 
         return await self.chat(model=model, messages=messages, max_tokens=max_tokens)
+
+
+def _extract_openai_retry_after(exc: BaseException) -> float | None:
+    """Pull ``Retry-After`` (seconds) from the underlying OpenAI exception.
+
+    The SDK's ``RateLimitError`` (parent ``APIStatusError``) carries the raw
+    httpx response on ``.response``. The wrapper exception chains the SDK one
+    via ``__cause__``, so walk back to the original and read the header.
+
+    Returns ``None`` when no usable value is present so the retry helper falls
+    back to its exponential backoff.
+    """
+    orig = exc.__cause__
+    response = getattr(orig, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        # The spec also allows an HTTP-date here; treat it as "use backoff".
+        return None
 
 
 def build_client_from_settings(settings: Settings | None = None) -> OpenAIClient:

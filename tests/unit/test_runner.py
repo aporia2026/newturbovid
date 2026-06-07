@@ -333,3 +333,174 @@ async def test_shutdown_with_empty_queue_returns_quickly(
 def test_runner_rejects_zero_concurrency(queue: JobQueue) -> None:
     with pytest.raises(ValueError):
         BatchRunner(queue, _make_dummy_clients(), max_concurrent=0)
+
+
+# ── Row wall-clock timeout ──────────────────────────────────────────────────
+
+
+async def test_row_timeout_marks_row_failed_and_releases_semaphore(
+    queue: JobQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that runs past its budget is cancelled, marked ROW_TIMEOUT, and
+    its slot is released so the next row can claim it."""
+    # Image-VO budget shrunk to 200ms via env override.
+    monkeypatch.setenv("BULKVID_ROW_TIMEOUT_SECONDS_IMAGE_VO", "0.2")
+    # Track which rows actually finished their processor coroutine vs were cancelled.
+    cancelled_rows: list[int] = []
+    completed_rows: list[int] = []
+
+    async def _slow_then_fast(row, _clients, *, job_id=None):
+        # Row 2 sleeps long enough to trip the timeout; row 3 runs fast.
+        if row.row_num == 2:
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                cancelled_rows.append(row.row_num)
+                raise
+            completed_rows.append(row.row_num)
+            return RowResult(
+                row_num=row.row_num, status=STATUS_SUCCESS, cost_usd=0.0,
+            )
+        completed_rows.append(row.row_num)
+        return RowResult(row_num=row.row_num, status=STATUS_SUCCESS, cost_usd=0.0)
+
+    monkeypatch.setattr(runner_mod, "process_image_vo_row", _slow_then_fast)
+
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
+    )
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.02,
+    )
+
+    async def _shutdown_when_done() -> None:
+        while True:
+            await asyncio.sleep(0.02)
+            job = await queue.get_job(job_id)
+            if job is not None and job.status == JOB_COMPLETED:
+                runner.request_shutdown()
+                return
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_when_done()),
+        timeout=10.0,
+    )
+
+    # Row 2 was cancelled mid-flight; row 3 completed.
+    assert 2 in cancelled_rows
+    assert 3 in completed_rows
+    # Job accounting: 1 failed (the timeout), 1 completed.
+    job = await queue.get_job(job_id)
+    assert job is not None
+    assert job.failed_rows == 1
+    assert job.completed_rows == 1
+
+
+async def test_row_timeout_uses_env_override_per_tab(
+    queue: JobQueue,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env var ``BULKVID_ROW_TIMEOUT_SECONDS_<TAB>`` wins over the default."""
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+    monkeypatch.setenv("BULKVID_ROW_TIMEOUT_SECONDS_CARTOON", "42")
+    assert await runner._row_timeout_seconds("cartoon") == 42.0
+    # No override for image_vo → default kicks in.
+    assert (
+        await runner._row_timeout_seconds("image_vo")
+        == runner_mod._DEFAULT_ROW_TIMEOUTS_SECONDS["image_vo"]
+    )
+
+
+# ── Stuck-row heartbeat ─────────────────────────────────────────────────────
+
+
+async def test_heartbeat_flags_stuck_in_flight_rows(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row whose elapsed time exceeds the threshold is logged on heartbeat."""
+    import time
+    from unittest.mock import MagicMock
+
+    monkeypatch.setenv("BULKVID_STUCK_ROW_THRESHOLD_SECONDS", "1.0")
+    # structlog doesn't route through stdlib's logging, so caplog can't see
+    # its records. Patch the logger and inspect the calls directly.
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+
+    async def _block_forever() -> None:
+        await asyncio.Event().wait()
+
+    fake_task = asyncio.create_task(_block_forever())
+    meta = runner_mod._RowMeta(
+        start_monotonic=time.monotonic() - 600.0,    # 10 min ago
+        queued_id=1,
+        job_id="job-stuck-1",
+        row_num=42,
+        tab="image_vo",
+    )
+    runner._in_flight[fake_task] = meta
+
+    try:
+        await runner._emit_heartbeat(idle=True)
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except BaseException:    # noqa: BLE001 — best-effort task cleanup
+            pass
+
+    # Heartbeat summary fired with stuck_count=1.
+    fake_log.info.assert_any_call(
+        "runner_heartbeat", idle=True, in_flight=1, stuck_count=1,
+        poll_idle_seconds=runner._poll_idle,
+    )
+    # Stuck-row line carries the row identity.
+    warning_calls = [c for c in fake_log.warning.call_args_list]
+    assert warning_calls, "expected a runner_heartbeat_stuck warning"
+    keyed = warning_calls[0].kwargs
+    assert keyed["job_id"] == "job-stuck-1"
+    assert keyed["row_num"] == 42
+    assert keyed["tab"] == "image_vo"
+    assert keyed["elapsed_s"] >= 1.0
+
+
+async def test_heartbeat_quiet_when_no_rows_stuck(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Heartbeat emits the summary but no stuck-row warnings when in-flight
+    rows are fresh."""
+    import time
+    from unittest.mock import MagicMock
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+
+    async def _block_forever() -> None:
+        await asyncio.Event().wait()
+
+    fake_task = asyncio.create_task(_block_forever())
+    runner._in_flight[fake_task] = runner_mod._RowMeta(
+        start_monotonic=time.monotonic(),
+        queued_id=2, job_id="job-fresh", row_num=7, tab="image_vo",
+    )
+
+    try:
+        await runner._emit_heartbeat(idle=True)
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except BaseException:    # noqa: BLE001
+            pass
+
+    # Summary fires, no warning called.
+    assert fake_log.info.called
+    fake_log.warning.assert_not_called()

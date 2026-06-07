@@ -9,7 +9,12 @@ Covers:
   - chat() with response_format passes through
   - vision_describe with image_url and image_b64
   - vision_describe rejects when neither image source provided
-  - 401 -> OpenAIAuthError, 429 -> OpenAIRateLimitError
+  - 401 -> OpenAIAuthError (terminal, no retry)
+  - 400 -> OpenAIError (terminal, no retry)
+  - 429 -> retried, then OpenAIRateLimitError after exhausting attempts
+  - 429 -> 200 succeeds after one retry
+  - 500 -> retried as OpenAIServerError
+  - Retry-After header honored
   - Constructor rejects empty api_key
 """
 
@@ -19,15 +24,28 @@ import httpx
 import pytest
 import respx
 
+from bulkvid.adapters import _retry
 from bulkvid.adapters.openai_client import (
     MODEL_SCRIPT_GEN,
     MODEL_VISION,
     PRICING_PER_1M_TOKENS,
     OpenAIAuthError,
     OpenAIClient,
+    OpenAIError,
     OpenAIRateLimitError,
+    OpenAIServerError,
     estimate_cost_usd,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep_between_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every retry sleep instant so the suite stays fast."""
+
+    async def _instant(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", _instant)
 
 API_KEY = "sk-test-openai"
 BASE = "https://api.openai.com/v1"
@@ -242,3 +260,146 @@ async def test_vision_describe_requires_image_source() -> None:
     async with OpenAIClient(api_key=API_KEY) as client:
         with pytest.raises(ValueError):
             await client.vision_describe(prompt="x")
+
+
+# ── Retry behavior ──────────────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_chat_429_then_200_succeeds_after_one_retry() -> None:
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(429, json={"error": {"message": "slow down", "type": "rate_limit_error"}}),
+            httpx.Response(200, json=_chat_response("ok", MODEL_SCRIPT_GEN)),
+        ]
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await client.chat(
+            model=MODEL_SCRIPT_GEN,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    assert result.text == "ok"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_chat_429_exhausts_then_raises_rate_limit() -> None:
+    # Persistent 429 — the helper must give up after 3 attempts and raise the
+    # original error class so callers' except blocks still match.
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            429,
+            json={"error": {"message": "rate limited", "type": "rate_limit_error"}},
+        )
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        with pytest.raises(OpenAIRateLimitError):
+            await client.chat(
+                model=MODEL_SCRIPT_GEN,
+                messages=[{"role": "user", "content": "x"}],
+            )
+
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_chat_500_is_retried_as_server_error() -> None:
+    # InternalServerError is retryable; after 3 failures, raise OpenAIServerError.
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            500,
+            json={"error": {"message": "boom", "type": "server_error"}},
+        )
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        with pytest.raises(OpenAIServerError):
+            await client.chat(
+                model=MODEL_SCRIPT_GEN,
+                messages=[{"role": "user", "content": "x"}],
+            )
+
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_chat_400_does_not_retry() -> None:
+    # Bad request is terminal — retrying a malformed prompt just wastes budget.
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": {"message": "bad prompt", "type": "invalid_request_error"}},
+        )
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        with pytest.raises(OpenAIError):
+            await client.chat(
+                model=MODEL_SCRIPT_GEN,
+                messages=[{"role": "user", "content": "x"}],
+            )
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_chat_401_does_not_retry() -> None:
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            401, json={"error": {"message": "no key", "type": "invalid_request_error"}}
+        )
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        with pytest.raises(OpenAIAuthError):
+            await client.chat(
+                model=MODEL_SCRIPT_GEN,
+                messages=[{"role": "user", "content": "x"}],
+            )
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_chat_honors_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Capture every requested sleep duration so we can assert the value the
+    # provider asked for is what we waited.
+    waits: list[float] = []
+
+    async def capture_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", capture_sleep)
+
+    respx.post(f"{BASE}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(
+                429,
+                json={"error": {"message": "wait", "type": "rate_limit_error"}},
+                headers={"retry-after": "4"},
+            ),
+            httpx.Response(200, json=_chat_response("ok", MODEL_SCRIPT_GEN)),
+        ]
+    )
+
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await client.chat(
+            model=MODEL_SCRIPT_GEN,
+            messages=[{"role": "user", "content": "x"}],
+        )
+
+    assert result.text == "ok"
+    # Retry-After: 4 takes precedence over jittered exponential backoff.
+    assert waits == [4.0]
+
+
+def test_max_retries_disabled_on_underlying_sdk_client() -> None:
+    # If we ever forget to disable the SDK's internal retry, our wrapper
+    # produces 3×3 = 9 round trips with silent latency. Pin the behavior.
+    client = OpenAIClient(api_key=API_KEY)
+    assert client._client.max_retries == 0    # type: ignore[attr-defined]

@@ -142,6 +142,58 @@ SENSITIVE_APPAREL_KEYWORDS_DEFAULT = (
 )
 
 
+# ── Default script template library (Yoav 2026-06-07) ───────────────────────
+#
+# Seed library used when ``script_pattern`` column is blank. The selector
+# (``bulkvid.pipeline.template_selector``) asks gpt-5.4-mini to pick the best
+# id, then the body is substituted into the existing script-generation
+# prompt. Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md``
+# §B.1.
+#
+# These entries are PLACEHOLDERS until Yoav and Evgeny supply the real
+# scripts. They're written to be compliance-safe (no CTAs, no urgency, no
+# superlatives) so even the placeholder set produces shippable output. Each
+# template body is fed into the ``{script_pattern}`` slot of the existing
+# script prompt — keep them short, voice-shaped, not full scripts.
+SCRIPT_TEMPLATE_LIBRARY_DEFAULT = """{
+  "version": 1,
+  "templates": [
+    {
+      "id": "factual_hook",
+      "name": "PLACEHOLDER — Factual hook",
+      "hint": "Open with one concrete fact from the article. Good for news, technology, finance, health.",
+      "body": "Open with a single concrete factual detail drawn from the article; then add one neutral context sentence about why that detail matters in the vertical.",
+      "match_hints": {"vertical_any": ["news", "tech", "finance", "health"]},
+      "enabled": true
+    },
+    {
+      "id": "insights_framing",
+      "name": "PLACEHOLDER — Insights On framing",
+      "hint": "Use the 'Insights On' / 'Key Aspects Of' framing. Good for general informational rows.",
+      "body": "Use the framing 'Insights On' or 'Key Aspects Of' to introduce the topic; share two neutral, useful observations that match the vertical.",
+      "match_hints": {"vertical_any": []},
+      "enabled": true
+    },
+    {
+      "id": "discovery_framing",
+      "name": "PLACEHOLDER — Discovery framing",
+      "hint": "Frame the topic as something the listener can learn about. Good for lifestyle, wellness, education.",
+      "body": "Use the framing 'Learn About' or 'Discover How' to introduce the topic; describe one notable aspect from the article in a calm, educational tone.",
+      "match_hints": {"vertical_any": ["lifestyle", "wellness", "education", "fashion"]},
+      "enabled": true
+    },
+    {
+      "id": "comparison_angle",
+      "name": "PLACEHOLDER — Comparison angle",
+      "hint": "Briefly contrast two relevant aspects. Good when the article presents options or alternatives.",
+      "body": "Open by noting two relevant aspects of the topic; describe them factually without ranking or recommending either one.",
+      "match_hints": {"vertical_any": []},
+      "enabled": true
+    }
+  ]
+}"""
+
+
 # ── Setting registry ────────────────────────────────────────────────────────
 
 
@@ -164,6 +216,20 @@ SETTING_SIMPLE_X4_SCRIPT_PROMPT = "simple_x4_script_prompt"
 SETTING_CARTOON_PLANNER_PROMPT = "cartoon_planner_prompt"
 SETTING_SENSITIVE_APPAREL_RULES = "sensitive_apparel_rules"
 SETTING_SENSITIVE_APPAREL_KEYWORDS = "sensitive_apparel_keywords"
+
+# Row wall-clock timeout per tab + stuck-row heartbeat threshold.
+# Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §A.2.
+# Env override (``BULKVID_ROW_TIMEOUT_SECONDS_<TAB>``) wins over the store.
+SETTING_ROW_TIMEOUT_SIMPLE = "row_timeout_simple_seconds"
+SETTING_ROW_TIMEOUT_IMAGE_VO = "row_timeout_image_vo_seconds"
+SETTING_ROW_TIMEOUT_4IMAGES = "row_timeout_4images_seconds"
+SETTING_ROW_TIMEOUT_CARTOON = "row_timeout_cartoon_seconds"
+SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
+
+# Default script template library + master enable-switch.
+# Plan ``_plans/2026-06-07-overload-handling-and-template-defaults.md`` §B.
+SETTING_SCRIPT_TEMPLATE_LIBRARY = "script_template_library"
+SETTING_TEMPLATE_SELECTOR_ENABLED = "template_selector_enabled"
 
 
 SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
@@ -223,6 +289,86 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "Comma-, newline-, or semicolon-separated list. Match is "
             "lowercase substring against the row's Vertical column. Add new "
             "terms here to widen the safeguard."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_SIMPLE,
+        label="Row timeout: Simple (seconds)",
+        default="720",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a Simple-tab row. If processing "
+            "exceeds this, the row is cancelled and marked ROW_TIMEOUT. "
+            "Env var BULKVID_ROW_TIMEOUT_SECONDS_SIMPLE overrides this."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_IMAGE_VO,
+        label="Row timeout: Image-VO (seconds)",
+        default="900",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for an Image-VO-tab row (image-heavy "
+            "work). Env BULKVID_ROW_TIMEOUT_SECONDS_IMAGE_VO overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_4IMAGES,
+        label="Row timeout: 4Images-VO2 (seconds)",
+        default="720",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a 4Images-VO2-tab row. Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_4IMAGES overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_CARTOON,
+        label="Row timeout: Cartoon (seconds)",
+        default="1200",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a Cartoon-tab row (planner + multi-"
+            "shot). Env BULKVID_ROW_TIMEOUT_SECONDS_CARTOON overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_STUCK_ROW_THRESHOLD,
+        label="Stuck row threshold (seconds)",
+        default="300",
+        multiline=False,
+        description=(
+            "Heartbeat logs a warning for every in-flight row whose elapsed "
+            "time exceeds this. Set well below the per-tab timeout so a row "
+            "stuck on a provider call is visible before it's cancelled. "
+            "Env BULKVID_STUCK_ROW_THRESHOLD_SECONDS overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        label="Default script template library",
+        default=SCRIPT_TEMPLATE_LIBRARY_DEFAULT,
+        multiline=True,
+        description=(
+            "JSON library of default templates used when a row's "
+            "script_pattern column is blank. Each entry has id, name, hint, "
+            "body, optional match_hints, and optional enabled. When the "
+            "column is blank, gpt-5.4-mini picks the best id from this "
+            "library and that template's body is substituted into the "
+            "script-generation prompt. PLACEHOLDER seed entries ship by "
+            "default; replace them with your real scripts."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_TEMPLATE_SELECTOR_ENABLED,
+        label="Default template selector: enabled",
+        default="true",
+        multiline=False,
+        description=(
+            "Master switch for the blank-script_pattern selector. Accepts "
+            "'true' or 'false'. When false, blank columns fall back to the "
+            "hardcoded literal opener (the legacy behavior). Flip off "
+            "instantly here if the selector ever misbehaves in production."
         ),
     ),
 )

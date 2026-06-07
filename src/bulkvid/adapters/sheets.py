@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import gspread
 from google.oauth2.service_account import Credentials
 
+from bulkvid.adapters._retry import with_retry
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
 from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
@@ -37,6 +39,60 @@ from bulkvid.orchestrator.queue import (
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 _log = get_logger("sheets")
+
+
+# ── Errors ──────────────────────────────────────────────────────────────────
+
+
+class SheetsError(RuntimeError):
+    """Base class for adapter-level Sheets errors."""
+
+
+class SheetsRateLimitError(SheetsError):
+    """Google Sheets quota (429). Retryable."""
+
+
+class SheetsServerError(SheetsError):
+    """5xx from the Sheets API. Retryable."""
+
+
+class SheetsConnectionError(SheetsError):
+    """Network died before the Sheets call landed. Retryable."""
+
+
+def _status_from_gspread_error(exc: BaseException) -> int | None:
+    """Pull the HTTP status off a gspread ``APIError`` shape if possible.
+
+    gspread wraps Google API errors in ``APIError`` which carries a
+    ``response`` attribute with ``status_code``. Older versions stash it
+    differently; we degrade gracefully so the classifier still works.
+    """
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int):
+        return code
+    return None
+
+
+def _classify_sheets_error(exc: BaseException) -> BaseException:
+    """Map gspread / google-api errors to our local hierarchy.
+
+    Returns a fresh wrapped exception when the underlying error is retryable;
+    returns the original exception unchanged when terminal.
+    """
+    status = _status_from_gspread_error(exc)
+    msg = str(exc).lower()
+
+    if status == 429 or "rate limit" in msg or "quota" in msg:
+        return SheetsRateLimitError(str(exc))
+    if status in {500, 502, 503, 504} or any(
+        code in msg for code in (" 500 ", " 502 ", " 503 ", " 504 ")
+    ):
+        return SheetsServerError(str(exc))
+    # Connection-style failures from googleapiclient / underlying urllib3.
+    if type(exc).__name__ in {"ConnectionError", "Timeout", "ReadTimeoutError"}:
+        return SheetsConnectionError(str(exc))
+    return exc
 
 
 GSHEETS_SCOPES = (
@@ -155,6 +211,43 @@ class SheetsClient:
                 "or a pre-built client"
             )
 
+    # ── Retry wrapper around to_thread ──────────────────────────────────────
+
+    async def _to_thread_with_retry(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        op: str,
+        attempts: int = 3,
+    ) -> Any:
+        """Run a sync gspread call off-loop with retry on transient errors.
+
+        ``attempts=3`` for reads. Writes pass ``attempts=2`` (a single retry)
+        because Google's batch_update is not idempotent — re-submitting after
+        a network-dropped 200 would double-write cells. One retry is the
+        compromise: absorbs a single 429, doesn't double-write on a flake.
+        """
+
+        async def _call() -> Any:
+            try:
+                return await asyncio.to_thread(fn, *args)
+            except Exception as e:
+                wrapped = _classify_sheets_error(e)
+                if wrapped is e:
+                    raise
+                raise wrapped from e
+
+        return await with_retry(
+            _call,
+            op=op,
+            retryable=(
+                SheetsRateLimitError,
+                SheetsServerError,
+                SheetsConnectionError,
+            ),
+            attempts=attempts,
+        )
+
     # ── Sync workers (invoked via asyncio.to_thread) ────────────────────────
 
     def _get_worksheet_sync(self, sheet_id: str, worksheet_name: str) -> Any:
@@ -198,14 +291,16 @@ class SheetsClient:
         local runner's layout auto-detection so it can fall back from
         name-based detection to header-based detection without reading the
         whole sheet."""
-        return await asyncio.to_thread(
-            self._read_header_row_sync, sheet_id, worksheet_name
+        return await self._to_thread_with_retry(
+            self._read_header_row_sync, sheet_id, worksheet_name, op="sheets read_header"
         )
 
     async def list_worksheets(self, sheet_id: str) -> list[str]:
         """Return every worksheet (tab) name in the spreadsheet, in tab order.
         Used by the local runner's interactive tab picker."""
-        return await asyncio.to_thread(self._list_worksheets_sync, sheet_id)
+        return await self._to_thread_with_retry(
+            self._list_worksheets_sync, sheet_id, op="sheets list_worksheets"
+        )
 
     async def read_processed_row_nums(
         self, sheet_id: str, worksheet_name: str, *, layout: str
@@ -220,15 +315,22 @@ class SheetsClient:
             col = FOUR_IMAGES_COLS.ready_video_start
         else:
             return set()
-        return await asyncio.to_thread(
-            self._read_processed_row_nums_sync, sheet_id, worksheet_name, col
+        return await self._to_thread_with_retry(
+            self._read_processed_row_nums_sync,
+            sheet_id,
+            worksheet_name,
+            col,
+            op="sheets read_processed",
         )
 
     async def read_image_vo_rows(
         self, sheet_id: str, worksheet_name: str
     ) -> list[ImageVORow]:
-        data = await asyncio.to_thread(
-            self._read_all_values_sync, sheet_id, worksheet_name
+        data = await self._to_thread_with_retry(
+            self._read_all_values_sync,
+            sheet_id,
+            worksheet_name,
+            op="sheets read_image_vo",
         )
         rows: list[ImageVORow] = []
         if not data:
@@ -278,8 +380,11 @@ class SheetsClient:
     async def read_four_images_rows(
         self, sheet_id: str, worksheet_name: str
     ) -> list[FourImagesVO2Row]:
-        data = await asyncio.to_thread(
-            self._read_all_values_sync, sheet_id, worksheet_name
+        data = await self._to_thread_with_retry(
+            self._read_all_values_sync,
+            sheet_id,
+            worksheet_name,
+            op="sheets read_four_images",
         )
         rows: list[FourImagesVO2Row] = []
         if not data:
@@ -345,8 +450,11 @@ class SheetsClient:
         """Read the cartoon tab. Shares the Image-VO column layout, but the
         Manual Image column (D) is ignored — cartoon scenes are generated from
         scratch — so only the article URL is required."""
-        data = await asyncio.to_thread(
-            self._read_all_values_sync, sheet_id, worksheet_name
+        data = await self._to_thread_with_retry(
+            self._read_all_values_sync,
+            sheet_id,
+            worksheet_name,
+            op="sheets read_cartoon",
         )
         rows: list[CartoonRow] = []
         if not data:
@@ -432,8 +540,17 @@ class SheetsClient:
                 tab_type=tab_type,
                 cell_count=len(updates),
             )
-            await asyncio.to_thread(
-                self._batch_update_sync, sheet_id, worksheet, updates
+            # attempts=2 → at most one retry. batch_update is NOT idempotent;
+            # a 200 response that was lost on the wire and re-tried would
+            # double-write cells. The trade-off: absorb a single 429 / transient
+            # 500, but never blow past one attempt on a write.
+            await self._to_thread_with_retry(
+                self._batch_update_sync,
+                sheet_id,
+                worksheet,
+                updates,
+                op="sheets batch_update",
+                attempts=2,
             )
             total_cells += len(updates)
 

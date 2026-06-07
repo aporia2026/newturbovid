@@ -23,6 +23,7 @@ from google import genai
 from google.genai import types as gtypes
 from google.oauth2 import service_account
 
+from bulkvid.adapters._retry import with_retry
 from bulkvid.adapters.google_credentials import build_vertex_credentials_info
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
@@ -126,6 +127,48 @@ class GeminiTTSError(RuntimeError):
 
 class GeminiTTSNoAudioError(GeminiTTSError):
     """Response did not include any inline audio data."""
+
+
+class GeminiTTSRateLimitError(GeminiTTSError):
+    """Quota exhausted (429 / ResourceExhausted). Retryable."""
+
+
+class GeminiTTSServerError(GeminiTTSError):
+    """5xx from Vertex AI. Retryable."""
+
+
+class GeminiTTSTimeoutError(GeminiTTSError):
+    """Request didn't complete in time (DeadlineExceeded). Retryable."""
+
+
+class GeminiTTSConnectionError(GeminiTTSError):
+    """Network failed before the request landed. Retryable."""
+
+
+def _classify_gemini_error(exc: BaseException) -> BaseException:
+    """Map google-genai / google-api-core exceptions to our local hierarchy.
+
+    Match on type name + message rather than importing the SDK's exception
+    classes — the SDK reshuffles its error hierarchy between versions and an
+    ImportError at module load would brick every TTS call across the worker.
+
+    Returns either a fresh wrapped exception (retryable) or the original
+    exception unchanged (terminal).
+    """
+    name = type(exc).__name__
+    msg = str(exc).lower()
+
+    if name == "ResourceExhausted" or "429" in msg or "rate limit" in msg or "quota" in msg:
+        return GeminiTTSRateLimitError(str(exc))
+    if name == "DeadlineExceeded" or "deadline exceeded" in msg or "timed out" in msg:
+        return GeminiTTSTimeoutError(str(exc))
+    if name in {"ServiceUnavailable", "InternalServerError"} or any(
+        code in msg for code in (" 500 ", " 502 ", " 503 ", " 504 ")
+    ):
+        return GeminiTTSServerError(str(exc))
+    if name == "GoogleAPICallError" and "connection" in msg:
+        return GeminiTTSConnectionError(str(exc))
+    return exc
 
 
 # ── Result ───────────────────────────────────────────────────────────────────
@@ -273,10 +316,28 @@ class GeminiTTSClient:
             has_style=bool(style_prompt),
         )
 
-        response = await client.aio.models.generate_content(
-            model=self._model,
-            contents=prompt_text,
-            config=config,
+        async def _call() -> Any:
+            try:
+                return await client.aio.models.generate_content(
+                    model=self._model,
+                    contents=prompt_text,
+                    config=config,
+                )
+            except Exception as e:
+                wrapped = _classify_gemini_error(e)
+                if wrapped is e:
+                    raise
+                raise wrapped from e
+
+        response = await with_retry(
+            _call,
+            op="gemini tts",
+            retryable=(
+                GeminiTTSRateLimitError,
+                GeminiTTSServerError,
+                GeminiTTSTimeoutError,
+                GeminiTTSConnectionError,
+            ),
         )
 
         pcm = _extract_audio_bytes(response)

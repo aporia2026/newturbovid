@@ -700,3 +700,126 @@ async def test_shorten_voiceover_empty_returns_original() -> None:
         client, text=original, language="en", target_words=5
     )
     assert out.voiceover == original
+
+
+# ── Template selector integration ───────────────────────────────────────────
+
+
+class _FakeSettingsStore:
+    """Minimal async settings-store stub for the selector tests."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+
+    async def get(self, key: str, default: str | None = None) -> str:
+        return self._values.get(key, default if default is not None else "")
+
+
+@respx.mock
+async def test_cartoon_blank_script_pattern_uses_selected_template() -> None:
+    """Blank script_pattern + enabled selector → the chosen template body is
+    appended as ``Preferred opening style: <body>.``"""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    library_json = json.dumps(
+        {
+            "version": 1,
+            "templates": [
+                {"id": "alpha", "name": "Alpha", "hint": "h",
+                 "body": "ALPHA_BODY"},
+                {"id": "beta", "name": "Beta", "hint": "h",
+                 "body": "BETA_BODY"},
+            ],
+        }
+    )
+
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        # First (selector) call: any system message containing the routing
+        # phrase. Second (planner) call: the actual cartoon plan.
+        if any("routing assistant" in m.get("content", "") for m in body["messages"]):
+            return httpx.Response(
+                200,
+                json=_chat_resp(json.dumps({"template_id": "alpha", "reason": "fits"})),
+            )
+        return httpx.Response(
+            200, json=_chat_resp(_good_plan_json(2, 2))
+        )
+
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(side_effect=_handler)
+
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "true",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    client = OpenAIClient(api_key="sk-test")
+    plan = await generate_cartoon_plan(
+        client,
+        article_body="Article body content.",
+        country="US", vertical="news", language="en",
+        script_pattern="",
+        open_comments=_analysis(),
+        settings_store=store,    # type: ignore[arg-type]
+    )
+
+    assert len(plan.ideas) == 2
+    # Two calls: selector + planner.
+    assert len(captured) == 2
+    planner_system = captured[-1]["messages"][0]["content"]
+    assert "Preferred opening style: ALPHA_BODY" in planner_system
+
+
+@respx.mock
+async def test_cartoon_filled_script_pattern_skips_selector() -> None:
+    """Existing behavior unchanged for filled script_pattern columns."""
+    from bulkvid.orchestrator.runtime_settings import (
+        SETTING_SCRIPT_TEMPLATE_LIBRARY,
+        SETTING_TEMPLATE_SELECTOR_ENABLED,
+    )
+
+    library_json = json.dumps(
+        {"version": 1, "templates": [
+            {"id": "alpha", "name": "Alpha", "hint": "h", "body": "ALPHA_BODY"},
+            {"id": "beta", "name": "Beta", "hint": "h", "body": "BETA_BODY"},
+        ]}
+    )
+
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_resp(_good_plan_json(2, 2)))
+
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(side_effect=_handler)
+
+    store = _FakeSettingsStore(
+        {
+            SETTING_TEMPLATE_SELECTOR_ENABLED: "true",
+            SETTING_SCRIPT_TEMPLATE_LIBRARY: library_json,
+        }
+    )
+
+    client = OpenAIClient(api_key="sk-test")
+    await generate_cartoon_plan(
+        client,
+        article_body="x",
+        country="US", vertical="news", language="en",
+        script_pattern="How To",
+        open_comments=_analysis(),
+        settings_store=store,    # type: ignore[arg-type]
+    )
+
+    # Only the planner call — selector skipped.
+    assert len(captured) == 1
+    planner_system = captured[0]["messages"][0]["content"]
+    assert "Preferred opening style: How To" in planner_system
+    assert "ALPHA_BODY" not in planner_system

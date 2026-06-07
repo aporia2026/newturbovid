@@ -33,11 +33,18 @@ from bulkvid.logging import get_logger
 from bulkvid.orchestrator.runtime_settings import (
     CARTOON_PLANNER_PROMPT_DEFAULT,
     SETTING_CARTOON_PLANNER_PROMPT,
+    SETTING_SCRIPT_TEMPLATE_LIBRARY,
     SETTING_SENSITIVE_APPAREL_RULES,
+    SETTING_TEMPLATE_SELECTOR_ENABLED,
 )
 from bulkvid.orchestrator.settings_store import SettingsStore
 from bulkvid.pipeline.open_comments import OpenCommentsAnalysis
 from bulkvid.pipeline.safety import SAFE, SafetyContext, append_safety_block
+from bulkvid.pipeline.template_selector import (
+    TemplateLibraryParseError,
+    parse_library,
+    select_default_template,
+)
 
 _log = get_logger("cartoonprompt")
 
@@ -396,6 +403,57 @@ def _coerce_ideas(
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
+async def _maybe_select_cartoon_template(
+    client: OpenAIClient,
+    *,
+    settings_store: SettingsStore,
+    vertical: str,
+    country: str,
+    article_body: str,
+    safety: SafetyContext,
+):    # -> Template | None
+    """Cartoon-side wrapper around the shared template selector.
+
+    Mirrors ``script_gen._maybe_select_template`` so cartoon and script tabs
+    share the same library + enable-switch semantics. Any failure path
+    returns ``None`` and the planner proceeds without a template.
+    """
+    enabled_raw = await settings_store.get(
+        SETTING_TEMPLATE_SELECTOR_ENABLED, default="true"
+    )
+    if enabled_raw.strip().lower() not in {"true", "1", "yes", "on"}:
+        _log.info("template_selector_disabled", surface="cartoon")
+        return None
+
+    library_raw = await settings_store.get(
+        SETTING_SCRIPT_TEMPLATE_LIBRARY, default=""
+    )
+    try:
+        library = parse_library(library_raw)
+    except TemplateLibraryParseError as e:
+        _log.warning("template_library_parse_failed", surface="cartoon", error=str(e))
+        return None
+
+    if not library.enabled_templates():
+        _log.info("template_library_empty", surface="cartoon")
+        return None
+
+    body = (article_body or "").strip()
+    first_line = body.splitlines()[0].strip() if body else ""
+    article_title = first_line[:200]
+    article_excerpt = body[:600]
+
+    return await select_default_template(
+        client,
+        library=library,
+        vertical=vertical,
+        country=country,
+        article_title=article_title,
+        article_excerpt=article_excerpt,
+        safety=safety,
+    )
+
+
 async def generate_cartoon_plan(
     client: OpenAIClient,
     *,
@@ -439,8 +497,23 @@ async def generate_cartoon_plan(
         num_ideas=num_ideas,
         num_shots=num_shots,
     )
-    if script_pattern.strip():
-        system += f"\n\nPreferred opening style: {script_pattern.strip()}."
+    # Blank script_pattern → ask the selector for a default template body.
+    # Cartoon shares the same library as the script tabs (Yoav 2026-06-07,
+    # answer 3 in the open-questions block).
+    effective_pattern = script_pattern.strip()
+    if not effective_pattern and settings_store is not None:
+        chosen = await _maybe_select_cartoon_template(
+            client,
+            settings_store=settings_store,
+            vertical=vertical,
+            country=country,
+            article_body=article_body,
+            safety=safety,
+        )
+        if chosen is not None:
+            effective_pattern = chosen.body.strip()
+    if effective_pattern:
+        system += f"\n\nPreferred opening style: {effective_pattern}."
     system = append_safety_block(system, safety, safety_block)
     if safety.matched:
         _log.info(

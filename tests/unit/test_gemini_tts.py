@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from bulkvid.adapters import _retry
 from bulkvid.adapters.gemini_tts import (
     COST_GEMINI_TTS_PER_CHAR_USD,
     DEFAULT_VOICE,
@@ -32,11 +33,59 @@ from bulkvid.adapters.gemini_tts import (
     VOICE_BY_LANGUAGE,
     GeminiTTSClient,
     GeminiTTSNoAudioError,
+    GeminiTTSRateLimitError,
+    GeminiTTSServerError,
+    GeminiTTSTimeoutError,
     accent_directive,
     pcm_duration_seconds,
     pick_voice,
     wrap_pcm_to_wav,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep_between_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every retry sleep instant so the suite stays fast."""
+
+    async def _instant(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(_retry.asyncio, "sleep", _instant)
+
+
+# Stand-in exception names that match what the google-api-core SDK uses.
+# Defining them locally keeps the test suite from importing google-api-core
+# (the classifier identifies by type name + message, not by isinstance).
+
+
+class ResourceExhausted(Exception):
+    pass
+
+
+class DeadlineExceeded(Exception):
+    pass
+
+
+class ServiceUnavailable(Exception):
+    pass
+
+
+def _make_failing_client(exc: Exception) -> SimpleNamespace:
+    """Build a fake client whose ``generate_content`` always raises ``exc``."""
+    generate = AsyncMock(side_effect=exc)
+    return SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+    )
+
+
+def _make_eventually_succeeding_client(
+    exc: Exception, response: SimpleNamespace
+) -> SimpleNamespace:
+    """Fake client: raises ``exc`` once, then returns ``response`` forever."""
+    generate = AsyncMock(side_effect=[exc, response])
+    return SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+    )
 
 
 def _make_fake_response(pcm: bytes) -> SimpleNamespace:
@@ -222,3 +271,62 @@ async def test_synthesize_honors_voice_override() -> None:
 
 def test_cost_constant_positive() -> None:
     assert COST_GEMINI_TTS_PER_CHAR_USD > 0
+
+
+# ── Retry behavior ──────────────────────────────────────────────────────────
+
+
+async def test_synthesize_retries_on_resource_exhausted_then_succeeds() -> None:
+    pcm = b"\x00" * 4000
+    response = _make_fake_response(pcm)
+    fake_client = _make_eventually_succeeding_client(
+        ResourceExhausted("quota exceeded"), response
+    )
+
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+    result = await tts.synthesize(text="hello world", language="en")
+
+    assert result.wav_bytes[:4] == b"RIFF"
+    assert fake_client.aio.models.generate_content.await_count == 2
+
+
+async def test_synthesize_exhausts_then_raises_rate_limit() -> None:
+    fake_client = _make_failing_client(ResourceExhausted("quota exceeded"))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    with pytest.raises(GeminiTTSRateLimitError):
+        await tts.synthesize(text="hello", language="en")
+
+    assert fake_client.aio.models.generate_content.await_count == 3
+
+
+async def test_synthesize_retries_on_deadline_exceeded() -> None:
+    fake_client = _make_failing_client(DeadlineExceeded("deadline exceeded"))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    with pytest.raises(GeminiTTSTimeoutError):
+        await tts.synthesize(text="hello", language="en")
+
+    assert fake_client.aio.models.generate_content.await_count == 3
+
+
+async def test_synthesize_retries_on_service_unavailable() -> None:
+    fake_client = _make_failing_client(ServiceUnavailable("503 service unavailable"))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    with pytest.raises(GeminiTTSServerError):
+        await tts.synthesize(text="hello", language="en")
+
+    assert fake_client.aio.models.generate_content.await_count == 3
+
+
+async def test_synthesize_does_not_retry_unknown_error() -> None:
+    # A garden-variety ValueError isn't recognised as retryable; the classifier
+    # leaves it alone and it bubbles immediately.
+    fake_client = _make_failing_client(ValueError("you handed in nonsense"))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    with pytest.raises(ValueError):
+        await tts.synthesize(text="hello", language="en")
+
+    assert fake_client.aio.models.generate_content.await_count == 1
