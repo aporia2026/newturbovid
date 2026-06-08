@@ -409,12 +409,19 @@ async def process_image_vo_row(
         # ─── Stage 12 (optional): ZapCap ───
 
         if row.zapcap and clients.zapcap is not None:
+            # ZapCap bills per second of rendered output. The VO drives the
+            # video length; ``vo_duration_seconds`` was stamped onto
+            # ``metadata`` inside ``_script_side()`` above. Fall back to the
+            # silent-video default when VO is off.
+            vo_duration = float(metadata.get("vo_duration_seconds") or 10.0)
+
             async def _caption(idx: int, video_url: str) -> str:
                 video_bytes = await _download(video_url, timeout=180.0)
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=language,
                     filename=f"v{idx + 1}.mp4",
+                    video_duration_seconds=vo_duration,
                 )
                 costs.zapcap += cost
                 cap_bytes = await _download(cap_url, timeout=180.0)

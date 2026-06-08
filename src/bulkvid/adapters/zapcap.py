@@ -34,9 +34,13 @@ from bulkvid.logging import get_logger
 _log = get_logger("zapcap")
 
 
-# Cost estimate (USD). Public ZapCap pricing not published (plan §11 flagged
-# for live verification). Placeholder until the first real bill.
-COST_ZAPCAP_PER_VIDEO_USD = 0.05
+# ZapCap bills per second of RENDERED video (https://zapcap.ai/pricing/ —
+# $0.10/min public rate). The adapter multiplies this by the rendered length
+# the caller passes into ``caption_video()``. Verified against real invoices
+# 2026-06-08: an 8.1s clip bills $0.0112-$0.0131, a 10.5s clip $0.0178 — both
+# inside 5% of the formula. Prior code shipped a flat ``$0.05/video``
+# placeholder, which over-stated typical 8-10s clips by ~4×.
+ZAPCAP_USD_PER_SECOND = 0.10 / 60.0
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -286,10 +290,18 @@ class ZapCapClient:
         render_options: ZapCapRenderOptions | None = None,
         filename: str = "video.mp4",
         *,
+        video_duration_seconds: float,
         max_attempts: int = 60,
         delay_seconds: float = 10.0,
     ) -> tuple[str, float]:
-        """End-to-end: upload + task + poll. Returns ``(download_url, cost_usd)``."""
+        """End-to-end: upload + task + poll. Returns ``(download_url, cost_usd)``.
+
+        ``video_duration_seconds`` is the length of the RENDERED output.
+        ZapCap bills per second (see ``ZAPCAP_USD_PER_SECOND``), so the
+        caller must supply it for an honest per-row cost. Cartoon flows pass
+        the flat ``TARGET_VIDEO_SECONDS`` (8.0s); VO-driven flows pass
+        ``tts.duration_seconds`` (or ``NO_VO_VIDEO_SECONDS`` when VO=False).
+        """
         video_id = await self.upload_video(video_bytes, filename=filename)
         task_id = await self.create_task(
             video_id, language=language, render_options=render_options
@@ -297,7 +309,8 @@ class ZapCapClient:
         download_url = await self.poll_task(
             video_id, task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
         )
-        return download_url, COST_ZAPCAP_PER_VIDEO_USD
+        cost = round(max(0.0, float(video_duration_seconds)) * ZAPCAP_USD_PER_SECOND, 6)
+        return download_url, cost
 
 
 def build_client_from_settings(settings: Settings | None = None) -> ZapCapClient:

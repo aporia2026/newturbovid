@@ -478,6 +478,7 @@ async def process_cartoon_row(
                             video_bytes=data,
                             language=lang.language,
                             filename=f"v{idx + 1}.mp4",
+                            video_duration_seconds=target_video_seconds,
                         )
                         costs.zapcap += cost
                         cap_bytes = await _download(cap_url, timeout=180.0)

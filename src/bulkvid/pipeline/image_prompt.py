@@ -107,6 +107,65 @@ def _collage_user_message(description: str, article_excerpt: str = "") -> str:
     )
 
 
+def _collage_user_message_no_text(description: str, article_excerpt: str = "") -> str:
+    """Same 2x2 grid request as the default, but the caller will draw the
+    headline + CTA themselves with Pillow later — so we explicitly ask kie
+    to leave the cells text-free. Otherwise the Pillow overlay would sit on
+    top of kie-baked text and produce visible double-text artifacts.
+
+    Used by the simple_x4 row processor when at least one card on the row
+    has a chosen template_id. Plan
+    ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.2 (R1).
+    """
+    article_block = (
+        "ARTICLE CONTEXT (the new photos must depict subjects relevant to THIS "
+        "article — not necessarily whatever the inspiration photo happened to "
+        f"show):\n{article_excerpt.strip()}\n\n"
+        if article_excerpt.strip()
+        else ""
+    )
+    return (
+        f"Inspiration ad analysis:\n{description}\n\n"
+        f"{article_block}"
+        "Produce ONE image that is a STRICT 2x2 GRID — 2 equal columns and 2 equal "
+        "rows = 4 cells of IDENTICAL size that tile perfectly:\n"
+        "  TOP-LEFT = Panel 1 | TOP-RIGHT = Panel 2\n"
+        "  BOTTOM-LEFT = Panel 3 | BOTTOM-RIGHT = Panel 4\n"
+        "The grid lines sit EXACTLY at the horizontal and vertical centre, so the "
+        "image splits cleanly into 4 equal quarters with a thin neutral divider.\n\n"
+        "Each cell is its OWN complete, self-contained vertical photo. CRITICAL: "
+        "do NOT draw one big photo across the whole image, do NOT stack photos in a "
+        "single column.\n\n"
+        "NO TEXT ON THE PHOTOS — STRICT:\n"
+        "- Do NOT draw any headline, sub-text, call-to-action, button, label, "
+        "caption, sticker, or any other written/typeset words on the cells.\n"
+        "- Do NOT include legible signage, license plates, document text, screen "
+        "text, banner text, or any other readable words in the photographic content.\n"
+        "- The cells must be CLEAN PHOTOS only — every text overlay will be added "
+        "afterwards in post-processing.\n"
+        "- IGNORE the inspiration ad's headline and CTA entirely; do not reproduce "
+        "them. They are NOT part of this output.\n\n"
+        "PHOTOGRAPHIC CONTENT:\n"
+        "- In each cell, produce a realistic photo that fits the article context "
+        "above (or, with no article context, the same subject as the inspiration). "
+        "Vary the photo across the 4 cells.\n\n"
+        "NO REAL BRANDS (strict — legal requirement):\n"
+        "- The imagery must contain NO real brand logos, trademarks, brand names, "
+        "badges, or recognisable branding — not even if the inspiration shows them.\n\n"
+        "FORMAT your response exactly like this and nothing else:\n"
+        "Create a single image that is a STRICT 2x2 grid (2 equal columns, 2 equal rows, "
+        "4 identical-size cells, thin neutral divider). Each cell is a clean realistic "
+        "photo with NO text, NO headline, NO CTA, NO captions, NO signage text, NO "
+        "readable words anywhere. Text will be added later in post-processing.\n"
+        "TOP-LEFT cell photo: [new article-relevant scene, no text].\n"
+        "TOP-RIGHT cell photo: [new article-relevant scene, no text].\n"
+        "BOTTOM-LEFT cell photo: [new article-relevant scene, no text].\n"
+        "BOTTOM-RIGHT cell photo: [new article-relevant scene, no text].\n"
+        "The 4 cells are equal and tile perfectly; no single full-image photo; no stacking; "
+        "ZERO text anywhere in any cell; no real brands."
+    )
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -144,18 +203,33 @@ async def build_collage_prompt(
     *,
     settings_store: SettingsStore | None = None,
     safety: SafetyContext = SAFE,
+    skip_text: bool = False,
 ) -> tuple[str, float]:
     """gpt-5.4-mini builds the 2x2 collage prompt. Returns ``(prompt, cost_usd)``.
 
-    Keeps the inspiration's headline + CTA + layout verbatim and changes ONLY the
-    photo; ``article_excerpt`` (when given) grounds the new photo in the article
+    Default mode (``skip_text=False``): keeps the inspiration's headline + CTA +
+    layout verbatim and changes ONLY the photo; the kie output IS the finished
+    marketing card.
+
+    ``skip_text=True`` mode: asks kie for CLEAN photographic cells with NO
+    headline / CTA / overlay text. Used by the simple_x4 card-template path,
+    which draws its own headline + CTA via Pillow afterwards — without this
+    flag those overlays would sit on top of kie-baked text and produce
+    double-text artifacts. Plan
+    ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.2 (R1).
+
+    ``article_excerpt`` (when given) grounds the new photo in the article
     topic rather than whatever the inspiration photo happened to show.
 
     When ``safety.matched`` the admin's sensitive-apparel safety block is
     appended to the user message before the LLM call, so the generated image
     description forces product-only frames with no humans.
     """
-    user_message = _collage_user_message(description, article_excerpt)
+    user_message = (
+        _collage_user_message_no_text(description, article_excerpt)
+        if skip_text
+        else _collage_user_message(description, article_excerpt)
+    )
     if safety.matched and settings_store is not None:
         # No explicit default — let the store fall through to the registered
         # default (``SENSITIVE_APPAREL_RULES_DEFAULT``).
@@ -173,6 +247,7 @@ async def build_collage_prompt(
         description_chars=len(description),
         article_chars=len(article_excerpt),
         safety_matched=safety.matched,
+        skip_text=skip_text,
     )
     result = await client.chat(
         model=model,

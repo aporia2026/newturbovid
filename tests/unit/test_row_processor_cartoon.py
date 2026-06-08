@@ -145,7 +145,11 @@ class _FakeRendi:
 
 
 class _FakeZapCap:
-    async def caption_video(self, video_bytes, language, filename):
+    async def caption_video(self, video_bytes, language, filename, *, video_duration_seconds):
+        # The real adapter charges ``video_duration_seconds * $0.10/60`` —
+        # return a deterministic constant here so cost assertions stay stable
+        # across cartoon-flow changes, but accept the new kwarg so the
+        # row processor's call passes through.
         return f"https://zc.test/{filename}", 0.1
 
 

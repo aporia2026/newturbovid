@@ -240,6 +240,9 @@ async def process_simple_row(
                     video_bytes=video_bytes,
                     language=lang.language,
                     filename="v1.mp4",
+                    video_duration_seconds=(
+                        tts.duration_seconds if row.voice_over else 10.0
+                    ),
                 )
                 costs.zapcap += cost
                 cap_bytes = await _download(cap_url, timeout=180.0)

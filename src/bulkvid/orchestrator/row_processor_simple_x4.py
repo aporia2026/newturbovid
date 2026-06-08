@@ -67,6 +67,7 @@ from bulkvid.pipeline.card_renderer import (
     TEMPLATE_2,
     render_card_bytes,
 )
+from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.headline_gen import generate_card_headline
 from bulkvid.pipeline.image_gen import edit_with_fallback
 from bulkvid.pipeline.image_prompt import build_collage_prompt, describe_source_image
@@ -153,14 +154,17 @@ async def _resolve_card_runtime(
     clients: PipelineClients,
     cards: list[CardChoice],
 ) -> tuple[bool, dict[str, str]]:
-    """Return ``(enabled, default_cta_by_template)``.
+    """Return ``(enabled, admin_cta_override_by_template)``.
 
     ``enabled`` is the master switch from settings. When False or when no
     card has a non-blank template_id, the caller skips the overlay step
-    entirely.
+    entirely (the row renders exactly like legacy image_vo).
 
-    ``default_cta_by_template`` maps "1" / "2" to the per-template default
-    CTA, used when a card's CTA cell is blank.
+    ``admin_cta_override_by_template`` maps "1" / "2" to the admin's
+    custom per-template default CTA from the settings store. When empty
+    (which is the registry default), the per-language "Learn More" fallback
+    in ``_resolve_cta_for_card`` wins instead. Plan
+    ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.5.
     """
     if not any(c.template_id for c in cards):
         return (False, {})
@@ -169,9 +173,31 @@ async def _resolve_card_runtime(
     if not enabled:
         return (False, {})
 
-    default_1 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_1_DEFAULT_CTA) or ""
-    default_2 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_2_DEFAULT_CTA) or ""
-    return (True, {TEMPLATE_1: default_1, TEMPLATE_2: default_2})
+    override_1 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_1_DEFAULT_CTA) or ""
+    override_2 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_2_DEFAULT_CTA) or ""
+    return (True, {TEMPLATE_1: override_1, TEMPLATE_2: override_2})
+
+
+def _resolve_cta_for_card(
+    card: CardChoice,
+    *,
+    admin_override: str,
+    language: str,
+) -> str:
+    """Pick the CTA text for one card. Fallback chain:
+
+      1. Operator-typed CTA cell on the row (if non-empty).
+      2. Admin's per-template override from the settings store (if set).
+      3. "Learn More" phrased naturally for ``language`` (per-language table).
+
+    A non-empty result is always returned — the renderer never gets an
+    empty string, so the CTA pill is always drawn. Yoav 2026-06-08.
+    """
+    if card.cta:
+        return card.cta
+    if admin_override:
+        return admin_override
+    return default_cta_for_language(language)
 
 
 def _apply_card_overlay(
@@ -179,13 +205,18 @@ def _apply_card_overlay(
     card: CardChoice,
     *,
     headline: str,
-    default_cta_by_template: dict[str, str],
+    admin_cta_override_by_template: dict[str, str],
+    language: str,
     aspect_ratio: str,
 ) -> bytes:
     """Apply the overlay for one quadrant. Pure CPU — runs in a thread pool."""
     if not card.template_id or card.template_id not in SUPPORTED_TEMPLATES:
         return quadrant_bytes
-    cta = card.cta or default_cta_by_template.get(card.template_id, "")
+    cta = _resolve_cta_for_card(
+        card,
+        admin_override=admin_cta_override_by_template.get(card.template_id, ""),
+        language=language,
+    )
     width, height = dimensions_for_ratio(aspect_ratio)
     return render_card_bytes(
         template_id=card.template_id,
@@ -245,8 +276,8 @@ async def process_simple_x4_row(
         any_card_template=any(c.template_id for c in row.cards),
     )
 
-    # Resolve master switch + default CTAs once per row.
-    cards_enabled, default_cta_by_template = await _resolve_card_runtime(
+    # Resolve master switch + admin CTA overrides once per row.
+    cards_enabled, admin_cta_override_by_template = await _resolve_card_runtime(
         clients, row.cards
     )
     metadata["card_overlay_enabled"] = cards_enabled
@@ -304,46 +335,90 @@ async def process_simple_x4_row(
         metadata["safety_keyword"] = safety.matched_keyword
 
         # ─── Stages 2 + 8 (parallel): image side + script side ────────────
+        #
+        # kie generates 4 cells as ONE 2x2 collage — there's no per-cell text
+        # control. So when a row mixes templated cells (which need a CLEAN
+        # photo so the Pillow overlay below doesn't double the text) with
+        # blank cells (which keep today's kie-baked headline/CTA style), we
+        # generate TWO collages in parallel and pick per-quadrant. When ALL
+        # cells are templated OR ALL are blank, we generate only the one
+        # collage we need — no extra kie cost.
+
+        any_templated = cards_enabled and any(c.template_id for c in row.cards)
+        any_blank = (not cards_enabled) or any(not c.template_id for c in row.cards)
+        metadata["card_collage_normal"] = any_blank
+        metadata["card_collage_clean"] = any_templated
 
         async def _image_side() -> list[bytes] | Exception:
             try:
-                description, c1 = await describe_source_image(clients.openai, source_b64)
+                description, c1 = await describe_source_image(
+                    clients.openai, source_b64
+                )
                 costs.vision += c1
 
-                collage_prompt, c2 = await build_collage_prompt(
-                    clients.openai,
-                    description,
-                    article_excerpt=article_body[:1500],
-                    settings_store=clients.settings_store,
-                    safety=safety,
-                )
-                costs.collage_prompt += c2
-
-                collage_url, c3 = await edit_with_fallback(
-                    kie=clients.kie,
-                    atlas=clients.atlas,
-                    source_image_url=source_url,
-                    prompt=collage_prompt,
-                    aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
-                )
-                costs.image_gen += c3
-
-                upscaled_url, c4 = await recraft_crisp_upscale(clients.kie, collage_url)
-                costs.upscale += c4
-
-                upscaled_bytes = await _download(upscaled_url, timeout=120.0)
-                quadrants = split_collage_2x2(
-                    upscaled_bytes, edge_crop_pixels=edge_crop_pixels
-                )
-                if len(quadrants) != 4:
-                    raise RuntimeError(
-                        f"split_collage_2x2 returned {len(quadrants)} quadrants"
+                async def _one_collage(skip_text: bool) -> list[bytes]:
+                    """Build one 2x2 collage (text or clean) and return its 4
+                    optimized quadrants. Shares the source description so we
+                    only run gpt-4o vision once per row."""
+                    collage_prompt, c2 = await build_collage_prompt(
+                        clients.openai,
+                        description,
+                        article_excerpt=article_body[:1500],
+                        settings_store=clients.settings_store,
+                        safety=safety,
+                        skip_text=skip_text,
                     )
+                    costs.collage_prompt += c2
 
-                optimized = await asyncio.gather(
-                    *[asyncio.to_thread(_optimize_pil_bytes, q) for q in quadrants]
+                    collage_url, c3 = await edit_with_fallback(
+                        kie=clients.kie,
+                        atlas=clients.atlas,
+                        source_image_url=source_url,
+                        prompt=collage_prompt,
+                        aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+                    )
+                    costs.image_gen += c3
+
+                    upscaled_url, c4 = await recraft_crisp_upscale(
+                        clients.kie, collage_url
+                    )
+                    costs.upscale += c4
+
+                    upscaled_bytes = await _download(upscaled_url, timeout=120.0)
+                    quads = split_collage_2x2(
+                        upscaled_bytes, edge_crop_pixels=edge_crop_pixels
+                    )
+                    if len(quads) != 4:
+                        raise RuntimeError(
+                            f"split_collage_2x2 returned {len(quads)} quadrants"
+                        )
+                    optimized = await asyncio.gather(
+                        *[asyncio.to_thread(_optimize_pil_bytes, q) for q in quads]
+                    )
+                    return list(optimized)
+
+                normal_task: asyncio.Task[list[bytes]] | None = (
+                    asyncio.create_task(_one_collage(skip_text=False))
+                    if any_blank
+                    else None
                 )
-                return list(optimized)
+                clean_task: asyncio.Task[list[bytes]] | None = (
+                    asyncio.create_task(_one_collage(skip_text=True))
+                    if any_templated
+                    else None
+                )
+                normal_quads = await normal_task if normal_task else None
+                clean_quads = await clean_task if clean_task else None
+
+                final_quads: list[bytes] = []
+                for i, card in enumerate(row.cards):
+                    if cards_enabled and card.template_id:
+                        assert clean_quads is not None
+                        final_quads.append(clean_quads[i])
+                    else:
+                        assert normal_quads is not None
+                        final_quads.append(normal_quads[i])
+                return final_quads
             except Exception as e:
                 return e
 
@@ -449,7 +524,8 @@ async def process_simple_x4_row(
                             quadrants[i],
                             row.cards[i],
                             headline=headline,
-                            default_cta_by_template=default_cta_by_template,
+                            admin_cta_override_by_template=admin_cta_override_by_template,
+                            language=language,
                             aspect_ratio=row.aspect_ratio,
                         )
                         for i in range(4)
@@ -543,12 +619,19 @@ async def process_simple_x4_row(
         # ─── Stage 12 (optional): ZapCap ──────────────────────────────────
 
         if row.zapcap and clients.zapcap is not None:
+            # ZapCap bills per second of rendered output. The VO drives the
+            # video length; ``vo_duration_seconds`` was stamped onto
+            # ``metadata`` inside ``_script_side()`` above. Fall back to the
+            # silent-video default when VO is off.
+            vo_duration = float(metadata.get("vo_duration_seconds") or 10.0)
+
             async def _caption(idx: int, video_url: str) -> str:
                 video_bytes = await _download(video_url, timeout=180.0)
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=language,
                     filename=f"v{idx + 1}.mp4",
+                    video_duration_seconds=vo_duration,
                 )
                 costs.zapcap += cost
                 cap_bytes = await _download(cap_url, timeout=180.0)

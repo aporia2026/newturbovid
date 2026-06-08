@@ -395,24 +395,25 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
     ),
     SettingDef(
         key=SETTING_CARD_TEMPLATE_1_DEFAULT_CTA,
-        label="Card template 1: default CTA",
-        default="DISCOVER MORE >>",
+        label="Card template 1: CTA override (optional)",
+        default="",
         multiline=False,
         description=(
-            "Fallback CTA text drawn on the Template 1 pill when the row's "
-            "CTA cell is blank. Set to empty to render the card with no "
-            "pill at all when both are blank."
+            "Optional admin override for the Template 1 CTA. Leave empty "
+            "(default) to use the per-language \"Learn More\" fallback "
+            "(e.g. \"Saber Más >>\" in Spanish, \"Mehr Erfahren >>\" in "
+            "German). Set a value here to force a custom default for "
+            "every blank Template 1 CTA cell across all languages."
         ),
     ),
     SettingDef(
         key=SETTING_CARD_TEMPLATE_2_DEFAULT_CTA,
-        label="Card template 2: default CTA",
-        default="See The Full Guide >>",
+        label="Card template 2: CTA override (optional)",
+        default="",
         multiline=False,
         description=(
-            "Fallback CTA text drawn on the Template 2 pill when the row's "
-            "CTA cell is blank. Set to empty to render the card with no "
-            "pill at all when both are blank."
+            "Optional admin override for the Template 2 CTA. Same fallback "
+            "behavior as Template 1 above."
         ),
     ),
     SettingDef(

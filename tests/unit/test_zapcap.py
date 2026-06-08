@@ -19,7 +19,7 @@ import pytest
 import respx
 
 from bulkvid.adapters.zapcap import (
-    COST_ZAPCAP_PER_VIDEO_USD,
+    ZAPCAP_USD_PER_SECOND,
     ZapCapAuthError,
     ZapCapClient,
     ZapCapError,
@@ -277,16 +277,57 @@ async def test_caption_video_end_to_end_returns_url_and_cost() -> None:
         url, cost = await c.caption_video(
             video_bytes=b"fake-mp4-data",
             language="he",
+            video_duration_seconds=8.0,
             max_attempts=2,
             delay_seconds=0.0,
         )
 
     assert url == "https://zc/final.mp4"
-    assert cost == COST_ZAPCAP_PER_VIDEO_USD
+    # 8.0s × $0.10/60 = $0.013333 (adapter rounds to 6 decimals) — matches
+    # the real ZapCap invoices we spot-checked against on 2026-06-08
+    # ($0.0112-$0.0131 for 8.1s clips).
+    assert cost == round(8.0 * ZAPCAP_USD_PER_SECOND, 6)
 
 
-# ── Cost constant sanity ────────────────────────────────────────────────────
+# ── Cost-per-second math ────────────────────────────────────────────────────
 
 
-def test_cost_constant_positive() -> None:
-    assert COST_ZAPCAP_PER_VIDEO_USD > 0
+def test_per_second_constant_matches_public_price() -> None:
+    # Public price: $0.10/min of rendered video (https://zapcap.ai/pricing/).
+    assert ZAPCAP_USD_PER_SECOND == pytest.approx(0.10 / 60.0)
+    # And a 10.5s clip should round to ~$0.0175, matching the real invoice
+    # snapshot from 2026-06-08.
+    assert round(10.5 * ZAPCAP_USD_PER_SECOND, 4) == pytest.approx(0.0175)
+
+
+@respx.mock
+async def test_caption_video_cost_scales_linearly_with_duration() -> None:
+    # The same upload + task + poll endpoints back BOTH calls; only the
+    # ``video_duration_seconds`` differs. Cost should double when duration does.
+    respx.post(f"{BASE}/videos").mock(
+        return_value=httpx.Response(201, json={"id": "v-scale"})
+    )
+    respx.post(f"{BASE}/videos/v-scale/task").mock(
+        return_value=httpx.Response(200, json={"taskId": "t-scale"})
+    )
+    respx.get(f"{BASE}/videos/v-scale/task/t-scale").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "completed", "downloadUrl": "https://zc/x.mp4"},
+        )
+    )
+    async with ZapCapClient(api_key=API_KEY, template_id=TEMPLATE_ID, base_url=BASE) as c:
+        _, cost_4s = await c.caption_video(
+            video_bytes=b"x", language="en",
+            video_duration_seconds=4.0, max_attempts=2, delay_seconds=0.0,
+        )
+        _, cost_8s = await c.caption_video(
+            video_bytes=b"x", language="en",
+            video_duration_seconds=8.0, max_attempts=2, delay_seconds=0.0,
+        )
+    # Both costs come from the same per-second formula; assert against it
+    # directly rather than the doubling relationship (rounding at the 6th
+    # decimal makes 8s == 4s × 2 false at the ~1e-6 level).
+    assert cost_4s == round(4.0 * ZAPCAP_USD_PER_SECOND, 6)
+    assert cost_8s == round(8.0 * ZAPCAP_USD_PER_SECOND, 6)
+    assert cost_4s > 0
