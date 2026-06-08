@@ -171,9 +171,31 @@ class SettingsStore:
             return self._cache
         async with self._lock:
             if not self._cache or (time.monotonic() - self._cache_loaded_at) >= self._cache_ttl:
-                self._cache = await asyncio.to_thread(self._load_sync)
+                # Turso/Hrana cold-start: the very first SELECT after a
+                # fresh container boot occasionally fails with
+                # ``Hrana: api error: status=400 ... invalid token``
+                # (job-1780936528-524e40fb killed an entire row this way).
+                # The retry path almost always succeeds — a short backoff
+                # is enough. Re-raise only if both attempts fail so the
+                # row processor still surfaces a real failure.
+                self._cache = await asyncio.to_thread(
+                    self._load_sync_with_retry
+                )
                 self._cache_loaded_at = time.monotonic()
         return self._cache
+
+    def _load_sync_with_retry(self) -> dict[str, str]:
+        """``_load_sync`` with one cold-start retry. See ``_ensure_cache``."""
+        try:
+            return self._load_sync()
+        except Exception as e:    # broad: libSQL raises ValueError, sqlite3 raises OperationalError
+            _log.warning(
+                "settings_store_load_retry",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
+            time.sleep(0.5)
+            return self._load_sync()
 
     async def get(self, key: str, default: str | None = None) -> str:
         """Return the stored value if present, else default, else the registered default."""

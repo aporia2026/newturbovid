@@ -811,12 +811,35 @@ async def shorten_voiceover(
         )
         return ShortenResult(voiceover=text, cost_usd=result.cost_usd)
 
-    # Hard cap to target_words in case the model went slightly over. The
-    # cap returns "" when truncation lands mid-thought (no real sentence
-    # boundary inside the cap). Either way, the result must end on .!? —
-    # otherwise we'd ship a fragment, which is the bug this whole helper
-    # exists to prevent. Fall back to the original on either failure so
-    # the caller drops the idea (matches the existing "no change" path).
+    # Trust the model's output when it's close to target AND ends cleanly.
+    # The hard-cap path was eating valid shortenings: e.g. job
+    # job-1780936528-524e40fb row 4 idea 1, target=7, model returned
+    # 8 words ending in ".", _enforce_word_cap truncated to 7 words
+    # ("Sin historial limpio, financia un carro usado") found no
+    # sentence boundary in the first half, returned "", and the caller
+    # fell back to the 10-word original (defeating the whole point of
+    # the shorten). +2 tolerance is well below the not-shorter
+    # backstop on line 806 and still catches genuine model drift.
+    new_word_count = len(new_vo.split())
+    if (new_word_count <= target_words + 2
+            and new_vo.rstrip().endswith((".", "!", "?"))):
+        _log.info(
+            "cartoon_shorten_ok",
+            original_words=len(text.split()),
+            returned_words=new_word_count,
+            target_words=target_words,
+            cost_usd=result.cost_usd,
+            path="trusted_model_output",
+        )
+        return ShortenResult(voiceover=new_vo.strip(), cost_usd=result.cost_usd)
+
+    # Hard cap to target_words for genuinely over-budget rewrites (model
+    # drifted well past +2 over target). The cap returns "" when
+    # truncation lands mid-thought (no real sentence boundary inside the
+    # cap). Either way, the result must end on .!? — otherwise we'd
+    # ship a fragment, which is the bug this whole helper exists to
+    # prevent. Fall back to the original on either failure so the
+    # caller drops the idea (matches the existing "no change" path).
     capped = _enforce_word_cap(new_vo, target_words)
     if not capped or not capped.rstrip().endswith((".", "!", "?")):
         _log.warning(
@@ -831,5 +854,6 @@ async def shorten_voiceover(
         original_words=len(text.split()),
         returned_words=len(capped.split()),
         cost_usd=result.cost_usd,
+        path="capped",
     )
     return ShortenResult(voiceover=capped, cost_usd=result.cost_usd)

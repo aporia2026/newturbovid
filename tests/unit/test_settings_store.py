@@ -24,6 +24,48 @@ async def test_get_returns_registered_default_when_unset(store: SettingsStore) -
     assert await store.get("script_system_prompt") == "default-prompt"
 
 
+async def test_ensure_cache_retries_once_on_cold_start_failure(store: SettingsStore) -> None:
+    """Regression for job-1780936528-524e40fb row 3.
+
+    The first SELECT after a fresh container boot occasionally fails
+    with ``Hrana: api error: status=400 ... invalid token`` (Turso/libSQL
+    cold-start). ``_ensure_cache`` now retries ``_load_sync`` once with
+    a short sleep so a transient cold-start blip doesn't kill a row.
+    """
+    real_load = store._load_sync
+    call_count = {"n": 0}
+
+    def flaky_load() -> dict[str, str]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError(
+                "Hrana: `api error: `status=400 Bad Request, body="
+                '{"error":"Protocol error: failed to parse http request: invalid token"}``'
+            )
+        return real_load()
+
+    store._load_sync = flaky_load    # type: ignore[method-assign]
+
+    # First read triggers _ensure_cache. Without the retry this would
+    # raise the Hrana ValueError; with the retry it succeeds on attempt 2.
+    value = await store.get("script_system_prompt")
+    assert value == "default-prompt"     # registered default, table is empty
+    assert call_count["n"] == 2          # one failure + one retry
+
+
+async def test_ensure_cache_reraises_when_both_attempts_fail(store: SettingsStore) -> None:
+    """If both attempts fail, the error must propagate — the row
+    processor surfaces it as a row failure rather than silently
+    succeeding with an empty cache."""
+    def always_fails() -> dict[str, str]:
+        raise ValueError("Hrana: persistent failure")
+
+    store._load_sync = always_fails    # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="Hrana"):
+        await store.get("script_system_prompt")
+
+
 async def test_get_returns_explicit_default_when_provided(store: SettingsStore) -> None:
     assert await store.get("unknown_key", default="fallback") == "fallback"
 

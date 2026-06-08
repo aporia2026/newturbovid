@@ -110,11 +110,14 @@ SPEECH_ATEMPO_MIN = 1.0
 # Retry-only ceiling. The first attempt protects voice quality with the
 # 1.3x default, but if the shortener trimmed the line and the re-TTS still
 # overshoots by a small margin (Spanish/German compounds blow up character
-# counts) it's far better to nudge the speed to 1.5x than to drop the idea
-# entirely. 1.5x stays inside Gemini TTS's "natural-sounding" range; past
-# 1.6x the voice starts to feel rushed. See job-1780933855-3c614650 where
-# three of four idea-1s dropped on margins of 78ms / 1.25s / 2.3s.
-SPEECH_ATEMPO_RETRY_MAX = 1.5
+# counts) it's far better to nudge the speed up than to drop the idea
+# entirely. 1.55x stays inside Gemini TTS's "natural-sounding" range; past
+# 1.6x the voice starts to feel rushed. See:
+#   * job-1780933855-3c614650 — three of four idea-1s dropped on margins
+#     of 78ms / 1.25s / 2.3s; 1.5x rescued all three.
+#   * job-1780936528-524e40fb row 5 idea 1 — German 11.61s VO overshoots
+#     at 1.5x (7.741s effective) by 241ms; 1.55x (7.49s effective) ships.
+SPEECH_ATEMPO_RETRY_MAX = 1.55
 
 
 def compute_atempo(

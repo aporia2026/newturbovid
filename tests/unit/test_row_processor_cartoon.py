@@ -367,13 +367,29 @@ def test_compute_atempo_retry_cap_rescues_borderline_drops() -> None:
 
 
 def test_compute_atempo_retry_cap_still_drops_truly_huge_vos() -> None:
-    """The 1.5x retry cap rescues borderline overshoots, NOT genuinely
-    oversized VOs. A 16s VO at 1.5x is still 10.67s — the caller's
+    """The retry cap rescues borderline overshoots, NOT genuinely
+    oversized VOs. A 16s VO at 1.55x is still 10.32s — the caller's
     `effective > MAX_EFFECTIVE_VO_SECONDS` gate has to still fire so the
     idea is dropped instead of shipping with rushed audio."""
     atempo, effective = compute_atempo(16.0, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
     assert atempo == pytest.approx(rpc.SPEECH_ATEMPO_RETRY_MAX)
     assert effective > MAX_EFFECTIVE_VO_SECONDS
+
+
+def test_compute_atempo_retry_cap_rescues_long_german_vo() -> None:
+    """Regression for job-1780936528-524e40fb row 5 idea 1: an 11.61s
+    German VO was dropped at the previous 1.5x ceiling (effective
+    7.741s > 7.5s cap) by a margin of 241ms. The 1.55x ceiling
+    rescues it — effective lands at exactly the 7.5s cap, no drop."""
+    atempo, effective = compute_atempo(11.61, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
+    # 11.61 / 7.5 = 1.548 — fits under the 1.55x ceiling.
+    assert atempo == pytest.approx(11.61 / MAX_EFFECTIVE_VO_SECONDS)
+    assert effective == MAX_EFFECTIVE_VO_SECONDS
+
+    # Sanity: WITHOUT the 1.55x cap (i.e. the old 1.5x), this would
+    # drop — proves the test would have failed pre-fix.
+    _, effective_at_1_5 = compute_atempo(11.61, max_atempo=1.5)
+    assert effective_at_1_5 > MAX_EFFECTIVE_VO_SECONDS
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────

@@ -702,6 +702,62 @@ async def test_shorten_voiceover_empty_returns_original() -> None:
     assert out.voiceover == original
 
 
+@respx.mock
+async def test_shorten_voiceover_accepts_slight_overshoot_with_clean_ending() -> None:
+    """Regression for job-1780936528-524e40fb row 4 idea 1.
+
+    Asked for 7 words, model returned a clean 8-word VO ending in `.`.
+    Previously ``_enforce_word_cap`` truncated to 7 words, found no
+    sentence boundary inside that prefix, returned "" — caller fell back
+    to the 10-word ORIGINAL and dropped the idea. With the +2 tolerance
+    the model's 8-word answer ships as-is.
+    """
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(json.dumps({
+                "voiceover": "Sin historial limpio, financia un carro usado hoy.",
+            })),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = "Sin historial limpio, aún puedes financiar un carro usado hoy."
+    out = await shorten_voiceover(
+        client, text=original, language="es", target_words=7,
+    )
+    # Model's 8-word answer ships; we are NOT falling back to the original.
+    assert out.voiceover == "Sin historial limpio, financia un carro usado hoy."
+    assert out.voiceover != original
+    assert len(out.voiceover.split()) == 8     # one over target, but accepted
+
+
+@respx.mock
+async def test_shorten_voiceover_caps_genuine_model_drift() -> None:
+    """If the model goes well past +2 over target and the cap can't find
+    a clean sentence boundary, fall back to the original (the existing
+    drop signal). Proves the leniency is bounded — not a free pass."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_resp(json.dumps({
+                # 12 words, target was 5 (+7 over) and no early sentence boundary.
+                "voiceover": "this rambling line keeps going past every reasonable target word budget here",
+            })),
+        )
+    )
+    client = OpenAIClient(api_key="sk-test")
+    original = (
+        "Original line about the matter at hand that we need shortened "
+        "because the synth came back too long for the eight second cap."
+    )
+    out = await shorten_voiceover(
+        client, text=original, language="en", target_words=5,
+    )
+    # Lenient path NOT taken (12 > 5+2). Cap path tried, failed.
+    # Falls back to original — caller drops the idea.
+    assert out.voiceover == original
+
+
 # ── Template selector integration ───────────────────────────────────────────
 
 
