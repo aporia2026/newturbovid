@@ -1,9 +1,10 @@
 """Tests for the Pillow card renderer.
 
-Covers Templates 1 and 2 across the production aspect ratios. No external
+Covers Templates 1, 2 and 3 across the production aspect ratios. No external
 services; all backgrounds are synthesized in-memory.
 
-Plan: ``_plans/2026-06-08-simple-x4-template-cards.md`` §Testing.
+Plan: ``_plans/2026-06-08-simple-x4-template-cards.md`` §Testing,
+plus ``_plans/2026-06-08-simple-x4-template-3.md`` for T3.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from bulkvid.pipeline.card_renderer import (
     SUPPORTED_TEMPLATES,
     TEMPLATE_1,
     TEMPLATE_2,
+    TEMPLATE_3,
     render_card_bytes,
 )
 
@@ -164,6 +166,63 @@ def test_template_2_gradient_darkens_the_bottom() -> None:
         img.close()
 
 
+def test_template_3_navy_band_present_above_pill() -> None:
+    """Template 3 has a deep-navy band between the image and the red pill.
+    Sample inside the band (~85% down, away from text) and confirm it's
+    the navy color from the design — not the image's red, not the pill's
+    red, not white."""
+    out = render_card_bytes(
+        template_id=TEMPLATE_3,
+        background_image_bytes=_solid_bg(color=(255, 0, 0)),    # red bg
+        headline="Hi",
+        cta="GO",
+        width=600,
+        height=600,
+    )
+    img = _decode(out)
+    try:
+        # Image cover ends at 75%; band starts at 75% and runs through 92%;
+        # pill takes the bottom 8%. 85% is safely inside the navy band, and
+        # 2% from the left avoids the centered title text.
+        x = int(600 * 0.02)
+        y = int(600 * 0.85)
+        r, g, b = img.getpixel((x, y))
+        # Navy = (15, 30, 55). Allow ±5 per channel for any JPEG-style drift.
+        assert r < 30 and g < 45 and b < 70 and b > r, (
+            f"expected deep-navy band, got {(r, g, b)}"
+        )
+    finally:
+        img.close()
+
+
+def test_template_3_red_pill_at_bottom_with_yellow_text() -> None:
+    """Template 3 anchors a full-width red pill at the very bottom of the
+    canvas. Sample a pixel inside the pill area, away from the centered
+    yellow text, and confirm it's the bright red from the design."""
+    out = render_card_bytes(
+        template_id=TEMPLATE_3,
+        background_image_bytes=_solid_bg(color=(255, 255, 255)),    # white bg
+        headline="Hi",
+        cta="GO",
+        width=600,
+        height=600,
+    )
+    img = _decode(out)
+    try:
+        # Pill region: bottom 8% (~from y=552 to y=600). Sample at 97% down
+        # and 2% from the left — clear of the centered text, well inside
+        # the pill background.
+        x = int(600 * 0.02)
+        y = int(600 * 0.97)
+        r, g, b = img.getpixel((x, y))
+        # Red = (230, 30, 35). Strong red dominance, low green/blue.
+        assert r > 180 and g < 80 and b < 80, (
+            f"expected bright-red pill, got {(r, g, b)}"
+        )
+    finally:
+        img.close()
+
+
 # ── CTA handling ─────────────────────────────────────────────────────────────
 
 
@@ -210,7 +269,7 @@ def test_very_long_headline_is_wrapped_not_truncated() -> None:
 def test_unknown_template_raises_value_error() -> None:
     with pytest.raises(ValueError, match="unknown card template id"):
         render_card_bytes(
-            template_id="3",
+            template_id="9",    # 1, 2, 3 are valid; pick something well past
             background_image_bytes=_solid_bg(),
             headline="x",
             cta="y",

@@ -103,7 +103,7 @@ class CartoonRowIn(BaseModel):
 
 
 class CardChoiceIn(BaseModel):
-    template_id: str = ""    # validated to "" | "1" | "2" in the server-side coercion below
+    template_id: str = ""    # validated to "" | "1" | "2" | "3" in the server-side coercion below
     cta: str = ""
 
 
@@ -153,7 +153,7 @@ def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
     """Coerce a SimpleX4RowIn from the wire into a SimpleX4Row dataclass.
 
     Server-side hardening (defense in depth — Apps Script also validates):
-      * ``template_id`` clamped to {"", "1", "2"} — invalid values are
+      * ``template_id`` clamped to {"", "1", "2", "3"} — invalid values are
         silently downgraded to "" (no overlay) so a typo doesn't fail the row.
       * ``cta`` truncated to 80 chars (matches the renderer's pill max-width).
       * ``cards`` padded / trimmed to exactly 4 entries — Apps Script always
@@ -165,7 +165,7 @@ def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
     raw_cards = raw_cards[:4]
     cards = [
         CardChoice(
-            template_id=(c.template_id if c.template_id in ("", "1", "2") else ""),
+            template_id=(c.template_id if c.template_id in ("", "1", "2", "3") else ""),
             cta=(c.cta or "")[:80],
         )
         for c in raw_cards

@@ -1,6 +1,6 @@
 """Pillow-based card renderer for the ``simple x4`` template feature.
 
-Two templates ship in the initial cut (mockups under
+Three templates ship today (mockups under
 ``apps_script/template_previews/``):
 
   - Template 1 (blue/purple): image fills the top, white strip at the bottom
@@ -8,9 +8,13 @@ Two templates ship in the initial cut (mockups under
   - Template 2 (green gradient): image fills the canvas, a vertical
     green-to-dark-green gradient overlays the lower portion to keep the
     headline readable; bold white headline + yellow rounded CTA pill.
+  - Template 3 (navy + red): image cover-crops the top 75%, a thin red
+    separator line, a deep-navy band with the white bold all-caps title,
+    and a bright-red full-width CTA pill with yellow text at the bottom.
 
 Plan: ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.2 (R1 chosen),
 §D.6 (renderer scales to any aspect ratio).
+Template 3: ``_plans/2026-06-08-simple-x4-template-3.md``.
 
 Font resolution
 ---------------
@@ -41,7 +45,10 @@ _log = get_logger("card_render")
 
 TEMPLATE_1: Final[str] = "1"
 TEMPLATE_2: Final[str] = "2"
-SUPPORTED_TEMPLATES: Final[frozenset[str]] = frozenset({TEMPLATE_1, TEMPLATE_2})
+TEMPLATE_3: Final[str] = "3"
+SUPPORTED_TEMPLATES: Final[frozenset[str]] = frozenset(
+    {TEMPLATE_1, TEMPLATE_2, TEMPLATE_3}
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,22 @@ _DESIGNS: Final[dict[str, CardDesign]] = {
         accent_line_color=None,
         gradient_top=(40, 220, 50),       # bright green top
         gradient_bottom=(5, 60, 5),       # dark green/black bottom
+    ),
+    TEMPLATE_3: CardDesign(
+        template_id=TEMPLATE_3,
+        # Total non-image area = navy band + red pill = 25% of canvas.
+        # The renderer splits this into 17% band + 8% pill (see
+        # ``_render_template_3`` for the constants that carve up
+        # ``strip_height_frac``).
+        strip_height_frac=0.25,
+        image_cover_frac=0.75,
+        title_color=(255, 255, 255),      # white on deep navy
+        cta_bg=(230, 30, 35),             # bright red full-width pill
+        cta_text_color=(255, 215, 0),     # yellow CTA text on red pill
+        strip_bg=(15, 30, 55),            # deep navy band behind title
+        accent_line_color=(230, 30, 35),  # red separator under image
+        gradient_top=None,
+        gradient_bottom=None,
     ),
 }
 
@@ -611,12 +634,138 @@ def _render_template_2(
     return canvas
 
 
+def _render_template_3(
+    background: Image.Image,
+    headline: str,
+    cta: str,
+    width: int,
+    height: int,
+    font_override: str | None,
+) -> Image.Image:
+    """Image cover-crops top 75%; thin red separator; deep-navy band with
+    white headline; bright-red full-width pill with yellow CTA at the
+    very bottom. Mockup: user-supplied 2026-06-08."""
+    design = _DESIGNS[TEMPLATE_3]
+
+    # Split the 25% non-image region into the navy band (68% of that) and
+    # the red pill (32%). Pill ends flush with the canvas bottom; band
+    # ends flush with the pill top — no gap between them, matching the
+    # mockup.
+    strip_h = int(round(height * design.strip_height_frac))
+    pill_region_h = int(round(strip_h * 0.32))
+    band_h = strip_h - pill_region_h
+    image_h = height - strip_h
+
+    canvas = Image.new("RGB", (width, height), design.strip_bg or (0, 0, 0))
+
+    # Cover-crop the source image into the upper region.
+    fitted = _fit_image_cover(background, width, image_h)
+    try:
+        canvas.paste(fitted, (0, 0))
+    finally:
+        fitted.close()
+
+    draw = ImageDraw.Draw(canvas)
+
+    # Thin red separator directly under the image. The line height scales
+    # with canvas height so it's visible at 720p and not garish at 4K.
+    # Order matters: draw the navy band FIRST (starting BELOW the line),
+    # then draw the line on top so it sits flush against both the image
+    # above and the navy band below. (Earlier ordering had the navy
+    # rectangle painting over the red line — invisible separator bug.)
+    line_thickness = max(3, height // 240) if design.accent_line_color else 0
+    band_top = image_h + line_thickness
+    band_bottom = image_h + band_h
+    draw.rectangle(
+        (0, band_top, width, band_bottom), fill=design.strip_bg or (15, 30, 55)
+    )
+    if design.accent_line_color is not None:
+        draw.rectangle(
+            (0, image_h, width, image_h + line_thickness),
+            fill=design.accent_line_color,
+        )
+
+    # Title region: centered inside the navy band with side padding.
+    side_padding = int(width * 0.04)
+    title_max_w = width - side_padding * 2
+    title_top_bound = band_top + int(band_h * 0.10)
+    title_bottom_bound = band_bottom - int(band_h * 0.10)
+    title_max_h = max(int(band_h * 0.50), title_bottom_bound - title_top_bound)
+
+    headline_text = (headline or "").upper()    # mockup uses all-caps headlines
+    font, lines = _fit_title_font(
+        draw,
+        headline_text,
+        title_max_w,
+        title_max_h,
+        max_lines=2,
+        initial_size=int(band_h * 0.42),
+        min_size=max(14, int(band_h * 0.22)),
+        font_override=font_override,
+    )
+
+    if lines:
+        line_heights = [
+            draw.textbbox((0, 0), ln or " ", font=font)[3]
+            - draw.textbbox((0, 0), ln or " ", font=font)[1]
+            for ln in lines
+        ]
+        line_spacing = int(font.size * 0.18) if hasattr(font, "size") else 4
+        block_h = sum(line_heights) + line_spacing * (len(lines) - 1)
+        # Vertically center the title block inside the navy band.
+        y = title_top_bound + (title_max_h - block_h) // 2
+        for ln, lh in zip(lines, line_heights, strict=True):
+            bbox = draw.textbbox((0, 0), ln, font=font)
+            tw = bbox[2] - bbox[0]
+            tx = (width - tw) // 2 - bbox[0]
+            ty = y - bbox[1]
+            draw.text((tx, ty), ln, fill=design.title_color, font=font)
+            y += lh + line_spacing
+
+    # Red full-width pill at the bottom — touches the navy band, ends
+    # flush with the canvas bottom. Pill text auto-shrinks for long
+    # localized CTAs (e.g. Polish "Dowiedz Się Więcej >>"), capped at
+    # 60% of the title font size so the title still reads as dominant.
+    if cta:
+        pill_left = 0
+        pill_right = width
+        pill_top = band_bottom
+        pill_bottom = height
+        # Square corners on the pill match the mockup (a clean band, not
+        # a rounded button) — implemented as a flat rectangle with
+        # text centered inside.
+        draw.rectangle(
+            (pill_left, pill_top, pill_right, pill_bottom), fill=design.cta_bg
+        )
+
+        pill_pad_x = int(width * 0.04)
+        title_size_actual = getattr(font, "size", int(band_h * 0.36))
+        pill_initial = max(14, int(title_size_actual * 0.60))
+        pill_min = max(12, int(pill_region_h * 0.30))
+        pill_font = _fit_pill_font(
+            draw, cta,
+            max_width=width - pill_pad_x * 2,
+            initial_size=pill_initial,
+            min_size=pill_min,
+            font_override=font_override,
+        )
+        bbox = draw.textbbox((0, 0), cta, font=pill_font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        tx = (width - text_w) // 2 - bbox[0]
+        ty = pill_top + (pill_region_h - text_h) // 2 - bbox[1]
+        draw.text((tx, ty), cta, fill=design.cta_text_color, font=pill_font)
+
+    return canvas
+
+
 # ── Public entry ─────────────────────────────────────────────────────────────
 
 
 _DISPATCH = {
     TEMPLATE_1: _render_template_1,
     TEMPLATE_2: _render_template_2,
+    TEMPLATE_3: _render_template_3,
 }
 
 

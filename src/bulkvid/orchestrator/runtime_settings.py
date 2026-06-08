@@ -236,8 +236,10 @@ SETTING_TEMPLATE_SELECTOR_ENABLED = "template_selector_enabled"
 SETTING_CARD_TEMPLATES_ENABLED = "card_templates_enabled"
 SETTING_CARD_TEMPLATE_1_DEFAULT_CTA = "card_template_1_default_cta"
 SETTING_CARD_TEMPLATE_2_DEFAULT_CTA = "card_template_2_default_cta"
+SETTING_CARD_TEMPLATE_3_DEFAULT_CTA = "card_template_3_default_cta"
 SETTING_CARD_PREVIEW_URL_TEMPLATE_1 = "card_preview_url_template_1"
 SETTING_CARD_PREVIEW_URL_TEMPLATE_2 = "card_preview_url_template_2"
+SETTING_CARD_PREVIEW_URL_TEMPLATE_3 = "card_preview_url_template_3"
 
 
 SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
@@ -417,6 +419,16 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
         ),
     ),
     SettingDef(
+        key=SETTING_CARD_TEMPLATE_3_DEFAULT_CTA,
+        label="Card template 3: CTA override (optional)",
+        default="",
+        multiline=False,
+        description=(
+            "Optional admin override for the Template 3 CTA. Same fallback "
+            "behavior as Template 1 above."
+        ),
+    ),
+    SettingDef(
         key=SETTING_CARD_PREVIEW_URL_TEMPLATE_1,
         label="Card template 1: preview URL",
         default="",
@@ -435,6 +447,16 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
         multiline=False,
         description=(
             "Public URL of the Template 2 preview PNG. Same pattern as "
+            "Template 1 above."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_PREVIEW_URL_TEMPLATE_3,
+        label="Card template 3: preview URL",
+        default="",
+        multiline=False,
+        description=(
+            "Public URL of the Template 3 preview PNG. Same pattern as "
             "Template 1 above."
         ),
     ),

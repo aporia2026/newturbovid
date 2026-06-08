@@ -297,7 +297,7 @@ def test_simple_x4_route_payload_with_invalid_cards_still_returns_200(
     coercion in ``_build_simple_x4_row`` cleans them server-side."""
     payload = _simple_x4_payload(
         cards=[
-            {"template_id": "3", "cta": "x" * 500},     # bad id + long CTA
+            {"template_id": "9", "cta": "x" * 500},     # bad id + long CTA
             {"template_id": "maybe", "cta": "ok"},
         ]    # only 2 cards (Apps Script always sends 4 — defensive)
     )
@@ -306,7 +306,9 @@ def test_simple_x4_route_payload_with_invalid_cards_still_returns_200(
 
 
 def test_build_simple_x4_row_coerces_invalid_template_to_empty() -> None:
-    """Direct unit test on the server-side coercion helper."""
+    """Direct unit test on the server-side coercion helper. Valid ids are
+    "", "1", "2", "3" — any other value silently downgrades to "" so a
+    typo doesn't fail the row."""
     from bulkvid.routes.jobs import CardChoiceIn, SimpleX4RowIn, _build_simple_x4_row
 
     r_in = SimpleX4RowIn(
@@ -314,14 +316,14 @@ def test_build_simple_x4_row_coerces_invalid_template_to_empty() -> None:
         article_url="https://example.com/a",
         manual_image_url="https://example.com/i.png",
         cards=[
-            CardChoiceIn(template_id="3", cta="Buy"),
+            CardChoiceIn(template_id="3", cta="Buy"),     # valid (since 2026-06-08)
             CardChoiceIn(template_id="maybe", cta="Look"),
             CardChoiceIn(template_id="1", cta="Click"),
-            CardChoiceIn(template_id="", cta=""),
+            CardChoiceIn(template_id="9", cta=""),         # invalid → ""
         ],
     )
     row = _build_simple_x4_row(r_in)
-    assert [c.template_id for c in row.cards] == ["", "", "1", ""]
+    assert [c.template_id for c in row.cards] == ["3", "", "1", ""]
     assert [c.cta for c in row.cards] == ["Buy", "Look", "Click", ""]
 
 

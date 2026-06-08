@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from bulkvid.pipeline.card_renderer import (    # noqa: E402
     TEMPLATE_1,
     TEMPLATE_2,
+    TEMPLATE_3,
     render_card_bytes,
 )
 
@@ -59,6 +60,8 @@ def main() -> None:
         (TEMPLATE_1, "DISCOVER MORE >>", 1080, 1920, "template_1_9x16.png"),
         (TEMPLATE_2, "See The Full Guide >>", 1080, 1080, "template_2_1x1.png"),
         (TEMPLATE_2, "See The Full Guide >>", 1080, 1920, "template_2_9x16.png"),
+        (TEMPLATE_3, "DISCOVER MORE >>", 1080, 1080, "template_3_1x1.png"),
+        (TEMPLATE_3, "DISCOVER MORE >>", 1080, 1920, "template_3_9x16.png"),
     ]
 
     for template_id, cta, w, h, filename in cases:

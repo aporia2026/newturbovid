@@ -1,11 +1,11 @@
-"""Generate `template_{1,2}_labeled.png` from the source mockups.
+"""Generate `template_{1,2,3}_labeled.png` from the source mockups.
 
-Adds a "TEMPLATE 1" / "TEMPLATE 2" caption band to the top of each source
-PNG so the in-sheet preview row is self-identifying — no separate label
-cells needed.
+Adds a "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3" caption band to the top of
+each source PNG so the in-sheet preview row is self-identifying — no
+separate label cells needed.
 
 Run after editing the source PNGs at
-``apps_script/template_previews/template_{1,2}.png``:
+``apps_script/template_previews/template_{1,2,3}.png``:
 
     python tools/render_labeled_template_previews.py
 
@@ -76,7 +76,7 @@ def main() -> None:
     if not FONT_PATH.is_file():
         print(f"ERROR: bundled font missing at {FONT_PATH}", file=sys.stderr)
         sys.exit(3)
-    for n in (1, 2):
+    for n in (1, 2, 3):
         _label_image(n)
 
 

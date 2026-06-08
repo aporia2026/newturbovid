@@ -63,6 +63,7 @@ from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_CARD_TEMPLATE_1_DEFAULT_CTA,
     SETTING_CARD_TEMPLATE_2_DEFAULT_CTA,
+    SETTING_CARD_TEMPLATE_3_DEFAULT_CTA,
     SETTING_CARD_TEMPLATES_ENABLED,
     SETTING_SIMPLE_X4_SCRIPT_PROMPT,
 )
@@ -70,6 +71,7 @@ from bulkvid.pipeline.card_renderer import (
     SUPPORTED_TEMPLATES,
     TEMPLATE_1,
     TEMPLATE_2,
+    TEMPLATE_3,
     render_card_bytes,
 )
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
@@ -165,11 +167,12 @@ async def _resolve_card_runtime(
     card has a non-blank template_id, the caller skips the overlay step
     entirely (the row renders exactly like legacy image_vo).
 
-    ``admin_cta_override_by_template`` maps "1" / "2" to the admin's
+    ``admin_cta_override_by_template`` maps "1" / "2" / "3" to the admin's
     custom per-template default CTA from the settings store. When empty
     (which is the registry default), the per-language "Learn More" fallback
     in ``_resolve_cta_for_card`` wins instead. Plan
-    ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.5.
+    ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.5;
+    Template 3 added per ``_plans/2026-06-08-simple-x4-template-3.md``.
     """
     if not any(c.template_id for c in cards):
         return (False, {})
@@ -180,7 +183,11 @@ async def _resolve_card_runtime(
 
     override_1 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_1_DEFAULT_CTA) or ""
     override_2 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_2_DEFAULT_CTA) or ""
-    return (True, {TEMPLATE_1: override_1, TEMPLATE_2: override_2})
+    override_3 = await clients.settings_store.get(SETTING_CARD_TEMPLATE_3_DEFAULT_CTA) or ""
+    return (
+        True,
+        {TEMPLATE_1: override_1, TEMPLATE_2: override_2, TEMPLATE_3: override_3},
+    )
 
 
 def _resolve_cta_for_card(

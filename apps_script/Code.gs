@@ -22,15 +22,17 @@ const TAB_SIMPLE_X4 = 'simple_x4';
 // returns a 302 → signed CDN URL with Content-Type: image/png. Sheets
 // =IMAGE() follows the redirect cleanly, so no separate hosting needed.
 //
-// The "_labeled" variants have a "TEMPLATE 1" / "TEMPLATE 2" caption baked
-// into the top of each PNG so the in-sheet preview is self-identifying — no
-// extra label cells needed in row 1. Regenerate with
+// The "_labeled" variants have a "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3"
+// caption baked into the top of each PNG so the in-sheet preview is
+// self-identifying — no extra label cells needed in row 1. Regenerate with
 // `python tools/render_labeled_template_previews.py` after editing the
-// source PNGs at `apps_script/template_previews/template_{1,2}.png`.
-// Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7.
+// source PNGs at `apps_script/template_previews/template_{1,2,3}.png`.
+// Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7;
+// Template 3 added per _plans/2026-06-08-simple-x4-template-3.md.
 const CARD_TEMPLATE_PREVIEW_URLS = {
   '1': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_1_labeled.png',
   '2': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_2_labeled.png',
+  '3': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_3_labeled.png',
 };
 
 // Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
@@ -275,7 +277,7 @@ function _readCartoonRow(sheet, rowNum) {
 function _readSimpleX4Row(sheet, rowNum) {
   // Post-migration simple_x4 layout: same A-H as image_vo + 4 (template, cta)
   // pairs + open_comments at col Q. Backend rejects Template* values that
-  // aren't "" / "1" / "2", but we ALSO validate here for fast UX feedback
+  // aren't "" / "1" / "2" / "3", but we ALSO validate here for fast UX feedback
   // (Apps Script dialog) rather than waiting for a 400 from the server.
   const cols = SIMPLE_X4_COLS;
   const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
@@ -333,8 +335,8 @@ function _validateSimpleX4(r) {
   // ship 4 videos and wonder why no overlay appeared.
   for (var i = 0; i < r.cards.length; i++) {
     var t = r.cards[i].template_id;
-    if (t && t !== '1' && t !== '2') {
-      return 'Template ' + (i + 1) + ' must be empty, 1, or 2 (got "' + t + '")';
+    if (t && t !== '1' && t !== '2' && t !== '3') {
+      return 'Template ' + (i + 1) + ' must be empty, 1, 2, or 3 (got "' + t + '")';
     }
   }
   return null;
@@ -635,14 +637,14 @@ function migrateSimpleX4Columns() {
   steps.push('wrote row 2 column headers');
 
   // ─── Step 4: row 1 preview =IMAGE() formulas ───
-  // Each preview PNG has "TEMPLATE 1" / "TEMPLATE 2" baked into the top of
-  // the image (see tools/render_labeled_template_previews.py), so a single
-  // cell per template is enough — the label IS the image. Placed at C1/D1
-  // so they sit at the leftmost area of the sheet and stay visible regardless
-  // of horizontal scroll position.
+  // Each preview PNG has "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3" baked
+  // into the top of the image (see tools/render_labeled_template_previews.py),
+  // so a single cell per template is enough — the label IS the image. Placed
+  // at C1/D1/E1 so they sit at the leftmost area of the sheet and stay
+  // visible regardless of horizontal scroll position.
   //
   // We always rewrite these cells so re-running the migration cleans up any
-  // earlier layout drift (e.g. stray "1"/"2" text typed by the operator).
+  // earlier layout drift (e.g. stray "1"/"2"/"3" text typed by the operator).
   sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 1)
     .setValue('Template Preview')
     .setFontWeight('bold');
@@ -651,6 +653,8 @@ function migrateSimpleX4Columns() {
     .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['1'] + '")');
   sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 4)
     .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['2'] + '")');
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 5)
+    .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['3'] + '")');
 
   // Bump row 1 height so the previews render at a useful size (the labeled
   // PNGs are 1080×1240 → ~14% aspect overhead from the label band).
@@ -667,9 +671,9 @@ function migrateSimpleX4Columns() {
 
   // ─── Step 6: data validation dropdowns on Template* columns ───
   const validation = SpreadsheetApp.newDataValidation()
-    .requireValueInList(['1', '2'], true)
+    .requireValueInList(['1', '2', '3'], true)
     .setAllowInvalid(false)
-    .setHelpText('Empty for no card, 1 for Template 1, 2 for Template 2.')
+    .setHelpText('Empty for no card, or 1 / 2 / 3 to pick a template.')
     .build();
   const maxRow = Math.max(sheet.getMaxRows(), 1000);
   const tplCols = [

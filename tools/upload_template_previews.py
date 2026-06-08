@@ -34,6 +34,7 @@ _log = get_logger("upload_template_previews")
 SOURCES: tuple[tuple[str, str], ...] = (
     ("template_1.png", "bulkvid/templates/template_1.png"),
     ("template_2.png", "bulkvid/templates/template_2.png"),
+    ("template_3.png", "bulkvid/templates/template_3.png"),
 )
 
 SOURCE_DIR = REPO_ROOT / "apps_script" / "template_previews"
