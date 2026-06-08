@@ -34,6 +34,11 @@ from PIL import Image
 
 from bulkvid.adapters.kie import recraft_crisp_upscale
 from bulkvid.adapters.rendi import dimensions_for_ratio, normalize_aspect_ratio
+from bulkvid.adapters.zapcap import (
+    ZapCapRenderOptions,
+    ZapCapStyleOptions,
+    ZapCapSubsOptions,
+)
 from bulkvid.image_ops import (
     DEFAULT_EDGE_CROP_PIXELS,
     optimize_image_for_size,
@@ -625,12 +630,31 @@ async def process_simple_x4_row(
             # silent-video default when VO is off.
             vo_duration = float(metadata.get("vo_duration_seconds") or 10.0)
 
+            # ZapCap render options per-quadrant. The default places captions
+            # at top=70 (lower-third) — fine for blank-template cells where the
+            # photo fills the canvas, but on TEMPLATED cells the caption sits
+            # directly on top of the Pillow-rendered headline strip, producing
+            # the unreadable double-text Yoav reported 2026-06-08. Templated
+            # cells push the caption up into the photo area (top=15) — same
+            # font size as the legacy look, just out of the bottom strip's way.
+            templated_caption_opts = ZapCapRenderOptions(
+                subs=ZapCapSubsOptions(),    # keep emoji + emphasis defaults
+                style=ZapCapStyleOptions(top=15),    # default font_size=42 preserved
+            )
+
             async def _caption(idx: int, video_url: str) -> str:
                 video_bytes = await _download(video_url, timeout=180.0)
+                # Per-quadrant render options: tame the caption on templated
+                # cells (so it stops covering my bottom strip), leave default
+                # caption style on blank-template cells (legacy look).
+                opts: ZapCapRenderOptions | None = None
+                if cards_enabled and row.cards[idx].template_id:
+                    opts = templated_caption_opts
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=language,
                     filename=f"v{idx + 1}.mp4",
+                    render_options=opts,
                     video_duration_seconds=vo_duration,
                 )
                 costs.zapcap += cost
