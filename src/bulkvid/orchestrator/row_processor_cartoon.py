@@ -311,6 +311,15 @@ async def process_cartoon_row(
 
         # ─── Stage 3+4: build each idea into a finished video (concurrently) ───
 
+        # Per-idea exception messages — collected so a row that fails
+        # entirely surfaces the ACTUAL ffmpeg/kie/seedance error in its
+        # error field (operators can see it in the sidebar) instead of
+        # the unhelpful generic "no usable videos produced for any idea".
+        # Also captures the CTA-overlay failures (non-fatal, video ships
+        # without the pill) so we can diagnose those without HF Logs.
+        idea_failure_messages: list[str] = []
+        cta_overlay_errors: list[str] = []
+
         async def _build_idea(idx: int, idea: CartoonIdea) -> str | None:
             """Build one stitched, voiced, optionally-captioned video. None on failure."""
             nonlocal zapcap_failed
@@ -537,9 +546,11 @@ async def process_cartoon_row(
                         cleanup_command_ids.append(overlaid.command_id)
                         video_url_for_persist = overlaid.url
                     except Exception as cta_err:
+                        err_msg = str(cta_err)[:300]
+                        cta_overlay_errors.append(f"idea {idx + 1}: {err_msg}")
                         _log.error(
                             "cartoon_cta_overlay_failed_kept_original",
-                            idea=idx + 1, error=str(cta_err)[:300],
+                            idea=idx + 1, error=err_msg,
                         )
 
                 # 4e. Persist to our storage, then free the Rendi copies.
@@ -590,7 +601,9 @@ async def process_cartoon_row(
 
                 return final_url
             except Exception as e:
-                _log.error("cartoon_idea_failed", idea=idx + 1, error=str(e)[:300])
+                err_msg = str(e)[:300]
+                idea_failure_messages.append(f"idea {idx + 1}: {err_msg}")
+                _log.error("cartoon_idea_failed", idea=idx + 1, error=err_msg)
                 return None
 
         results = await asyncio.gather(
@@ -598,10 +611,26 @@ async def process_cartoon_row(
         )
         video_urls = [u for u in results if u]
 
+        # Surface CTA-overlay failures even when the row itself succeeded —
+        # without this, a row that shipped videos but lost the CTA pill is
+        # indistinguishable from a row that intentionally ran with CTA off.
+        if cta_overlay_errors:
+            metadata["cta_overlay_errors"] = cta_overlay_errors
+            metadata["cta_overlay_applied"] = False
+
         if not video_urls:
+            # Detailed failure message: surfaces the ACTUAL per-idea errors
+            # so the operator can debug from the sidebar (no need to dig
+            # through HF Space logs for the ffmpeg/kie/seedance stderr).
+            detail = (
+                " | ".join(idea_failure_messages)
+                if idea_failure_messages
+                else "ideas returned None without raising"
+            )
             return _fail(
                 row, STATUS_VIDEO_ASSEMBLY_FAILED,
-                "no usable videos produced for any idea", t0, costs, metadata,
+                f"no usable videos produced for any idea — {detail}",
+                t0, costs, metadata,
             )
 
         metadata["videos_produced"] = len(video_urls)
