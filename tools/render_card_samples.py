@@ -28,20 +28,19 @@ from bulkvid.pipeline.card_renderer import (    # noqa: E402
 
 
 def _make_placeholder_photo(width: int = 1200, height: int = 1200) -> bytes:
-    """Synthesize a photo-like gradient so the operator can see what a real
-    kie-generated image would look like inside the card."""
+    """Synthesize a clean photo-like gradient so the operator can see what
+    a real kie-generated image would look like inside the card. A pure
+    sky-to-sand gradient — no decorative shapes, since the in-sheet
+    preview is a UI surface and "weird shapes" read as clip art rather
+    than as a photo."""
     img = Image.new("RGB", (width, height), (30, 100, 200))
     draw = ImageDraw.Draw(img)
-    # Sky -> ground gradient.
     for y in range(height):
         t = y / (height - 1)
         r = int(60 + (210 - 60) * t)
         g = int(140 + (190 - 140) * t)
         b = int(220 + (130 - 220) * t)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
-    # A couple of "subject" shapes so it isn't a flat gradient.
-    draw.ellipse((width * 0.55, height * 0.10, width * 0.85, height * 0.30), fill=(255, 220, 100))
-    draw.rectangle((width * 0.05, height * 0.60, width * 0.45, height * 0.85), fill=(70, 50, 30))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     img.close()

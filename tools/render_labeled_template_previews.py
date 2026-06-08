@@ -1,11 +1,15 @@
-"""Generate `template_{1,2,3}_labeled.png` from the source mockups.
+"""Generate the in-sheet preview PNGs from the source mockups.
 
-Adds a "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3" caption band to the top of
-each source PNG so the in-sheet preview row is self-identifying — no
-separate label cells needed.
+Adds a caption band to the top of each source PNG so the in-sheet preview
+row is self-identifying — no separate label cells needed. Produces:
+
+  * template_default_labeled.png — "DEFAULT" (no overlay; raw kie photo)
+  * template_1_labeled.png       — "TEMPLATE 1"
+  * template_2_labeled.png       — "TEMPLATE 2"
+  * template_3_labeled.png       — "TEMPLATE 3"
 
 Run after editing the source PNGs at
-``apps_script/template_previews/template_{1,2,3}.png``:
+``apps_script/template_previews/template_{default,1,2,3}.png``:
 
     python tools/render_labeled_template_previews.py
 
@@ -35,9 +39,10 @@ LABEL_BG = (255, 255, 255)
 LABEL_FG = (40, 40, 40)
 
 
-def _label_image(n: int) -> None:
-    src_path = SRC_DIR / f"template_{n}.png"
-    out_path = SRC_DIR / f"template_{n}_labeled.png"
+def _label_image(stem: str, label: str) -> None:
+    """Label ``{stem}.png`` and write ``{stem}_labeled.png``."""
+    src_path = SRC_DIR / f"{stem}.png"
+    out_path = SRC_DIR / f"{stem}_labeled.png"
     if not src_path.is_file():
         print(f"ERROR: missing {src_path}", file=sys.stderr)
         sys.exit(2)
@@ -58,12 +63,11 @@ def _label_image(n: int) -> None:
             font.set_variation_by_axes(_FONT_AXES)
         except (OSError, AttributeError):
             pass    # static fallback font — already at the right weight
-        text = f"TEMPLATE {n}"
-        bbox = draw.textbbox((0, 0), text, font=font)
+        bbox = draw.textbbox((0, 0), label, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         tx = (src_w - tw) // 2 - bbox[0]
         ty = (label_h - th) // 2 - bbox[1]
-        draw.text((tx, ty), text, fill=LABEL_FG, font=font)
+        draw.text((tx, ty), label, fill=LABEL_FG, font=font)
 
         # Paste the original template design below the band.
         out.paste(src_rgb, (0, label_h))
@@ -72,12 +76,21 @@ def _label_image(n: int) -> None:
         print(f"wrote {out_path.relative_to(REPO_ROOT)} ({out.size[0]}x{out.size[1]})")
 
 
+# (stem, label) pairs — order is just display, all four get rebuilt every run.
+_LABELS = (
+    ("template_default", "DEFAULT"),
+    ("template_1",       "TEMPLATE 1"),
+    ("template_2",       "TEMPLATE 2"),
+    ("template_3",       "TEMPLATE 3"),
+)
+
+
 def main() -> None:
     if not FONT_PATH.is_file():
         print(f"ERROR: bundled font missing at {FONT_PATH}", file=sys.stderr)
         sys.exit(3)
-    for n in (1, 2, 3):
-        _label_image(n)
+    for stem, label in _LABELS:
+        _label_image(stem, label)
 
 
 if __name__ == "__main__":

@@ -22,14 +22,18 @@ const TAB_SIMPLE_X4 = 'simple_x4';
 // returns a 302 → signed CDN URL with Content-Type: image/png. Sheets
 // =IMAGE() follows the redirect cleanly, so no separate hosting needed.
 //
-// The "_labeled" variants have a "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3"
-// caption baked into the top of each PNG so the in-sheet preview is
-// self-identifying — no extra label cells needed in row 1. Regenerate with
-// `python tools/render_labeled_template_previews.py` after editing the
-// source PNGs at `apps_script/template_previews/template_{1,2,3}.png`.
+// The "_labeled" variants have a "DEFAULT" / "TEMPLATE 1" / "TEMPLATE 2" /
+// "TEMPLATE 3" caption baked into the top of each PNG so the in-sheet
+// preview row is self-identifying — no extra label cells needed.
+// Regenerate with `python tools/render_labeled_template_previews.py` after
+// editing the source PNGs at
+// `apps_script/template_previews/template_{default,1,2,3}.png`.
 // Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7;
-// Template 3 added per _plans/2026-06-08-simple-x4-template-3.md.
+// Template 3 added per _plans/2026-06-08-simple-x4-template-3.md;
+// DEFAULT preview added 2026-06-09 so the operator can see what ships
+// when the Template column is left blank.
 const CARD_TEMPLATE_PREVIEW_URLS = {
+  'default': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_default_labeled.png',
   '1': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_1_labeled.png',
   '2': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_2_labeled.png',
   '3': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_3_labeled.png',
@@ -637,18 +641,22 @@ function migrateSimpleX4Columns() {
   steps.push('wrote row 2 column headers');
 
   // ─── Step 4: row 1 preview =IMAGE() formulas ───
-  // Each preview PNG has "TEMPLATE 1" / "TEMPLATE 2" / "TEMPLATE 3" baked
-  // into the top of the image (see tools/render_labeled_template_previews.py),
-  // so a single cell per template is enough — the label IS the image. Placed
-  // at C1/D1/E1 so they sit at the leftmost area of the sheet and stay
-  // visible regardless of horizontal scroll position.
+  // Each preview PNG has "DEFAULT" / "TEMPLATE 1" / "TEMPLATE 2" /
+  // "TEMPLATE 3" baked into the top of the image (see
+  // tools/render_labeled_template_previews.py), so a single cell per
+  // template is enough — the label IS the image. Placed at B1/C1/D1/E1 so
+  // they sit at the leftmost area of the sheet and stay visible regardless
+  // of horizontal scroll position. The DEFAULT cell (B1) shows what ships
+  // when the operator leaves the Template column blank — a bare kie photo
+  // with no overlay.
   //
   // We always rewrite these cells so re-running the migration cleans up any
   // earlier layout drift (e.g. stray "1"/"2"/"3" text typed by the operator).
   sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 1)
     .setValue('Template Preview')
     .setFontWeight('bold');
-  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 2).clearContent();
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 2)
+    .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['default'] + '")');
   sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 3)
     .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['1'] + '")');
   sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 4)
