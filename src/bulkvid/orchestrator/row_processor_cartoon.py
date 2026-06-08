@@ -107,23 +107,39 @@ VO_SHORTEN_STEP = 3
 # of the 8s window; long VOs still get sped up just enough to fit.
 SPEECH_ATEMPO_MIN = 1.0
 
+# Retry-only ceiling. The first attempt protects voice quality with the
+# 1.3x default, but if the shortener trimmed the line and the re-TTS still
+# overshoots by a small margin (Spanish/German compounds blow up character
+# counts) it's far better to nudge the speed to 1.5x than to drop the idea
+# entirely. 1.5x stays inside Gemini TTS's "natural-sounding" range; past
+# 1.6x the voice starts to feel rushed. See job-1780933855-3c614650 where
+# three of four idea-1s dropped on margins of 78ms / 1.25s / 2.3s.
+SPEECH_ATEMPO_RETRY_MAX = 1.5
 
-def compute_atempo(raw_seconds: float) -> tuple[float, float]:
+
+def compute_atempo(
+    raw_seconds: float, *, max_atempo: float = SPEECH_ATEMPO,
+) -> tuple[float, float]:
     """Pick a per-row atempo for the VO.
 
     Returns ``(atempo, effective_seconds)`` where ``effective_seconds`` is the
     actual played length of the VO after ffmpeg applies the ``atempo`` filter.
+
+    ``max_atempo`` (default ``SPEECH_ATEMPO`` = 1.3) is the ceiling on speedup.
+    Pass ``SPEECH_ATEMPO_RETRY_MAX`` on the shorten-and-retry path to rescue
+    borderline overshoots instead of dropping the idea.
 
     Logic:
       - Raw audio ≤ MAX_EFFECTIVE_VO_SECONDS (7.5s): no speedup needed, atempo=1.0.
         The VO plays at natural pace, which sounds better and fills more of the
         8s video — directly addresses the "v2-style" 3-second trailing-silence
         bug.
-      - Raw audio > 7.5s but ≤ 7.5 × 1.3 (=9.75s): speed up just enough to fit.
+      - Raw audio > 7.5s but ≤ 7.5 × max_atempo: speed up just enough to fit.
         ``atempo = raw / 7.5``; effective lands at exactly 7.5s.
-      - Raw audio > 9.75s: even max speedup (1.3) doesn't fit. Return (1.3,
-        raw/1.3) — the caller will see ``effective > MAX_EFFECTIVE_VO_SECONDS``
-        and trigger the shorten-and-retry path.
+      - Raw audio > 7.5 × max_atempo: even max speedup doesn't fit. Return
+        ``(max_atempo, raw/max_atempo)`` — the caller will see
+        ``effective > MAX_EFFECTIVE_VO_SECONDS`` and trigger the
+        shorten-and-retry path (or drop, if this already WAS the retry).
 
     Floating-point note: in the "speed up just enough to fit" branch we
     return the cap value as a literal, NOT ``raw_seconds / atempo``. By
@@ -134,11 +150,11 @@ def compute_atempo(raw_seconds: float) -> tuple[float, float]:
     7.5000000001 and dropped a clean idea).
     """
     if raw_seconds <= 0:
-        return SPEECH_ATEMPO, 0.0
+        return max_atempo, 0.0
     if raw_seconds <= MAX_EFFECTIVE_VO_SECONDS:
         return SPEECH_ATEMPO_MIN, raw_seconds
     needed = raw_seconds / MAX_EFFECTIVE_VO_SECONDS
-    if needed <= SPEECH_ATEMPO:
+    if needed <= max_atempo:
         # Audio fits with some speedup; effective lands exactly at the cap.
         # Return the cap as a literal to avoid FP drift past it.
         return needed, MAX_EFFECTIVE_VO_SECONDS
@@ -146,7 +162,7 @@ def compute_atempo(raw_seconds: float) -> tuple[float, float]:
     # and trigger shorten-and-retry. We DO return the math here (not the cap)
     # because the value carries meaningful "how badly does this overshoot"
     # information for the log line.
-    return SPEECH_ATEMPO, raw_seconds / SPEECH_ATEMPO
+    return max_atempo, raw_seconds / max_atempo
 
 
 async def _download(url: str, *, timeout: float = 60.0) -> bytes:
@@ -399,7 +415,13 @@ async def process_cartoon_row(
                             country=row.country,
                         )
                         costs.tts += tts.cost_usd
-                        vo_atempo, effective = compute_atempo(tts.duration_seconds)
+                        # Allow up to 1.5x on the retry to rescue borderline
+                        # overshoots that the default 1.3x cap would drop.
+                        # See SPEECH_ATEMPO_RETRY_MAX docstring for context.
+                        vo_atempo, effective = compute_atempo(
+                            tts.duration_seconds,
+                            max_atempo=SPEECH_ATEMPO_RETRY_MAX,
+                        )
                         shortened = True
 
                         if effective > MAX_EFFECTIVE_VO_SECONDS:

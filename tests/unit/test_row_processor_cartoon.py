@@ -337,6 +337,45 @@ def test_compute_atempo_boundary_returns_cap_exactly_no_fp_drift() -> None:
         assert SPEECH_ATEMPO_MIN < atempo <= 1.3
 
 
+def test_compute_atempo_retry_cap_rescues_borderline_drops() -> None:
+    """Regression for job-1780933855-3c614650: three idea-1s dropped on
+    retry-effective values of 7.578s / 8.747s / 9.793s — all rescuable
+    with a slightly higher atempo. The default 1.3x cap drops them; the
+    1.5x retry cap ships them at a still-natural speed."""
+    # r3: 7.578s raw — needs barely any speedup.
+    atempo, effective = compute_atempo(7.578, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
+    assert atempo == pytest.approx(7.578 / MAX_EFFECTIVE_VO_SECONDS)
+    assert effective == MAX_EFFECTIVE_VO_SECONDS
+
+    # r2: 8.747s raw — comfortably under the 1.5x ceiling.
+    atempo, effective = compute_atempo(8.747, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
+    assert atempo == pytest.approx(8.747 / MAX_EFFECTIVE_VO_SECONDS)
+    assert effective == MAX_EFFECTIVE_VO_SECONDS
+
+    # r4: 9.793s raw — would have been dropped at 1.3x (1.306 > 1.3) but
+    # fits cleanly at 1.31x under the 1.5x ceiling.
+    atempo, effective = compute_atempo(9.793, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
+    assert atempo == pytest.approx(9.793 / MAX_EFFECTIVE_VO_SECONDS)
+    assert effective == MAX_EFFECTIVE_VO_SECONDS
+
+    # Sanity: WITHOUT the retry cap (default 1.3x), all three still get
+    # dropped — proves the test would have failed pre-fix.
+    for raw in (7.578, 8.747, 9.793):
+        _, effective_default = compute_atempo(raw)
+        if raw / MAX_EFFECTIVE_VO_SECONDS > 1.3:
+            assert effective_default > MAX_EFFECTIVE_VO_SECONDS
+
+
+def test_compute_atempo_retry_cap_still_drops_truly_huge_vos() -> None:
+    """The 1.5x retry cap rescues borderline overshoots, NOT genuinely
+    oversized VOs. A 16s VO at 1.5x is still 10.67s — the caller's
+    `effective > MAX_EFFECTIVE_VO_SECONDS` gate has to still fire so the
+    idea is dropped instead of shipping with rushed audio."""
+    atempo, effective = compute_atempo(16.0, max_atempo=rpc.SPEECH_ATEMPO_RETRY_MAX)
+    assert atempo == pytest.approx(rpc.SPEECH_ATEMPO_RETRY_MAX)
+    assert effective > MAX_EFFECTIVE_VO_SECONDS
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
