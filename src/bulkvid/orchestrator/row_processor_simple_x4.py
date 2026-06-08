@@ -339,41 +339,55 @@ async def process_simple_x4_row(
         metadata["safety_matched"] = safety.matched
         metadata["safety_keyword"] = safety.matched_keyword
 
+        # ─── Language detection ───────────────────────────────────────────
+        # Runs synchronously before the parallel split so the image-side can
+        # resolve per-cell default CTAs (which fall back to the per-language
+        # "Read More" table when the operator didn't type one). Script-side
+        # reads ``language`` from the enclosing scope, no second detect call.
+        try:
+            lang_result = await detect_language(clients.openai, article_body)
+            costs.language += lang_result.cost_usd
+            language: str = lang_result.language
+            metadata["language"] = language
+        except Exception as e:
+            return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
+
         # ─── Stages 2 + 8 (parallel): image side + script side ────────────
         #
         # kie generates 4 cells as ONE 2x2 collage — there's no per-cell text
-        # control. So when a row mixes templated cells (which need a CLEAN
-        # photo so the Pillow overlay below doesn't double the text) with
-        # blank cells (which keep today's kie-baked headline/CTA style), we
-        # generate TWO collages in parallel and pick per-quadrant. When ALL
-        # cells are templated OR ALL are blank, we generate only the one
-        # collage we need — no extra kie cost.
+        # control. We work around it by generating ONE collage per UNIQUE CTA
+        # in the default cells (plus, when any cell is templated, one clean
+        # collage). For each cell we pick its index from the collage that
+        # matches its resolved CTA. Costs:
+        #
+        #   * All cells blank, all CTAs same → 1 default kie call (today)
+        #   * All cells templated             → 1 clean kie call only
+        #   * Default cells with N unique CTAs → N default kie calls + (1 clean
+        #                                       if any templated)
+        #
+        # Per-cell CTA on default cells (Yoav 2026-06-08): a CTA cell value
+        # applies to ITS cell only — does NOT bleed across sibling default
+        # cells. Cells with a blank CTA cell fall back to per-language
+        # "Read More" via the cta_defaults table.
 
         any_templated = cards_enabled and any(c.template_id for c in row.cards)
-        any_blank = (not cards_enabled) or any(not c.template_id for c in row.cards)
-        metadata["card_collage_normal"] = any_blank
-        metadata["card_collage_clean"] = any_templated
 
-        # CTA for the DEFAULT (with-text) kie collage. Yoav 2026-06-08: the
-        # operator's CTA cell value should drive what kie draws on default-
-        # template cells too — but ONLY for cells whose Template is blank.
-        # Templated cells (Template = 1/2) get their CTA via the Pillow
-        # overlay, so their CTA value must NOT bleed into the default kie
-        # prompt — otherwise a row that mixes templated + default cells
-        # would force the templated cells' CTA onto the unrelated default
-        # cells (Yoav 2026-06-08 caught this with CTA1="Tenta 20" on a
-        # Template-1 cell incorrectly appearing on the default cells too).
-        #
-        # kie generates 4 cells in one collage with a single CTA, so we pick
-        # the first non-blank CTA from any BLANK-template cell. When no
-        # blank-template cell has a CTA, no override → kie uses its built-in
-        # per-language "Read More" guidance from the prompt body.
-        default_cta_override = ""
-        for _card in row.cards:
-            if not _card.template_id and _card.cta:
-                default_cta_override = _card.cta
-                break
-        metadata["card_default_cta_override"] = default_cta_override[:80]
+        # Per-cell CTA resolution for default (blank-template) cells.
+        def _cta_for_default_cell(card: CardChoice) -> str:
+            if card.cta:
+                return card.cta
+            return default_cta_for_language(language)
+
+        default_cta_per_cell: dict[int, str] = {}
+        for _i, _card in enumerate(row.cards):
+            if cards_enabled and _card.template_id:
+                continue
+            default_cta_per_cell[_i] = _cta_for_default_cell(_card)
+
+        unique_default_ctas: list[str] = sorted(set(default_cta_per_cell.values()))
+        metadata["card_collage_clean"] = any_templated
+        metadata["card_default_collage_count"] = len(unique_default_ctas)
+        metadata["card_default_ctas"] = unique_default_ctas[:8]    # cap log size
 
         async def _image_side() -> list[bytes] | Exception:
             try:
@@ -382,10 +396,13 @@ async def process_simple_x4_row(
                 )
                 costs.vision += c1
 
-                async def _one_collage(skip_text: bool) -> list[bytes]:
+                async def _one_collage(skip_text: bool, cta: str = "") -> list[bytes]:
                     """Build one 2x2 collage (text or clean) and return its 4
                     optimized quadrants. Shares the source description so we
-                    only run gpt-4o vision once per row."""
+                    only run gpt-4o vision once per row.
+
+                    ``cta`` is the cta_override passed into the prompt; ignored
+                    when ``skip_text=True`` (clean photos have no kie text)."""
                     collage_prompt, c2 = await build_collage_prompt(
                         clients.openai,
                         description,
@@ -393,9 +410,7 @@ async def process_simple_x4_row(
                         settings_store=clients.settings_store,
                         safety=safety,
                         skip_text=skip_text,
-                        # cta_override applies only to the default (with-text)
-                        # collage; the clean collage has no kie-drawn CTA at all.
-                        cta_override=("" if skip_text else default_cta_override),
+                        cta_override=("" if skip_text else cta),
                     )
                     costs.collage_prompt += c2
 
@@ -426,27 +441,32 @@ async def process_simple_x4_row(
                     )
                     return list(optimized)
 
-                normal_task: asyncio.Task[list[bytes]] | None = (
-                    asyncio.create_task(_one_collage(skip_text=False))
-                    if any_blank
-                    else None
-                )
+                # Launch all needed collages in parallel.
                 clean_task: asyncio.Task[list[bytes]] | None = (
                     asyncio.create_task(_one_collage(skip_text=True))
                     if any_templated
                     else None
                 )
-                normal_quads = await normal_task if normal_task else None
-                clean_quads = await clean_task if clean_task else None
+                default_tasks: dict[str, asyncio.Task[list[bytes]]] = {
+                    cta: asyncio.create_task(_one_collage(skip_text=False, cta=cta))
+                    for cta in unique_default_ctas
+                }
 
+                clean_quads = await clean_task if clean_task else None
+                default_quads_by_cta: dict[str, list[bytes]] = {
+                    cta: await task for cta, task in default_tasks.items()
+                }
+
+                # Per-cell assignment: templated cells from the clean collage,
+                # default cells from the collage matching THEIR resolved CTA.
                 final_quads: list[bytes] = []
                 for i, card in enumerate(row.cards):
                     if cards_enabled and card.template_id:
                         assert clean_quads is not None
                         final_quads.append(clean_quads[i])
                     else:
-                        assert normal_quads is not None
-                        final_quads.append(normal_quads[i])
+                        cta_for_cell = default_cta_per_cell[i]
+                        final_quads.append(default_quads_by_cta[cta_for_cell][i])
                 return final_quads
             except Exception as e:
                 return e
@@ -456,11 +476,13 @@ async def process_simple_x4_row(
         ):
             """Same as image_vo's _script_side BUT also extracts a headline
             (when any card has a template chosen). Returns
-            (script_text, style_direction, language, vo_url, headline)."""
-            try:
-                lang = await detect_language(clients.openai, article_body)
-                costs.language += lang.cost_usd
+            (script_text, style_direction, language, vo_url, headline).
 
+            Note: language detection was lifted OUT of this coroutine to the
+            top of process_simple_x4_row (so default-cell CTA resolution can
+            use per-language Read-More fallbacks). ``language`` is read from
+            the enclosing scope; no second detect call here."""
+            try:
                 analysis = await classify_open_comments(clients.openai, row.open_comments)
                 costs.classify += analysis.cost_usd
 
@@ -469,7 +491,7 @@ async def process_simple_x4_row(
                     article_body=article_body,
                     country=row.country,
                     vertical=row.vertical,
-                    language=lang.language,
+                    language=language,
                     script_pattern=row.script_pattern,
                     open_comments=analysis,
                     settings_store=clients.settings_store,
@@ -477,7 +499,6 @@ async def process_simple_x4_row(
                     safety=safety,
                 )
                 costs.script += script.cost_usd
-                metadata["language"] = lang.language
                 metadata["open_comments_mode"] = analysis.mode.value
                 metadata["script_word_count"] = script.word_count
                 metadata["script_used_override"] = script.used_override
@@ -492,19 +513,19 @@ async def process_simple_x4_row(
                 headline, head_cost = await generate_card_headline(
                     clients.openai,
                     article_excerpt=article_body,
-                    language=lang.language,
+                    language=language,
                     vertical=row.vertical,
                 )
                 costs.headline += head_cost
                 metadata["card_headline_chars"] = len(headline)
 
             if not row.voice_over:
-                return script.script, script.style_direction, lang.language, None, headline
+                return script.script, script.style_direction, language, None, headline
 
             try:
                 tts_result = await clients.tts.synthesize(
                     text=script.script,
-                    language=lang.language,
+                    language=language,
                     style_prompt=script.style_direction,
                     country=row.country,
                 )
@@ -520,7 +541,7 @@ async def process_simple_x4_row(
                 return (
                     script.script,
                     script.style_direction,
-                    lang.language,
+                    language,
                     vo_upload.url,
                     headline,
                 )
