@@ -59,7 +59,11 @@ _COLLAGE_SYSTEM = (
 )
 
 
-def _collage_user_message(description: str, article_excerpt: str = "") -> str:
+def _collage_user_message(
+    description: str,
+    article_excerpt: str = "",
+    cta_override: str = "",
+) -> str:
     """Default (with-text) collage prompt for the legacy image_vo path.
 
     Hard-constrains every cell to the THREE-BAND LAYOUT Yoav specified
@@ -68,6 +72,11 @@ def _collage_user_message(description: str, article_excerpt: str = "") -> str:
     every cell, every run, regardless of what the inspiration seed image
     happened to look like — earlier prompts let the seed's banner style
     drive the output and produced inconsistent results across rows.
+
+    ``cta_override`` (when non-empty): the CTA band must use this EXACT
+    text on every cell. Replaces — does NOT append to — the per-language
+    Read-More guidance, so kie sees only one CTA instruction and doesn't
+    render both the override AND the per-language fallback stacked.
     """
     article_block = (
         "ARTICLE CONTEXT (the headline and the new photos must reflect THIS "
@@ -110,12 +119,26 @@ def _collage_user_message(description: str, article_excerpt: str = "") -> str:
         "- Length ≈ 8-14 words; may wrap to 2-4 lines.\n"
         "- Summarizes the article topic concretely (concrete nouns, no fluff).\n"
         "- Crisp, correctly spelled, legible.\n\n"
-        "CTA TEXT (bottom band — same CTA on ALL 4 cells):\n"
-        "- A generic \"Read More\" style call-to-action in the article's language.\n"
-        "- One short line, ideally 1-3 words. Examples by language: English "
-        "\"Read More\"; German \"Weiterlesen\"; Spanish \"Saber Más\"; French "
-        "\"En Savoir Plus\"; Italian \"Scopri di Più\"; Portuguese \"Saiba Mais\"; "
-        "Dutch \"Meer Weten\"; Polish \"Dowiedz Się Więcej\"; Hebrew \"למידע נוסף\".\n\n"
+        + (
+            # STRICT override path — only this CTA, nothing else. Repeated
+            # phrasing on purpose so kie can't merge it with any other
+            # CTA-related instruction earlier or later in the prompt.
+            "CTA TEXT (bottom band — STRICT, same on ALL 4 cells):\n"
+            f"- The CTA text on every cell is EXACTLY: \"{cta_override.strip()}\".\n"
+            "- Do NOT translate, paraphrase, expand, abbreviate, or reword it.\n"
+            "- Do NOT add a second CTA, secondary text line, or any other "
+            "call-to-action above, below, or beside it — only the EXACT "
+            "single line above appears on the bottom band.\n"
+            "- Crisp, correctly spelled, legible, in bold black sans-serif.\n\n"
+            if cta_override.strip()
+            else
+            "CTA TEXT (bottom band — same CTA on ALL 4 cells):\n"
+            "- A generic \"Read More\" style call-to-action in the article's language.\n"
+            "- One short line, ideally 1-3 words. Examples by language: English "
+            "\"Read More\"; German \"Weiterlesen\"; Spanish \"Saber Más\"; French "
+            "\"En Savoir Plus\"; Italian \"Scopri di Più\"; Portuguese \"Saiba Mais\"; "
+            "Dutch \"Meer Weten\"; Polish \"Dowiedz Się Więcej\"; Hebrew \"למידע נוסף\".\n\n"
+        ) +
         "PHOTOS (middle band — VARY across the 4 cells):\n"
         "- Realistic, photographic, contemporary. Relevant to the article topic.\n"
         "- DIFFERENT photo per cell so the 4 generated videos don't feel "
@@ -130,11 +153,20 @@ def _collage_user_message(description: str, article_excerpt: str = "") -> str:
         "4 identical-size cells, thin neutral divider). EACH cell follows the same 3-band "
         "layout: solid-white top band (~26% height) with a bold black sans-serif headline, "
         "photographic middle band (~60% height), solid-white bottom band (~14% height) with "
-        "a bold black sans-serif \"Read More\" CTA in the article's language. Same headline "
+        + (
+            f'the exact CTA "{cta_override.strip()}" in bold black sans-serif. '
+            if cta_override.strip()
+            else 'a bold black sans-serif "Read More" CTA in the article\'s language. '
+        )
+        + "Same headline "
         "and CTA on every cell; vary the middle photo per cell.\n"
         'Headline (verbatim, same on every cell, in the article\'s language): "[8-14 word headline]".\n'
-        'CTA (verbatim, same on every cell, in the article\'s language): "[short Read-More CTA]".\n'
-        "TOP-LEFT cell photo: [new article-relevant scene, photographic, no text].\n"
+        + (
+            f'CTA (verbatim, same on every cell — STRICT EXACT TEXT, no translation): "{cta_override.strip()}".\n'
+            if cta_override.strip()
+            else 'CTA (verbatim, same on every cell, in the article\'s language): "[short Read-More CTA]".\n'
+        )
+        + "TOP-LEFT cell photo: [new article-relevant scene, photographic, no text].\n"
         "TOP-RIGHT cell photo: [different article-relevant scene, photographic, no text].\n"
         "BOTTOM-LEFT cell photo: [different article-relevant scene, photographic, no text].\n"
         "BOTTOM-RIGHT cell photo: [different article-relevant scene, photographic, no text].\n"
@@ -271,20 +303,14 @@ async def build_collage_prompt(
     if skip_text:
         user_message = _collage_user_message_no_text(description, article_excerpt)
     else:
-        user_message = _collage_user_message(description, article_excerpt)
-        if cta_override.strip():
-            # Append a hard CTA override block AFTER the body so kie reads it
-            # last and treats it as the final word on what to draw.
-            user_message += (
-                "\n\nCTA OVERRIDE (STRICT — supersedes the per-language Read-More "
-                "guidance above):\n"
-                f"- Use this EXACT text on every cell's bottom CTA band, verbatim: "
-                f'"{cta_override.strip()}"\n'
-                "- Do NOT translate, paraphrase, expand, or reword it.\n"
-                "- Use the SAME CTA text on all 4 cells.\n"
-                "- Crisp, correctly spelled, legible, in the same bold black "
-                "sans-serif styling as the rest of the bottom band."
-            )
+        # cta_override gets baked INTO the body of the prompt (single source
+        # of CTA truth) rather than appended as a separate "override" block.
+        # The append-style block had kie rendering both the override AND the
+        # per-language Read-More fallback stacked — see Yoav 2026-06-08
+        # "Read More + Tenta 20 both showing".
+        user_message = _collage_user_message(
+            description, article_excerpt, cta_override=cta_override
+        )
     if safety.matched and settings_store is not None:
         # No explicit default — let the store fall through to the registered
         # default (``SENSITIVE_APPAREL_RULES_DEFAULT``).

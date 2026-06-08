@@ -356,14 +356,21 @@ async def process_simple_x4_row(
 
         # CTA for the DEFAULT (with-text) kie collage. Yoav 2026-06-08: the
         # operator's CTA cell value should drive what kie draws on default-
-        # template cells too — not just the templated overlay path. kie
-        # generates all 4 cells in one call with a single CTA, so we pick
-        # the first non-blank CTA across the row and pass it as an override.
-        # When all CTA cells are blank, no override → kie uses its built-in
+        # template cells too — but ONLY for cells whose Template is blank.
+        # Templated cells (Template = 1/2) get their CTA via the Pillow
+        # overlay, so their CTA value must NOT bleed into the default kie
+        # prompt — otherwise a row that mixes templated + default cells
+        # would force the templated cells' CTA onto the unrelated default
+        # cells (Yoav 2026-06-08 caught this with CTA1="Tenta 20" on a
+        # Template-1 cell incorrectly appearing on the default cells too).
+        #
+        # kie generates 4 cells in one collage with a single CTA, so we pick
+        # the first non-blank CTA from any BLANK-template cell. When no
+        # blank-template cell has a CTA, no override → kie uses its built-in
         # per-language "Read More" guidance from the prompt body.
         default_cta_override = ""
         for _card in row.cards:
-            if _card.cta:
+            if not _card.template_id and _card.cta:
                 default_cta_override = _card.cta
                 break
         metadata["card_default_cta_override"] = default_cta_override[:80]

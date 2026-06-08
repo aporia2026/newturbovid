@@ -234,6 +234,33 @@ def _wrap_text_to_width(
     return lines
 
 
+def _fit_pill_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    max_width: int,
+    initial_size: int,
+    min_size: int,
+    font_override: str | None,
+) -> ImageFont.ImageFont:
+    """Pick the largest font where ``text`` fits in ``max_width`` pixels.
+
+    Used by the CTA pill so a long localised string (e.g. Polish
+    "Dowiedz Się Więcej >>") shrinks down rather than overflowing the
+    pill. Walks the font size DOWN from ``initial_size``; floors at
+    ``min_size`` accepting overflow rather than degrading further.
+    """
+    size = initial_size
+    while size >= min_size:
+        font = _load_font(size, override=font_override)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        if text_w <= max_width:
+            return font
+        size -= max(2, size // 20)
+    return _load_font(min_size, override=font_override)
+
+
 def _fit_title_font(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -416,9 +443,23 @@ def _render_template_1(
             y += lh + line_spacing
 
     # CTA pill, centered horizontally near the bottom of the strip.
+    # Pill font is capped at 60% of the title font so the title always
+    # reads as the dominant element (Yoav 2026-06-08: "the CTA text is
+    # bigger than the title text — it should be the other way around").
+    # Pill auto-shrinks to fit when the localized CTA is long
+    # (e.g. Polish "Dowiedz Się Więcej >>" overflowed at the fixed size).
     if cta:
-        pill_font = _load_font(
-            max(14, int(strip_h * 0.22)), override=font_override
+        title_size_actual = getattr(font, "size", int(strip_h * 0.22))
+        pill_max_width = int(width * 0.92)
+        pill_pad_x = int(width * 0.04)
+        pill_initial = max(14, int(title_size_actual * 0.60))
+        pill_min = max(12, int(strip_h * 0.13))
+        pill_font = _fit_pill_font(
+            draw, cta,
+            max_width=pill_max_width - pill_pad_x * 2,
+            initial_size=pill_initial,
+            min_size=pill_min,
+            font_override=font_override,
         )
         cta_center_y = image_h + strip_h - int(strip_h * 0.22)
         _draw_pill(
@@ -429,9 +470,9 @@ def _render_template_1(
             text_color=design.cta_text_color,
             center_x=width // 2,
             center_y=cta_center_y,
-            pad_x=int(width * 0.04),
+            pad_x=pill_pad_x,
             pad_y=int(strip_h * 0.06),
-            max_width=int(width * 0.85),
+            max_width=pill_max_width,
         )
 
     return canvas
@@ -490,18 +531,20 @@ def _render_template_2(
     pill_bottom_margin = int(strip_h * 0.06)    # gap between pill and canvas bottom
     title_to_pill_gap = int(strip_h * 0.05)     # gap between title block and pill top
 
-    # Pill geometry (measure first; draw after the title so z-order keeps text
-    # legible if anything overlaps).
-    pill_font = _load_font(
-        max(14, int(strip_h * 0.20)), override=font_override
-    )
+    # Pill geometry — pill font is sized AFTER the title so we can cap it
+    # below the title font (Yoav 2026-06-08: title must read as the dominant
+    # element). We use a placeholder size to measure pill height; the actual
+    # pill font is computed below using the fitted title font's actual size.
     pill_pad_x = int(width * 0.04)
     pill_pad_y = int(strip_h * 0.06)
-    pill_text = cta or ""
-    pill_bbox = draw.textbbox((0, 0), pill_text or "X", font=pill_font)
-    pill_text_h = pill_bbox[3] - pill_bbox[1]
-    pill_h_actual = pill_text_h + pill_pad_y * 2
     pill_full_width = int(width * 0.94)
+    # Placeholder height — recomputed once we have the real pill font.
+    placeholder_pill_font = _load_font(
+        max(14, int(strip_h * 0.18)), override=font_override
+    )
+    placeholder_bbox = draw.textbbox((0, 0), cta or "X", font=placeholder_pill_font)
+    placeholder_text_h = placeholder_bbox[3] - placeholder_bbox[1]
+    pill_h_actual = placeholder_text_h + pill_pad_y * 2
     pill_center_y = height - pill_bottom_margin - pill_h_actual // 2
     pill_top = pill_center_y - pill_h_actual // 2
 
@@ -541,6 +584,16 @@ def _render_template_2(
             y += lh + line_spacing
 
     if cta:
+        title_size_actual = getattr(font, "size", int(strip_h * 0.28))
+        pill_initial = max(14, int(title_size_actual * 0.60))
+        pill_min = max(12, int(strip_h * 0.12))
+        pill_font = _fit_pill_font(
+            draw, cta,
+            max_width=pill_full_width - pill_pad_x * 2,
+            initial_size=pill_initial,
+            min_size=pill_min,
+            font_override=font_override,
+        )
         _draw_pill(
             canvas,
             cta,

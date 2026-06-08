@@ -178,9 +178,10 @@ async def test_build_collage_asks_for_text_cta_and_forbids_real_brands() -> None
 
 @respx.mock
 async def test_build_collage_includes_cta_override_when_provided() -> None:
-    """A non-empty cta_override appends a STRICT block telling kie to use that
-    exact text on every cell. Used by the simple_x4 default path so operator-
-    typed CTA cells drive the rendered CTA. Yoav 2026-06-08."""
+    """A non-empty cta_override REPLACES the per-language Read-More guidance
+    in the prompt body — kie sees only the override CTA, never both. Used by
+    the simple_x4 default path so operator-typed CTA cells drive the
+    rendered CTA. Yoav 2026-06-08."""
     captured: list[dict] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -194,15 +195,26 @@ async def test_build_collage_includes_cta_override_when_provided() -> None:
         )
 
     user_msg = captured[0]["messages"][1]["content"]
-    assert "CTA OVERRIDE" in user_msg, "override block missing from prompt"
-    assert "Buy Now Today >>" in user_msg, "exact CTA text not echoed into prompt"
-    assert "verbatim" in user_msg.lower()
+    # The exact override text must appear multiple times (emphasis through
+    # repetition stops kie from collapsing it to a per-language fallback).
+    assert user_msg.count("Buy Now Today >>") >= 2, (
+        "override CTA must be echoed multiple times for emphasis"
+    )
+    # STRICT instructions present so kie treats it as the literal text.
+    assert "STRICT" in user_msg
+    # The per-language fallback list (Read More / Weiterlesen / Saber Más)
+    # must NOT appear when an override is set — otherwise kie renders BOTH.
+    assert "Read More" not in user_msg, (
+        "per-language fallback bled through; kie would render both"
+    )
+    assert "Saber Más" not in user_msg
+    assert "Weiterlesen" not in user_msg
 
 
 @respx.mock
 async def test_build_collage_omits_override_block_when_cta_override_blank() -> None:
     """When cta_override is empty (default), the prompt keeps its per-language
-    Read-More guidance and never inserts the override block."""
+    Read-More guidance so kie generates a localised CTA."""
     captured: list[dict] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -214,7 +226,11 @@ async def test_build_collage_omits_override_block_when_cta_override_blank() -> N
         await build_collage_prompt(client, description="A street scene.")
 
     user_msg = captured[0]["messages"][1]["content"]
-    assert "CTA OVERRIDE" not in user_msg
+    # Per-language guidance present — kie picks the right CTA for the article's
+    # language without any operator/admin override.
+    assert "Read More" in user_msg
+    assert "Saber Más" in user_msg
+    assert "Weiterlesen" in user_msg
 
 
 @respx.mock
