@@ -195,6 +195,62 @@ def test_template_3_navy_band_present_above_pill() -> None:
         img.close()
 
 
+def test_template_3_font_picker_routes_by_script() -> None:
+    """``_pick_template_3_font_path`` routes by the FIRST non-Latin char it
+    sees: Hebrew → Heebo, Arabic → Cairo, Cyrillic → Oswald; everything
+    else (including Vietnamese and other Latin Extended) → Anton."""
+    from bulkvid.pipeline.card_renderer import _pick_template_3_font_path
+
+    # Pure Latin (incl. accented + Vietnamese) → Anton.
+    assert "Anton" in _pick_template_3_font_path("HELLO WORLD")
+    assert "Anton" in _pick_template_3_font_path("TURNUS REHABILITACYJNY DLA SENIORÓW")
+    assert "Anton" in _pick_template_3_font_path("LEADERSHIP FÉMININ")
+    assert "Anton" in _pick_template_3_font_path("KHÁM PHÁ NGAY")    # Vietnamese
+    assert "Anton" in _pick_template_3_font_path("")                  # empty falls through
+
+    # Cyrillic → Oswald.
+    assert "Oswald" in _pick_template_3_font_path("ОТКРЫТЬ ДЛЯ СЕБЯ")
+    # Hebrew → Heebo.
+    assert "Heebo" in _pick_template_3_font_path("גלה עוד")
+    # Arabic → Cairo.
+    assert "Cairo" in _pick_template_3_font_path("اكتشف المزيد")
+
+    # First-script-wins: a string that starts Latin then hits Cyrillic
+    # still routes to Cyrillic (we don't try to render mixed-script
+    # headlines — the gpt-5.4-mini headline is always one language).
+    assert "Oswald" in _pick_template_3_font_path("New Открыть")
+
+
+def test_template_3_renders_with_each_script_without_crashing() -> None:
+    """End-to-end: T3 must render headlines in each supported script
+    without raising. We don't pixel-inspect the glyphs (font hinting
+    drifts across versions); we just confirm the renderer picks a font
+    and produces a valid PNG."""
+    bg = _solid_bg(color=(80, 120, 200))
+    scripts = {
+        "Polish":   "TURNUS REHABILITACYJNY NAD BAŁTYKIEM",
+        "Russian":  "ОТКРЫТЬ ДЛЯ СЕБЯ НОВОЕ ПУТЕШЕСТВИЕ",
+        "Hebrew":   "טיולים מאורגנים לגיל השלישי",
+        "Arabic":   "اكتشف رحلات جديدة لكبار السن",
+        "Vietnamese": "KHÁM PHÁ HÀNH TRÌNH MỚI",
+    }
+    for label, headline in scripts.items():
+        out = render_card_bytes(
+            template_id=TEMPLATE_3,
+            background_image_bytes=bg,
+            headline=headline,
+            cta="DISCOVER MORE >>",
+            width=1080,
+            height=1080,
+        )
+        img = _decode(out)
+        try:
+            assert img.size == (1080, 1080), f"{label}: bad size"
+            assert len(out) > 2048, f"{label}: output too small"
+        finally:
+            img.close()
+
+
 def test_template_3_red_pill_at_bottom_with_yellow_text() -> None:
     """Template 3 anchors a full-width red pill at the very bottom of the
     canvas. Sample a pixel inside the pill area, away from the centered

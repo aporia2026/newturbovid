@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -157,6 +158,93 @@ _SYSTEM_FONT_CANDIDATES: Final[tuple[str, ...]] = (
 )
 
 
+# ── Template-3 display fonts ────────────────────────────────────────────────
+#
+# T3's mockup uses a heavy condensed display sans (Anton/Bebas-style), not
+# Inter's standard-width Bold. Inter has no width axis so no variation can
+# match the mockup; the only fix is to swap fonts.
+#
+# Anton (single weight, Latin + Latin Extended + Vietnamese) is the closest
+# free match. Three script-specific fallbacks cover the languages Anton
+# doesn't — chosen so each fallback is the closest "heavy condensed display
+# sans" available for its script:
+#
+#   * Cyrillic (Russian, Ukrainian, Bulgarian, …) → Oswald Variable @ 700
+#   * Hebrew                                       → Heebo Variable @ 900
+#   * Arabic                                       → Cairo Variable @ 900
+#
+# The picker (``_pick_template_3_font_path``) scans the headline for the first
+# character belonging to one of those scripts and routes the whole render
+# through the matching font. Latin (incl. Vietnamese) falls through to Anton.
+# All four fonts ship under the SIL Open Font License.
+_T3_FONT_LATIN: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Anton-Regular.ttf"
+)
+_T3_FONT_CYRILLIC: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Oswald-Variable.ttf"
+)
+_T3_FONT_HEBREW: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Heebo-Variable.ttf"
+)
+_T3_FONT_ARABIC: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Cairo-Variable.ttf"
+)
+
+# Weight pin per font (None = single-weight font, skip variation).
+_T3_FONT_WEIGHTS: Final[dict[str, float | None]] = {
+    str(_T3_FONT_LATIN):    None,      # Anton ships in one weight
+    str(_T3_FONT_CYRILLIC): 700.0,     # Oswald Bold (it caps at ExtraBold/700)
+    str(_T3_FONT_HEBREW):   900.0,     # Heebo Black
+    str(_T3_FONT_ARABIC):   900.0,     # Cairo Black
+}
+
+
+def _pick_template_3_font_path(text: str) -> str:
+    """Pick the T3 font whose glyph set matches the text's script.
+
+    Scans ``text`` char-by-char for the first character belonging to a
+    non-Latin script we have a dedicated font for; falls through to Anton
+    (Latin) when the text is purely Latin/Vietnamese or empty.
+
+    Codepoint ranges:
+      * Hebrew:   U+0590..U+05FF (and Hebrew Presentation Forms FB1D..FB4F)
+      * Arabic:   U+0600..U+06FF (Arabic), U+0750..U+077F (Arabic Suppl.)
+      * Cyrillic: U+0400..U+04FF (Cyrillic), U+0500..U+052F (Cyrillic Suppl.)
+    """
+    for ch in text or "":
+        cp = ord(ch)
+        if 0x0590 <= cp <= 0x05FF or 0xFB1D <= cp <= 0xFB4F:
+            return str(_T3_FONT_HEBREW)
+        if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
+            return str(_T3_FONT_ARABIC)
+        if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
+            return str(_T3_FONT_CYRILLIC)
+    return str(_T3_FONT_LATIN)
+
+
+def _load_template_3_font(text: str, size: int) -> ImageFont.ImageFont:
+    """Load the T3 display font matching ``text``'s script at ``size`` px.
+
+    For variable fonts (Oswald, Heebo, Cairo) we pin the weight axis to the
+    pre-selected Black-ish weight; for Anton (single weight) we skip the
+    variation call. On any failure falls through to PIL's bitmap font so a
+    bad font file never crashes the renderer.
+    """
+    path = _pick_template_3_font_path(text)
+    try:
+        font = ImageFont.truetype(path, size=size)
+    except OSError as e:
+        _log.warning("card_t3_font_load_failed", path=path, error=str(e))
+        return ImageFont.load_default()
+    weight = _T3_FONT_WEIGHTS.get(path)
+    if weight is not None:
+        try:
+            font.set_variation_by_axes([weight])
+        except (OSError, AttributeError):
+            pass    # static font or older Pillow — already at the bundled weight
+    return font
+
+
 def _find_font_path(override: str | None = None) -> str | None:
     """Return the first usable TTF path, or None to trigger the bitmap fallback.
 
@@ -265,6 +353,7 @@ def _fit_pill_font(
     initial_size: int,
     min_size: int,
     font_override: str | None,
+    font_loader: "Callable[[int], ImageFont.ImageFont] | None" = None,
 ) -> ImageFont.ImageFont:
     """Pick the largest font where ``text`` fits in ``max_width`` pixels.
 
@@ -272,16 +361,21 @@ def _fit_pill_font(
     "Dowiedz Się Więcej >>") shrinks down rather than overflowing the
     pill. Walks the font size DOWN from ``initial_size``; floors at
     ``min_size`` accepting overflow rather than degrading further.
+
+    ``font_loader`` is an optional callable ``(size) -> ImageFont`` used by
+    Template 3's script-aware loader. When None we fall back to the
+    bundled Inter loader (T1 / T2 / CTA pill default path).
     """
+    loader = font_loader or (lambda s: _load_font(s, override=font_override))
     size = initial_size
     while size >= min_size:
-        font = _load_font(size, override=font_override)
+        font = loader(size)
         bbox = draw.textbbox((0, 0), text, font=font)
         text_w = bbox[2] - bbox[0]
         if text_w <= max_width:
             return font
         size -= max(2, size // 20)
-    return _load_font(min_size, override=font_override)
+    return loader(min_size)
 
 
 def _fit_title_font(
@@ -294,16 +388,22 @@ def _fit_title_font(
     initial_size: int,
     min_size: int,
     font_override: str | None,
+    font_loader: "Callable[[int], ImageFont.ImageFont] | None" = None,
 ) -> tuple[ImageFont.ImageFont, list[str]]:
     """Pick the largest font size where the wrapped text fits the box.
 
     Walks the font size DOWN from ``initial_size`` until the wrapped block
     fits both width and height constraints; floors at ``min_size``. Returns
     the font and the wrapped lines so callers can draw without re-wrapping.
+
+    ``font_loader`` lets a template plug in a non-default font (e.g.
+    Template 3 uses ``_load_template_3_font`` to pick Anton / Oswald /
+    Heebo / Cairo per script).
     """
+    loader = font_loader or (lambda s: _load_font(s, override=font_override))
     size = initial_size
     while size >= min_size:
-        font = _load_font(size, override=font_override)
+        font = loader(size)
         lines = _wrap_text_to_width(draw, text, font, max_width)
         if not lines:
             return font, []
@@ -320,7 +420,7 @@ def _fit_title_font(
                 return font, lines
         size -= max(2, size // 20)
     # Floor: accept overflow at min_size rather than degrade further.
-    font = _load_font(min_size, override=font_override)
+    font = loader(min_size)
     lines = _wrap_text_to_width(draw, text, font, max_width)
     return font, lines
 
@@ -693,6 +793,12 @@ def _render_template_3(
     title_max_h = max(int(band_h * 0.50), title_bottom_bound - title_top_bound)
 
     headline_text = (headline or "").upper()    # mockup uses all-caps headlines
+    # T3 uses a heavy condensed display font (Anton for Latin, Oswald for
+    # Cyrillic, Heebo for Hebrew, Cairo for Arabic) instead of Inter — see
+    # ``_load_template_3_font`` for the per-script picker. The font_loader
+    # closure freezes the headline so every size-fit attempt picks the
+    # matching font.
+    title_loader = lambda s: _load_template_3_font(headline_text, s)    # noqa: E731
     font, lines = _fit_title_font(
         draw,
         headline_text,
@@ -702,6 +808,7 @@ def _render_template_3(
         initial_size=int(band_h * 0.42),
         min_size=max(14, int(band_h * 0.22)),
         font_override=font_override,
+        font_loader=title_loader,
     )
 
     if lines:
@@ -742,12 +849,19 @@ def _render_template_3(
         title_size_actual = getattr(font, "size", int(band_h * 0.36))
         pill_initial = max(14, int(title_size_actual * 0.60))
         pill_min = max(12, int(pill_region_h * 0.30))
+        # Reuse the script-aware loader for the CTA pill too — keeps the
+        # title and CTA visually consistent (the mockup uses the same
+        # display font for both) and makes a Polish CTA like
+        # "DOWIEDZ SIĘ WIĘCEJ >>" render in Anton, a Hebrew CTA render
+        # in Heebo, etc.
+        pill_loader = lambda s: _load_template_3_font(cta, s)    # noqa: E731
         pill_font = _fit_pill_font(
             draw, cta,
             max_width=width - pill_pad_x * 2,
             initial_size=pill_initial,
             min_size=pill_min,
             font_override=font_override,
+            font_loader=pill_loader,
         )
         bbox = draw.textbbox((0, 0), cta, font=pill_font)
         text_w = bbox[2] - bbox[0]
