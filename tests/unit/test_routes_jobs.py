@@ -33,6 +33,7 @@ from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
+    TAB_SIMPLE_X4,
     JobQueue,
 )
 from bulkvid.routes import jobs as jobs_routes
@@ -154,6 +155,36 @@ def _simple_payload() -> dict:
     }
 
 
+def _simple_x4_payload(
+    *,
+    cards: list[dict] | None = None,
+) -> dict:
+    """Minimal valid simple_x4 submit body. ``cards`` defaults to all-blank
+    (no template overlay)."""
+    if cards is None:
+        cards = [{"template_id": "", "cta": ""}] * 4
+    return {
+        "sheet_id": "sheet-X4",
+        "worksheet": "simple x4",
+        "tab_type": TAB_SIMPLE_X4,
+        "rows_simple_x4": [
+            {
+                "row_num": 3,
+                "country": "DE",
+                "vertical": "Car Deals PR",
+                "article_url": "https://example.com/article",
+                "manual_image_url": "https://example.com/seed.png",
+                "voice_over": True,
+                "zapcap": False,
+                "aspect_ratio": "9:16",
+                "script_pattern": "",
+                "cards": cards,
+                "open_comments": "",
+            }
+        ],
+    }
+
+
 def _cartoon_payload() -> dict:
     return {
         "sheet_id": "sheet-C",
@@ -242,6 +273,102 @@ def test_submit_cartoon_without_rows_returns_400(client: TestClient) -> None:
     payload["rows_cartoon"] = []
     r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
     assert r.status_code == 400
+
+
+def test_submit_simple_x4_returns_job_id(client: TestClient) -> None:
+    r = client.post("/jobs", json=_simple_x4_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["row_count"] == 1
+
+
+def test_submit_simple_x4_without_rows_returns_400(client: TestClient) -> None:
+    payload = _simple_x4_payload()
+    payload["rows_simple_x4"] = []
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
+
+
+def test_simple_x4_route_payload_with_invalid_cards_still_returns_200(
+    client: TestClient,
+) -> None:
+    """Garbage template_id + over-long CTA + missing cards must NOT 4xx —
+    coercion in ``_build_simple_x4_row`` cleans them server-side."""
+    payload = _simple_x4_payload(
+        cards=[
+            {"template_id": "3", "cta": "x" * 500},     # bad id + long CTA
+            {"template_id": "maybe", "cta": "ok"},
+        ]    # only 2 cards (Apps Script always sends 4 — defensive)
+    )
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 200, r.text
+
+
+def test_build_simple_x4_row_coerces_invalid_template_to_empty() -> None:
+    """Direct unit test on the server-side coercion helper."""
+    from bulkvid.routes.jobs import CardChoiceIn, SimpleX4RowIn, _build_simple_x4_row
+
+    r_in = SimpleX4RowIn(
+        row_num=3,
+        article_url="https://example.com/a",
+        manual_image_url="https://example.com/i.png",
+        cards=[
+            CardChoiceIn(template_id="3", cta="Buy"),
+            CardChoiceIn(template_id="maybe", cta="Look"),
+            CardChoiceIn(template_id="1", cta="Click"),
+            CardChoiceIn(template_id="", cta=""),
+        ],
+    )
+    row = _build_simple_x4_row(r_in)
+    assert [c.template_id for c in row.cards] == ["", "", "1", ""]
+    assert [c.cta for c in row.cards] == ["Buy", "Look", "Click", ""]
+
+
+def test_build_simple_x4_row_truncates_long_cta() -> None:
+    from bulkvid.routes.jobs import CardChoiceIn, SimpleX4RowIn, _build_simple_x4_row
+
+    r_in = SimpleX4RowIn(
+        row_num=3,
+        article_url="https://example.com/a",
+        manual_image_url="https://example.com/i.png",
+        cards=[CardChoiceIn(template_id="1", cta="x" * 500)],
+    )
+    row = _build_simple_x4_row(r_in)
+    assert len(row.cards[0].cta) == 80
+
+
+def test_build_simple_x4_row_pads_cards_to_four() -> None:
+    """Apps Script always sends 4 entries; a hand-crafted payload with fewer
+    must not blow up — pad with empty entries."""
+    from bulkvid.routes.jobs import CardChoiceIn, SimpleX4RowIn, _build_simple_x4_row
+
+    r_in = SimpleX4RowIn(
+        row_num=3,
+        article_url="https://example.com/a",
+        manual_image_url="https://example.com/i.png",
+        cards=[CardChoiceIn(template_id="1", cta="Go")],    # only 1
+    )
+    row = _build_simple_x4_row(r_in)
+    assert len(row.cards) == 4
+    assert row.cards[0].template_id == "1"
+    assert row.cards[0].cta == "Go"
+    assert all(c.template_id == "" and c.cta == "" for c in row.cards[1:])
+
+
+def test_build_simple_x4_row_trims_cards_beyond_four() -> None:
+    """A payload with MORE than 4 cards is truncated, never crashed."""
+    from bulkvid.routes.jobs import CardChoiceIn, SimpleX4RowIn, _build_simple_x4_row
+
+    r_in = SimpleX4RowIn(
+        row_num=3,
+        article_url="https://example.com/a",
+        manual_image_url="https://example.com/i.png",
+        cards=[CardChoiceIn(template_id="1", cta=f"c{i}") for i in range(7)],
+    )
+    row = _build_simple_x4_row(r_in)
+    assert len(row.cards) == 4
+    assert [c.cta for c in row.cards] == ["c0", "c1", "c2", "c3"]
 
 
 def test_submit_simple_without_rows_returns_400(client: TestClient) -> None:

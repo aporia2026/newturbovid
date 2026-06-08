@@ -15,6 +15,16 @@ const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
+const TAB_SIMPLE_X4 = 'simple_x4';
+
+// Card-template preview asset URLs. Run `python tools/upload_template_previews.py`
+// from the repo to upload the PNGs to GCS, then paste the returned URLs here.
+// The migration menu (`migrateSimpleX4Columns`) writes these as =IMAGE() formulas
+// into row 1. Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7.
+const CARD_TEMPLATE_PREVIEW_URLS = {
+  '1': 'https://storage.googleapis.com/aporia-unleash/bulkvid/templates/template_1.png',
+  '2': 'https://storage.googleapis.com/aporia-unleash/bulkvid/templates/template_2.png',
+};
 
 // Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
 // its uWSGI dispatcher cannot find a free worker quickly (cold-start, recycle,
@@ -48,6 +58,27 @@ const FOUR_IMAGES_COLS = {
   lastInputCol: 13,
 };
 
+// Simple x4 (post-migration). Same A-H as IMAGE_VO_COLS, plus 8 new columns
+// for per-video Template + CTA pairs, then Open Comments and Ready Video 1-4
+// shifted right by 8. Data starts at sheet ROW 3 (row 1 = preview header,
+// row 2 = column names). Plan _plans/2026-06-08-simple-x4-template-cards.md §D.1.
+const SIMPLE_X4_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  voiceOver: 5, zapcap: 6, aspectRatio: 7, scriptPattern: 8,
+  template1: 9, cta1: 10,
+  template2: 11, cta2: 12,
+  template3: 13, cta3: 14,
+  template4: 15, cta4: 16,
+  openComments: 17,
+  readyVideo1: 18, readyVideo2: 19, readyVideo3: 20, readyVideo4: 21,
+  lastInputCol: 17,
+};
+
+// Row indices for the post-migration simple_x4 layout.
+const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
+const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
+const SIMPLE_X4_FIRST_DATA_ROW = 3; // data starts here
+
 
 // ─── Menu ────────────────────────────────────────────────────────────────────
 
@@ -59,6 +90,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Show job status sidebar', 'showJobsSidebar')
     .addSeparator()
+    .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
 }
@@ -100,10 +132,12 @@ function configureBackendUrl() {
 function _detectTabType(sheet) {
   // Detect by sheet NAME first (these tabs share the Image-VO columns).
   const name = String(sheet.getName() || '').toLowerCase().trim();
-  // "simple x4" -> the 4-video GENERATION flow (Manual Image as inspiration ->
-  // generate 4 new images -> 4 videos). Must be checked BEFORE plain "simple",
-  // since the name also contains "simple".
-  if (name.indexOf('x4') !== -1) return TAB_IMAGE_VO;
+  // "simple x4" -> needs disambiguation: post-migration it has 2 header rows
+  // and the new Template/CTA columns; pre-migration it's the legacy image_vo
+  // shape. Must be checked BEFORE plain "simple" since the name contains it.
+  if (name.indexOf('x4') !== -1) {
+    return _isSimpleX4Migrated(sheet) ? TAB_SIMPLE_X4 : TAB_IMAGE_VO;
+  }
   // "simple" -> ONE video from the existing Manual Image, NO image generation.
   if (name.indexOf('simple') !== -1) return TAB_SIMPLE;
   // "cartoon" -> generate animated multi-shot videos from text (no seed image).
@@ -118,6 +152,21 @@ function _detectTabType(sheet) {
   if (headers.indexOf('how many') !== -1) return TAB_FOUR_IMAGES;
   if (headers.indexOf('manual image') !== -1) return TAB_IMAGE_VO;
   return null;
+}
+
+
+/** Probe a tab to decide whether it has been migrated to the new simple_x4
+ *  layout. Migrated = "Template 1" header sits at row 2 col I (the position
+ *  the migration menu writes). Returns true even if other things look weird,
+ *  because the header is the authoritative signal — if the operator added
+ *  "Template 1" by hand, the backend can read the tab. */
+function _isSimpleX4Migrated(sheet) {
+  if (sheet.getLastRow() < SIMPLE_X4_HEADER_ROW) return false;
+  if (sheet.getLastColumn() < SIMPLE_X4_COLS.template1) return false;
+  const cell = sheet
+    .getRange(SIMPLE_X4_HEADER_ROW, SIMPLE_X4_COLS.template1)
+    .getValue();
+  return String(cell || '').toLowerCase().trim().indexOf('template 1') === 0;
 }
 
 
@@ -199,6 +248,38 @@ function _readCartoonRow(sheet, rowNum) {
 }
 
 
+function _readSimpleX4Row(sheet, rowNum) {
+  // Post-migration simple_x4 layout: same A-H as image_vo + 4 (template, cta)
+  // pairs + open_comments at col Q. Backend rejects Template* values that
+  // aren't "" / "1" / "2", but we ALSO validate here for fast UX feedback
+  // (Apps Script dialog) rather than waiting for a 400 from the server.
+  const cols = SIMPLE_X4_COLS;
+  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  const cards = [];
+  const tplIdxs = [cols.template1, cols.template2, cols.template3, cols.template4];
+  const ctaIdxs = [cols.cta1, cols.cta2, cols.cta3, cols.cta4];
+  for (var i = 0; i < 4; i++) {
+    cards.push({
+      template_id: _cell(values, tplIdxs[i]),
+      cta: _cell(values, ctaIdxs[i]),
+    });
+  }
+  return {
+    row_num: rowNum,
+    country: _cell(values, cols.country),
+    vertical: _cell(values, cols.vertical),
+    article_url: _cell(values, cols.article),
+    manual_image_url: _cell(values, cols.manualImage),
+    voice_over: _yes(_cell(values, cols.voiceOver), true),
+    zapcap: _yes(_cell(values, cols.zapcap), false),
+    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    script_pattern: _cell(values, cols.scriptPattern),
+    cards: cards,
+    open_comments: _cell(values, cols.openComments),
+  };
+}
+
+
 function _validateImageVO(r) {
   if (!r.article_url) return 'article URL missing';
   if (!r.manual_image_url) return 'manual image URL missing';
@@ -220,15 +301,38 @@ function _validateFourImages(r) {
 }
 
 
+function _validateSimpleX4(r) {
+  if (!r.article_url) return 'article URL missing';
+  if (!r.manual_image_url) return 'manual image URL missing';
+  // Card values: backend coerces invalid template ids to "" silently, but it's
+  // friendlier to flag obvious typos at submit time so the operator doesn't
+  // ship 4 videos and wonder why no overlay appeared.
+  for (var i = 0; i < r.cards.length; i++) {
+    var t = r.cards[i].template_id;
+    if (t && t !== '1' && t !== '2') {
+      return 'Template ' + (i + 1) + ' must be empty, 1, or 2 (got "' + t + '")';
+    }
+  }
+  return null;
+}
+
+
 // ─── Selection helpers ──────────────────────────────────────────────────────
 
-function _selectedDataRowNumbers(sheet) {
+function _firstDataRowForTab(tabType) {
+  // simple_x4 has TWO header rows (preview + column names); everyone else has one.
+  return tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_FIRST_DATA_ROW : 2;
+}
+
+
+function _selectedDataRowNumbers(sheet, tabType) {
+  const firstData = _firstDataRowForTab(tabType);
   const ranges = sheet.getActiveRangeList().getRanges();
   const rowNums = {};
   ranges.forEach(function (range) {
     const start = range.getRow();
     const end = start + range.getNumRows() - 1;
-    for (var r = Math.max(start, 2); r <= end; r++) {
+    for (var r = Math.max(start, firstData); r <= end; r++) {
       rowNums[r] = true;
     }
   });
@@ -236,15 +340,18 @@ function _selectedDataRowNumbers(sheet) {
 }
 
 
-function _unprocessedRowNumbers(sheet, readyVideoCol1) {
+function _unprocessedRowNumbers(sheet, readyVideoCol1, tabType) {
+  const firstData = _firstDataRowForTab(tabType);
   const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < firstData) return [];
   // Read the ready-video-1 column for all data rows.
-  const values = sheet.getRange(2, readyVideoCol1, lastRow - 1, 1).getValues();
+  const values = sheet
+    .getRange(firstData, readyVideoCol1, lastRow - firstData + 1, 1)
+    .getValues();
   const rowNums = [];
   for (var i = 0; i < values.length; i++) {
     if (!String(values[i][0] || '').trim()) {
-      rowNums.push(i + 2);    // sheet row
+      rowNums.push(i + firstData);    // sheet row
     }
   }
   return rowNums;
@@ -262,7 +369,7 @@ function generateSelected() {
     );
     return;
   }
-  const rowNums = _selectedDataRowNumbers(sheet);
+  const rowNums = _selectedDataRowNumbers(sheet, tabType);
   if (rowNums.length === 0) {
     SpreadsheetApp.getUi().alert('No data rows selected. Click on a data row first.');
     return;
@@ -280,8 +387,12 @@ function generateAllUnprocessed() {
     );
     return;
   }
-  const cols = tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS : IMAGE_VO_COLS;
-  const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1);
+  const cols = (
+    tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
+    : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+    : IMAGE_VO_COLS
+  );
+  const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
   if (rowNums.length === 0) {
     SpreadsheetApp.getUi().alert('No unprocessed rows found.');
     return;
@@ -298,12 +409,14 @@ function generateAllUnprocessed() {
 
 
 function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
-  // Simple + Image-VO share the same input columns/readers; 4Images and cartoon differ.
+  // Simple + Image-VO share the same input columns/readers; 4Images, cartoon, simple_x4 differ.
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
+    : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
+    : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : _validateImageVO;
 
   let rows = [];
@@ -327,7 +440,11 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
 
   // Guard against accidentally regenerating rows that already have a video.
   if (checkExisting) {
-    const videoCol = (tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS : IMAGE_VO_COLS).readyVideo1;
+    const videoCol = (
+      tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
+      : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+      : IMAGE_VO_COLS
+    ).readyVideo1;
     const withVideo = rows.filter(function (r) {
       return String(sheet.getRange(r.row_num, videoCol).getValue() || '').trim() !== '';
     }).map(function (r) { return r.row_num; });
@@ -365,6 +482,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
+  else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);
@@ -384,6 +502,158 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   }
   SpreadsheetApp.getUi().alert(message);
   showJobsSidebar();
+}
+
+
+// ─── Simple x4 migration ────────────────────────────────────────────────────
+//
+// One-shot setup for the simple x4 tab. Idempotent — safe to run multiple
+// times. Each step is gated by a "does this already look done?" probe, so
+// re-running the menu item never corrupts a partially-migrated sheet.
+//
+// What it ensures:
+//   1. A frozen row 1 holding the "Template Preview" label + two =IMAGE()
+//      formulas pointing at the Template 1 and Template 2 preview PNGs.
+//   2. A frozen row 2 holding the column-name headers (Country, …,
+//      Template 1, CTA 1, …, Open Comments, Ready Video 1-4).
+//   3. 8 new columns inserted between H (Script Pattern) and the old col I
+//      (Open Comments) — but only if they aren't already there.
+//   4. Data Validation (dropdown blank / 1 / 2) on the Template* columns.
+//
+// Plan _plans/2026-06-08-simple-x4-template-cards.md §Migration.
+
+function migrateSimpleX4Columns() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const name = String(sheet.getName() || '').toLowerCase().trim();
+
+  if (name.indexOf('x4') === -1) {
+    ui.alert(
+      'Wrong tab',
+      'Switch to the "simple x4" tab first — the active tab is "' +
+        sheet.getName() + '".',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  const ans = ui.alert(
+    'Migrate simple x4 columns?',
+    'This will:\n' +
+    '  1. Insert a frozen row 1 with the template-preview images\n' +
+    '  2. Insert 8 new columns (Template 1, CTA 1, …, CTA 4) between\n' +
+    '     "Script Pattern" and the existing "Open Comments"\n' +
+    '  3. Freeze rows 1 + 2 so they stay visible while you scroll\n' +
+    '  4. Add a dropdown (blank / 1 / 2) to each Template column\n\n' +
+    'Re-running this is SAFE — already-migrated tabs are left alone.\n\n' +
+    'Continue?',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (ans !== ui.Button.OK) return;
+
+  const steps = [];
+
+  // ─── Step 1: ensure row 1 (preview header) exists ───
+  // Probe: cell A1 reads "Template Preview"? If not, treat the tab as needing
+  // row 1 + 2 inserted (i.e. the headers currently sit at row 1, not row 2).
+  const a1 = String(sheet.getRange(1, 1).getValue() || '').toLowerCase().trim();
+  const a2 = String(sheet.getRange(2, 1).getValue() || '').toLowerCase().trim();
+  const needRowInsert = a1 !== 'template preview';
+  if (needRowInsert) {
+    sheet.insertRowBefore(1);
+    sheet.getRange(1, 1).setValue('Template Preview').setFontWeight('bold');
+    steps.push('inserted row 1 (preview header)');
+  } else if (a2 === 'country') {
+    steps.push('row 1 already present (skipped)');
+  } else {
+    // Defensive: row 1 says "Template Preview" but row 2 doesn't look like
+    // column headers. Bail rather than push garbage around.
+    ui.alert(
+      'Unexpected layout',
+      'Row 1 reads "Template Preview" but row 2 does NOT look like the column ' +
+      'header row (got "' + a2 + '"). Aborting to avoid corrupting data — ' +
+      'please inspect the sheet manually.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  // ─── Step 2: ensure the 8 new columns exist between H and old I ───
+  // Probe: row 2 col I reads "Template 1"? If yes, already inserted.
+  const headerI = String(
+    sheet.getRange(SIMPLE_X4_HEADER_ROW, SIMPLE_X4_COLS.template1).getValue() || ''
+  ).toLowerCase().trim();
+  const needColInsert = headerI.indexOf('template 1') !== 0;
+  if (needColInsert) {
+    // Insert 8 columns AFTER col 8 (H = Script Pattern). The existing
+    // Open Comments + Ready Video columns shift right by 8 automatically.
+    sheet.insertColumnsAfter(8, 8);
+    steps.push('inserted 8 new columns (I-P)');
+  } else {
+    steps.push('8 columns already inserted (skipped)');
+  }
+
+  // ─── Step 3: write the row 2 column headers idempotently ───
+  // Always overwrite — operator might have typo'd "Tempate 1" by hand.
+  const headers = [
+    'Country', 'Vertical', 'Article', 'Manual Image',
+    'Voice Over', 'ZapCap', 'Change Size', 'Script Pattern',
+    'Template 1', 'CTA 1', 'Template 2', 'CTA 2',
+    'Template 3', 'CTA 3', 'Template 4', 'CTA 4',
+    'Open Comments',
+    'Ready Video 1', 'Ready Video 2', 'Ready Video 3', 'Ready Video 4',
+  ];
+  sheet.getRange(SIMPLE_X4_HEADER_ROW, 1, 1, headers.length)
+    .setValues([headers])
+    .setFontWeight('bold');
+  steps.push('wrote row 2 column headers');
+
+  // ─── Step 4: row 1 preview =IMAGE() formulas ───
+  // We place the previews at cols C and D — the leftmost area where they
+  // stay visible regardless of horizontal scroll position (matches Yoav's
+  // manual setup from 2026-06-08).
+  const preview1Cell = sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 3);
+  const preview2Cell = sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 4);
+  preview1Cell.setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['1'] + '")');
+  preview2Cell.setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['2'] + '")');
+  // Bump row 1 height so the previews actually show up at a useful size.
+  sheet.setRowHeight(SIMPLE_X4_PREVIEW_ROW, 160);
+  steps.push('wrote row-1 preview =IMAGE() formulas');
+
+  // ─── Step 5: freeze rows 1 + 2 ───
+  if (sheet.getFrozenRows() < 2) {
+    sheet.setFrozenRows(2);
+    steps.push('froze rows 1 + 2');
+  } else {
+    steps.push('rows already frozen (skipped)');
+  }
+
+  // ─── Step 6: data validation dropdowns on Template* columns ───
+  const validation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['1', '2'], true)
+    .setAllowInvalid(false)
+    .setHelpText('Empty for no card, 1 for Template 1, 2 for Template 2.')
+    .build();
+  const maxRow = Math.max(sheet.getMaxRows(), 1000);
+  const tplCols = [
+    SIMPLE_X4_COLS.template1,
+    SIMPLE_X4_COLS.template2,
+    SIMPLE_X4_COLS.template3,
+    SIMPLE_X4_COLS.template4,
+  ];
+  tplCols.forEach(function (col) {
+    sheet
+      .getRange(SIMPLE_X4_FIRST_DATA_ROW, col, maxRow - SIMPLE_X4_FIRST_DATA_ROW + 1, 1)
+      .setDataValidation(validation);
+  });
+  steps.push('added dropdown validation to Template 1-4 columns');
+
+  ui.alert(
+    'Migration done',
+    'Steps applied to "' + sheet.getName() + '":\n\n• ' + steps.join('\n• ') +
+    '\n\nThe simple x4 tab is now ready. Submit a row to test.',
+    ui.ButtonSet.OK
+  );
 }
 
 
