@@ -255,24 +255,27 @@ _MUSIC_MIX_TEMPLATE = (
 # yellow CTA pill at the bottom — the result is the cartoon video with a
 # permanent CTA pill burned in.
 #
-# Implementation notes (Yoav 2026-06-08 prod test — earlier draft of this
-# command had both cartoon ideas failing silently on Rendi):
-#   * Plain ``[0:v][1:v]overlay=0:0`` — dropped ``format=auto`` since it
-#     was the suspect in the silent FAILED responses; the default format
-#     negotiation handles RGBA-onto-YUV blends fine.
-#   * ``-map 0:a?`` keeps the input video's audio when present; ``?`` makes
-#     it optional so silent inputs don't trip the mapper.
-#   * Re-encode audio to AAC instead of ``-c:a copy`` — copy can fail on
-#     unusual container/codec combos; AAC is universal and ZapCap
-#     re-encodes downstream anyway.
+# Implementation notes (Yoav 2026-06-08 prod test — earlier drafts of this
+# command kept silently failing on Rendi):
+#   * Explicit ``[1:v]format=yuva420p`` converts the RGBA PNG into a
+#     YUV-with-alpha pixel format BEFORE the overlay filter sees it. Without
+#     this conversion ffmpeg's overlay can't always negotiate a blend between
+#     RGBA PNG and YUV cartoon video — most likely cause of the prod
+#     "no usable videos" failure.
+#   * Cartoon videos ALWAYS have audio (the voiceover), so use plain
+#     ``-map 0:a`` (no ``?``) — fails loud if the input is unexpectedly
+#     silent rather than producing a video with no audio.
+#   * ``-c:a copy`` because the cartoon concat step already encodes audio
+#     as AAC, which mp4 ingests natively. Skipping the re-encode keeps the
+#     command fast.
 #   * ``-shortest`` clamps output to the video's duration — the PNG is a
 #     single-frame input that overlay re-uses for every video frame.
 _OVERLAY_IMAGE_TEMPLATE = (
     "-i {{in_1}} -i {{in_2}} "
-    '-filter_complex "[0:v][1:v]overlay=0:0[outv]" '
-    '-map "[outv]" -map 0:a? '
+    '-filter_complex "[1:v]format=yuva420p[fg];[0:v][fg]overlay=0:0[v]" '
+    '-map "[v]" -map 0:a '
     "-c:v libx264 -pix_fmt yuv420p "
-    "-c:a aac -b:a 192k -shortest {{out_1}}"
+    "-c:a copy -shortest {{out_1}}"
 )
 
 
