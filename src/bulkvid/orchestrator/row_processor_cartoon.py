@@ -405,6 +405,11 @@ async def process_cartoon_row(
                                 idea=idx + 1,
                                 original_effective=round(effective, 3),
                             )
+                            idea_failure_messages.append(
+                                f"idea {idx + 1}: VO shortener returned the "
+                                f"original text — couldn't trim "
+                                f"{round(effective, 1)}s VO under {MAX_EFFECTIVE_VO_SECONDS}s cap"
+                            )
                             return None
 
                         final_text = shorten_result.voiceover
@@ -433,6 +438,12 @@ async def process_cartoon_row(
                                 idea=idx + 1,
                                 original_effective=round(original_effective, 3),
                                 retry_effective=round(effective, 3),
+                            )
+                            idea_failure_messages.append(
+                                f"idea {idx + 1}: VO too long even after "
+                                f"shorten+retry ({round(effective, 2)}s vs "
+                                f"{MAX_EFFECTIVE_VO_SECONDS}s cap @ "
+                                f"{SPEECH_ATEMPO_RETRY_MAX}x max speedup)"
                             )
                             return None
 
@@ -530,6 +541,10 @@ async def process_cartoon_row(
                 clip_urls = [c for c in ordered if c]
                 if not clip_urls:
                     _log.error("cartoon_idea_no_clips", idea=idx + 1)
+                    idea_failure_messages.append(
+                        f"idea {idx + 1}: no Seedance clips produced "
+                        f"for any of {len(image_urls)} shots"
+                    )
                     return None
 
                 # 4d. Stitch + overlay VO. ``per_clip_seconds`` is uniform

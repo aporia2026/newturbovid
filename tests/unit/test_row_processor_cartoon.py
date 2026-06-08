@@ -579,6 +579,10 @@ async def test_cartoon_vo_shortener_no_change_drops_idea(monkeypatch) -> None:
     assert result.video_urls == []
     # Each idea: one initial TTS, then shortener returned the same text → no retry.
     assert clients.tts.calls == rpc.CARTOON_NUM_IDEAS
+    # Sidebar-visible error must name the actual drop reason, not the
+    # old generic "ideas returned None without raising" line.
+    assert result.error is not None
+    assert "VO shortener returned the original text" in result.error
     _ = original    # noqa: F841
 
 
@@ -656,6 +660,10 @@ async def test_cartoon_all_animations_fail(monkeypatch) -> None:
     result = await process_cartoon_row(_row(), clients, job_id="j")
     assert result.status == STATUS_VIDEO_ASSEMBLY_FAILED
     assert result.video_urls == []
+    # Sidebar-visible error must surface the no-clips drop reason rather
+    # than the old generic "ideas returned None without raising" line.
+    assert result.error is not None
+    assert "no Seedance clips produced" in result.error
 
 
 @respx.mock
