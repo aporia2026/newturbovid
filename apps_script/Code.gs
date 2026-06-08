@@ -21,11 +21,16 @@ const TAB_SIMPLE_X4 = 'simple_x4';
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
 // returns a 302 → signed CDN URL with Content-Type: image/png. Sheets
 // =IMAGE() follows the redirect cleanly, so no separate hosting needed.
-// Update the path here if the Space repo name changes.
+//
+// The "_labeled" variants have a "TEMPLATE 1" / "TEMPLATE 2" caption baked
+// into the top of each PNG so the in-sheet preview is self-identifying — no
+// extra label cells needed in row 1. Regenerate with
+// `python tools/render_labeled_template_previews.py` after editing the
+// source PNGs at `apps_script/template_previews/template_{1,2}.png`.
 // Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7.
 const CARD_TEMPLATE_PREVIEW_URLS = {
-  '1': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_1.png',
-  '2': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_2.png',
+  '1': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_1_labeled.png',
+  '2': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_2_labeled.png',
 };
 
 // Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
@@ -611,15 +616,26 @@ function migrateSimpleX4Columns() {
   steps.push('wrote row 2 column headers');
 
   // ─── Step 4: row 1 preview =IMAGE() formulas ───
-  // We place the previews at cols C and D — the leftmost area where they
-  // stay visible regardless of horizontal scroll position (matches Yoav's
-  // manual setup from 2026-06-08).
-  const preview1Cell = sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 3);
-  const preview2Cell = sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 4);
-  preview1Cell.setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['1'] + '")');
-  preview2Cell.setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['2'] + '")');
-  // Bump row 1 height so the previews actually show up at a useful size.
-  sheet.setRowHeight(SIMPLE_X4_PREVIEW_ROW, 160);
+  // Each preview PNG has "TEMPLATE 1" / "TEMPLATE 2" baked into the top of
+  // the image (see tools/render_labeled_template_previews.py), so a single
+  // cell per template is enough — the label IS the image. Placed at C1/D1
+  // so they sit at the leftmost area of the sheet and stay visible regardless
+  // of horizontal scroll position.
+  //
+  // We always rewrite these cells so re-running the migration cleans up any
+  // earlier layout drift (e.g. stray "1"/"2" text typed by the operator).
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 1)
+    .setValue('Template Preview')
+    .setFontWeight('bold');
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 2).clearContent();
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 3)
+    .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['1'] + '")');
+  sheet.getRange(SIMPLE_X4_PREVIEW_ROW, 4)
+    .setFormula('=IMAGE("' + CARD_TEMPLATE_PREVIEW_URLS['2'] + '")');
+
+  // Bump row 1 height so the previews render at a useful size (the labeled
+  // PNGs are 1080×1240 → ~14% aspect overhead from the label band).
+  sheet.setRowHeight(SIMPLE_X4_PREVIEW_ROW, 200);
   steps.push('wrote row-1 preview =IMAGE() formulas');
 
   // ─── Step 5: freeze rows 1 + 2 ───
