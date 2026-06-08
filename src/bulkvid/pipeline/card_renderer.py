@@ -103,6 +103,19 @@ _DESIGNS: Final[dict[str, CardDesign]] = {
 
 
 _BUNDLED_FONT_PATH: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Inter-Variable.ttf"
+)
+
+# Variable-font axes for Bold display weight. ``opsz`` (14) = display-optimized
+# glyph shapes; ``wght`` (700) = Bold. Pillow's set_variation_by_axes() expects
+# values in the axis order the font declares — for Inter that's [opsz, wght].
+_BUNDLED_FONT_AXES: Final[tuple[float, float]] = (14.0, 700.0)
+
+# Legacy static Bold variant (basic Latin only — missing Polish ł, ę etc.).
+# Kept as a final fallback for the unlikely case the variable font is missing
+# or its variation API isn't available; never picked when the variable font
+# is present. Will be removed once the variable font has shipped for a while.
+_LEGACY_BUNDLED_FONT_PATH: Final[Path] = (
     Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Inter-Bold.ttf"
 )
 
@@ -124,12 +137,16 @@ _SYSTEM_FONT_CANDIDATES: Final[tuple[str, ...]] = (
 def _find_font_path(override: str | None = None) -> str | None:
     """Return the first usable TTF path, or None to trigger the bitmap fallback.
 
-    Resolution order: explicit override -> bundled Inter Bold -> system fonts.
+    Resolution order: explicit override → bundled Inter Variable (full Latin
+    Ext, Cyrillic, Greek, Vietnamese) → legacy bundled Inter Bold (basic
+    Latin only) → system fonts.
     """
     if override and os.path.isfile(override):
         return override
     if _BUNDLED_FONT_PATH.is_file():
         return str(_BUNDLED_FONT_PATH)
+    if _LEGACY_BUNDLED_FONT_PATH.is_file():
+        return str(_LEGACY_BUNDLED_FONT_PATH)
     for candidate in _SYSTEM_FONT_CANDIDATES:
         if os.path.isfile(candidate):
             return candidate
@@ -137,16 +154,32 @@ def _find_font_path(override: str | None = None) -> str | None:
 
 
 def _load_font(size: int, override: str | None = None) -> ImageFont.ImageFont:
-    """Load a TTF at ``size`` px; fall back to the bitmap default on failure."""
+    """Load the bundled font at ``size`` px in Bold (wght=700).
+
+    The Inter variable font ships with the opsz+wght axes; we pin opsz=14
+    (display-shape glyphs) and wght=700 (Bold) so every render call
+    produces consistent display-bold text. Falls back to default-weight
+    glyphs on non-variable fonts (no exception) and to PIL's bitmap font
+    on missing files.
+    """
     path = _find_font_path(override)
     if path is None:
         _log.warning("card_font_fallback_default", size=size)
         return ImageFont.load_default()
     try:
-        return ImageFont.truetype(path, size=size)
+        font = ImageFont.truetype(path, size=size)
     except OSError as e:
         _log.warning("card_font_load_failed", path=path, error=str(e))
         return ImageFont.load_default()
+
+    # Variable fonts need the weight axis pinned to render Bold; static
+    # fonts (e.g. the legacy Inter-Bold.ttf fallback) raise OSError on
+    # set_variation_by_axes — swallow it, the static font is already Bold.
+    try:
+        font.set_variation_by_axes(list(_BUNDLED_FONT_AXES))
+    except (OSError, AttributeError):
+        pass
+    return font
 
 
 # ── Layout helpers ───────────────────────────────────────────────────────────
@@ -283,13 +316,19 @@ def _draw_pill(
     pad_x: int,
     pad_y: int,
     max_width: int,
+    min_width: int = 0,
 ) -> tuple[int, int]:
-    """Draw a centered rounded-rectangle pill. Returns (pill_w, pill_h)."""
+    """Draw a centered rounded-rectangle pill. Returns (pill_w, pill_h).
+
+    ``min_width`` forces the pill to be at least that wide regardless of
+    text length — used by Template 2 to render a full-width CTA pill that
+    matches the user-supplied mockup. Default 0 = hugs the text + padding.
+    """
     draw = ImageDraw.Draw(canvas)
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
-    pill_w = min(text_w + pad_x * 2, max_width)
+    pill_w = min(max(text_w + pad_x * 2, min_width), max_width)
     pill_h = text_h + pad_y * 2
     left = center_x - pill_w // 2
     top = center_y - pill_h // 2
@@ -441,13 +480,36 @@ def _render_template_2(
 
     draw = ImageDraw.Draw(canvas)
 
-    # Title region occupies the lower portion of the canvas.
+    # Layout (Yoav 2026-06-08): the CTA pill is anchored to the bottom and
+    # spans (nearly) the full canvas width to match the user-supplied mockup;
+    # the title block sits bottom-aligned RIGHT ABOVE the pill (no big gap).
+    # We compute pill geometry first so the title can be positioned relative
+    # to it, then draw both.
     strip_h = int(round(height * design.strip_height_frac))
-    side_padding = int(width * 0.05)
+    side_padding = int(width * 0.03)            # tight padding for near-full-width
+    pill_bottom_margin = int(strip_h * 0.06)    # gap between pill and canvas bottom
+    title_to_pill_gap = int(strip_h * 0.05)     # gap between title block and pill top
+
+    # Pill geometry (measure first; draw after the title so z-order keeps text
+    # legible if anything overlaps).
+    pill_font = _load_font(
+        max(14, int(strip_h * 0.20)), override=font_override
+    )
+    pill_pad_x = int(width * 0.04)
+    pill_pad_y = int(strip_h * 0.06)
+    pill_text = cta or ""
+    pill_bbox = draw.textbbox((0, 0), pill_text or "X", font=pill_font)
+    pill_text_h = pill_bbox[3] - pill_bbox[1]
+    pill_h_actual = pill_text_h + pill_pad_y * 2
+    pill_full_width = int(width * 0.94)
+    pill_center_y = height - pill_bottom_margin - pill_h_actual // 2
+    pill_top = pill_center_y - pill_h_actual // 2
+
+    # Title region: from where the strip starts down to just above the pill.
     title_max_w = width - side_padding * 2
-    cta_h_reserve = int(strip_h * 0.45)
-    title_max_h = strip_h - cta_h_reserve - int(strip_h * 0.10)
-    title_top = height - strip_h + int(strip_h * 0.05)
+    title_top_bound = height - strip_h + int(strip_h * 0.04)
+    title_bottom_bound = pill_top - title_to_pill_gap
+    title_max_h = max(int(strip_h * 0.20), title_bottom_bound - title_top_bound)
 
     font, lines = _fit_title_font(
         draw,
@@ -468,7 +530,8 @@ def _render_template_2(
         ]
         line_spacing = int(font.size * 0.16) if hasattr(font, "size") else 4
         block_h = sum(line_heights) + line_spacing * (len(lines) - 1)
-        y = title_top + (title_max_h - block_h) // 2
+        # Bottom-align the title block to sit right above the pill.
+        y = title_bottom_bound - block_h
         for ln, lh in zip(lines, line_heights, strict=True):
             bbox = draw.textbbox((0, 0), ln, font=font)
             tw = bbox[2] - bbox[0]
@@ -478,10 +541,6 @@ def _render_template_2(
             y += lh + line_spacing
 
     if cta:
-        pill_font = _load_font(
-            max(14, int(strip_h * 0.18)), override=font_override
-        )
-        cta_center_y = height - int(strip_h * 0.18)
         _draw_pill(
             canvas,
             cta,
@@ -489,10 +548,11 @@ def _render_template_2(
             bg=design.cta_bg,
             text_color=design.cta_text_color,
             center_x=width // 2,
-            center_y=cta_center_y,
-            pad_x=int(width * 0.05),
-            pad_y=int(strip_h * 0.05),
-            max_width=int(width * 0.90),
+            center_y=pill_center_y,
+            pad_x=pill_pad_x,
+            pad_y=pill_pad_y,
+            max_width=pill_full_width,
+            min_width=pill_full_width,    # force full width (matches mockup)
         )
 
     return canvas

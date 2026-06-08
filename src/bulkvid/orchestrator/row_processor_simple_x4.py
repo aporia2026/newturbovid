@@ -354,6 +354,20 @@ async def process_simple_x4_row(
         metadata["card_collage_normal"] = any_blank
         metadata["card_collage_clean"] = any_templated
 
+        # CTA for the DEFAULT (with-text) kie collage. Yoav 2026-06-08: the
+        # operator's CTA cell value should drive what kie draws on default-
+        # template cells too — not just the templated overlay path. kie
+        # generates all 4 cells in one call with a single CTA, so we pick
+        # the first non-blank CTA across the row and pass it as an override.
+        # When all CTA cells are blank, no override → kie uses its built-in
+        # per-language "Read More" guidance from the prompt body.
+        default_cta_override = ""
+        for _card in row.cards:
+            if _card.cta:
+                default_cta_override = _card.cta
+                break
+        metadata["card_default_cta_override"] = default_cta_override[:80]
+
         async def _image_side() -> list[bytes] | Exception:
             try:
                 description, c1 = await describe_source_image(
@@ -372,6 +386,9 @@ async def process_simple_x4_row(
                         settings_store=clients.settings_store,
                         safety=safety,
                         skip_text=skip_text,
+                        # cta_override applies only to the default (with-text)
+                        # collage; the clean collage has no kie-drawn CTA at all.
+                        cta_override=("" if skip_text else default_cta_override),
                     )
                     costs.collage_prompt += c2
 
@@ -633,13 +650,14 @@ async def process_simple_x4_row(
             # ZapCap render options per-quadrant. The default places captions
             # at top=70 (lower-third) — fine for blank-template cells where the
             # photo fills the canvas, but on TEMPLATED cells the caption sits
-            # directly on top of the Pillow-rendered headline strip, producing
-            # the unreadable double-text Yoav reported 2026-06-08. Templated
-            # cells push the caption up into the photo area (top=15) — same
-            # font size as the legacy look, just out of the bottom strip's way.
+            # directly on top of the Pillow-rendered headline strip. Templated
+            # cells position the caption mid-photo (top=40) at a slightly
+            # smaller size (font_size=32 vs default 42 — ~25% reduction) per
+            # Yoav 2026-06-08: "make them slightly smaller and put them in
+            # the middle".
             templated_caption_opts = ZapCapRenderOptions(
                 subs=ZapCapSubsOptions(),    # keep emoji + emphasis defaults
-                style=ZapCapStyleOptions(top=15),    # default font_size=42 preserved
+                style=ZapCapStyleOptions(top=40, font_size=32),
             )
 
             async def _caption(idx: int, video_url: str) -> str:

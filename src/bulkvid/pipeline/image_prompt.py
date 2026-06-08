@@ -241,19 +241,25 @@ async def build_collage_prompt(
     settings_store: SettingsStore | None = None,
     safety: SafetyContext = SAFE,
     skip_text: bool = False,
+    cta_override: str = "",
 ) -> tuple[str, float]:
     """gpt-5.4-mini builds the 2x2 collage prompt. Returns ``(prompt, cost_usd)``.
 
-    Default mode (``skip_text=False``): keeps the inspiration's headline + CTA +
-    layout verbatim and changes ONLY the photo; the kie output IS the finished
-    marketing card.
+    Default mode (``skip_text=False``): mandates the 3-band layout (white
+    headline band on top, photo middle, white CTA band on bottom) on every
+    cell regardless of seed style. The kie output IS the finished marketing
+    card.
 
     ``skip_text=True`` mode: asks kie for CLEAN photographic cells with NO
     headline / CTA / overlay text. Used by the simple_x4 card-template path,
-    which draws its own headline + CTA via Pillow afterwards — without this
-    flag those overlays would sit on top of kie-baked text and produce
-    double-text artifacts. Plan
+    which draws its own headline + CTA via Pillow afterwards. Plan
     ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.2 (R1).
+
+    ``cta_override`` (default mode only — ignored when ``skip_text=True``):
+    when non-empty, the prompt instructs kie to use this EXACT text on every
+    cell's bottom CTA band, overriding the default per-language "Read More"
+    fallback. Used by the simple_x4 default path so operator-typed CTA cells
+    drive the rendered CTA. Yoav 2026-06-08.
 
     ``article_excerpt`` (when given) grounds the new photo in the article
     topic rather than whatever the inspiration photo happened to show.
@@ -262,11 +268,23 @@ async def build_collage_prompt(
     appended to the user message before the LLM call, so the generated image
     description forces product-only frames with no humans.
     """
-    user_message = (
-        _collage_user_message_no_text(description, article_excerpt)
-        if skip_text
-        else _collage_user_message(description, article_excerpt)
-    )
+    if skip_text:
+        user_message = _collage_user_message_no_text(description, article_excerpt)
+    else:
+        user_message = _collage_user_message(description, article_excerpt)
+        if cta_override.strip():
+            # Append a hard CTA override block AFTER the body so kie reads it
+            # last and treats it as the final word on what to draw.
+            user_message += (
+                "\n\nCTA OVERRIDE (STRICT — supersedes the per-language Read-More "
+                "guidance above):\n"
+                f"- Use this EXACT text on every cell's bottom CTA band, verbatim: "
+                f'"{cta_override.strip()}"\n'
+                "- Do NOT translate, paraphrase, expand, or reword it.\n"
+                "- Use the SAME CTA text on all 4 cells.\n"
+                "- Crisp, correctly spelled, legible, in the same bold black "
+                "sans-serif styling as the rest of the bottom band."
+            )
     if safety.matched and settings_store is not None:
         # No explicit default — let the store fall through to the registered
         # default (``SENSITIVE_APPAREL_RULES_DEFAULT``).

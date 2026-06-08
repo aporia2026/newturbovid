@@ -23,7 +23,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "apps_script" / "template_previews"
-FONT_PATH = REPO_ROOT / "src" / "bulkvid" / "assets" / "fonts" / "Inter-Bold.ttf"
+# Variable Inter (full Latin Ext + Cyrillic + Greek + Vietnamese coverage).
+# Same font the card_renderer uses — keep them in sync so the "TEMPLATE 1"
+# preview label and the in-video Pillow overlay share a typeface.
+FONT_PATH = REPO_ROOT / "src" / "bulkvid" / "assets" / "fonts" / "Inter-Variable.ttf"
+_FONT_AXES = [14.0, 700.0]    # opsz=14 (display), wght=700 (Bold)
 
 # Caption band sits at the top of the labeled image.
 LABEL_BAND_HEIGHT_FRAC = 0.14          # ~14% of source height
@@ -50,6 +54,10 @@ def _label_image(n: int) -> None:
         draw = ImageDraw.Draw(out)
         font_size = int(label_h * 0.55)
         font = ImageFont.truetype(str(FONT_PATH), font_size)
+        try:
+            font.set_variation_by_axes(_FONT_AXES)
+        except (OSError, AttributeError):
+            pass    # static fallback font — already at the right weight
         text = f"TEMPLATE {n}"
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]

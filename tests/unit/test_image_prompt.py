@@ -177,6 +177,72 @@ async def test_build_collage_asks_for_text_cta_and_forbids_real_brands() -> None
 
 
 @respx.mock
+async def test_build_collage_includes_cta_override_when_provided() -> None:
+    """A non-empty cta_override appends a STRICT block telling kie to use that
+    exact text on every cell. Used by the simple_x4 default path so operator-
+    typed CTA cells drive the rendered CTA. Yoav 2026-06-08."""
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_response("Create a 2x2 grid collage."))
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await build_collage_prompt(
+            client, description="A street scene.", cta_override="Buy Now Today >>"
+        )
+
+    user_msg = captured[0]["messages"][1]["content"]
+    assert "CTA OVERRIDE" in user_msg, "override block missing from prompt"
+    assert "Buy Now Today >>" in user_msg, "exact CTA text not echoed into prompt"
+    assert "verbatim" in user_msg.lower()
+
+
+@respx.mock
+async def test_build_collage_omits_override_block_when_cta_override_blank() -> None:
+    """When cta_override is empty (default), the prompt keeps its per-language
+    Read-More guidance and never inserts the override block."""
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_response("Create a 2x2 grid collage."))
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await build_collage_prompt(client, description="A street scene.")
+
+    user_msg = captured[0]["messages"][1]["content"]
+    assert "CTA OVERRIDE" not in user_msg
+
+
+@respx.mock
+async def test_build_collage_ignores_cta_override_in_skip_text_mode() -> None:
+    """skip_text=True asks for clean photos with NO text — the override block
+    would be meaningless (kie isn't drawing any CTA at all). The Pillow
+    overlay handles CTA on templated cells."""
+    captured: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_response("Create a 2x2 grid collage."))
+
+    respx.post(f"{BASE}/chat/completions").mock(side_effect=_handler)
+    async with OpenAIClient(api_key=API_KEY) as client:
+        await build_collage_prompt(
+            client,
+            description="A street scene.",
+            skip_text=True,
+            cta_override="Should Be Ignored",
+        )
+
+    user_msg = captured[0]["messages"][1]["content"]
+    assert "CTA OVERRIDE" not in user_msg
+    assert "Should Be Ignored" not in user_msg
+
+
+@respx.mock
 async def test_build_collage_grounds_new_photo_in_article() -> None:
     captured: list[dict] = []
 
