@@ -60,15 +60,25 @@ _COLLAGE_SYSTEM = (
 
 
 def _collage_user_message(description: str, article_excerpt: str = "") -> str:
+    """Default (with-text) collage prompt for the legacy image_vo path.
+
+    Hard-constrains every cell to the THREE-BAND LAYOUT Yoav specified
+    2026-06-08 as the canonical default look: solid-white headline band at
+    top, photo in the middle, solid-white CTA band at bottom. Same layout
+    every cell, every run, regardless of what the inspiration seed image
+    happened to look like — earlier prompts let the seed's banner style
+    drive the output and produced inconsistent results across rows.
+    """
     article_block = (
-        "ARTICLE CONTEXT (the new photos must depict subjects relevant to THIS "
-        "article — not necessarily whatever the inspiration photo happened to "
-        f"show):\n{article_excerpt.strip()}\n\n"
+        "ARTICLE CONTEXT (the headline and the new photos must reflect THIS "
+        "article — not whatever the inspiration photo happened to show):\n"
+        f"{article_excerpt.strip()}\n\n"
         if article_excerpt.strip()
         else ""
     )
     return (
-        f"Inspiration ad analysis:\n{description}\n\n"
+        f"Inspiration ad analysis (use ONLY for color/photo-style cues — its "
+        f"layout is NOT the target):\n{description}\n\n"
         f"{article_block}"
         "Produce ONE image that is a STRICT 2x2 GRID — 2 equal columns and 2 equal "
         "rows = 4 cells of IDENTICAL size that tile perfectly:\n"
@@ -76,34 +86,61 @@ def _collage_user_message(description: str, article_excerpt: str = "") -> str:
         "  BOTTOM-LEFT = Panel 3 | BOTTOM-RIGHT = Panel 4\n"
         "The grid lines sit EXACTLY at the horizontal and vertical centre, so the "
         "image splits cleanly into 4 equal quarters with a thin neutral divider.\n\n"
-        "Each cell is its OWN complete, self-contained vertical ad frame. CRITICAL: "
-        "do NOT draw one big ad across the whole image, do NOT stack ads in a single "
-        "column, and NEVER let an ad or its text span more than one cell.\n\n"
-        "KEEP THE TEXT (do NOT rewrite):\n"
-        "- Put the inspiration's headline and call-to-action on EACH cell, EXACTLY as "
-        "written (verbatim, same language), in the same banner/label visual style. "
-        "Use the SAME headline and CTA on all 4 cells.\n"
-        "- The ONLY change allowed to the text is replacing a real brand or company "
-        "name with a generic term. Keep text crisp, correctly spelled and legible.\n\n"
-        "CHANGE ONLY THE PHOTO:\n"
-        "- In each cell, replace the inspiration's photo with a NEW, realistic photo "
-        "that fits the article context above (or, with no article context, the same "
-        "product/subject as the inspiration). Vary the photo across the 4 cells.\n\n"
+        "MANDATORY 3-BAND LAYOUT FOR EVERY CELL (strict — every cell must look "
+        "the same shape; this is not optional and overrides any layout the "
+        "inspiration ad happened to use):\n"
+        "  • TOP BAND ≈ 26% of cell height — SOLID WHITE background, edge-to-edge. "
+        "Bold black sans-serif headline text, large, multi-line wrap if needed, "
+        "horizontally centered, comfortably padded from cell edges. NO drop "
+        "shadows, NO color tint, NO decorative borders, NO graphic elements — "
+        "just black text on solid white.\n"
+        "  • MIDDLE BAND ≈ 60% of cell height — a realistic photograph relevant "
+        "to the article. Photographic content only; NO overlaid text, NO logos, "
+        "NO captions, NO banners over the photo.\n"
+        "  • BOTTOM BAND ≈ 14% of cell height — SOLID WHITE background, edge-to-"
+        "edge. Bold black sans-serif CTA text, horizontally centered, comfortably "
+        "padded. Same plain styling as the top band — black text on solid white.\n\n"
+        "Each cell is its OWN self-contained vertical ad frame in this 3-band "
+        "shape. CRITICAL: do NOT make the photo full-bleed across the cell, do "
+        "NOT skip the white bands, do NOT make the bands semi-transparent or "
+        "tinted, do NOT put text on the photo itself.\n\n"
+        "HEADLINE TEXT (top band — same headline on ALL 4 cells):\n"
+        "- Write a concise marketing headline in the ARTICLE'S language (the "
+        "language the article excerpt above is written in).\n"
+        "- Length ≈ 8-14 words; may wrap to 2-4 lines.\n"
+        "- Summarizes the article topic concretely (concrete nouns, no fluff).\n"
+        "- Crisp, correctly spelled, legible.\n\n"
+        "CTA TEXT (bottom band — same CTA on ALL 4 cells):\n"
+        "- A generic \"Read More\" style call-to-action in the article's language.\n"
+        "- One short line, ideally 1-3 words. Examples by language: English "
+        "\"Read More\"; German \"Weiterlesen\"; Spanish \"Saber Más\"; French "
+        "\"En Savoir Plus\"; Italian \"Scopri di Più\"; Portuguese \"Saiba Mais\"; "
+        "Dutch \"Meer Weten\"; Polish \"Dowiedz Się Więcej\"; Hebrew \"למידע נוסף\".\n\n"
+        "PHOTOS (middle band — VARY across the 4 cells):\n"
+        "- Realistic, photographic, contemporary. Relevant to the article topic.\n"
+        "- DIFFERENT photo per cell so the 4 generated videos don't feel "
+        "interchangeable. Same subject area, different angles/scenes/moments.\n\n"
         "NO REAL BRANDS (strict — legal requirement):\n"
-        "- The imagery must contain NO real brand logos, trademarks, brand names, "
-        "badges, or recognisable branding — not even if the inspiration shows them.\n\n"
+        "- The photos must contain NO real brand logos, trademarks, brand names, "
+        "badges, or recognisable branding — not even if the inspiration shows them.\n"
+        "- License plates, signage, product labels visible in the photo MUST be "
+        "generic, blurred, or removed.\n\n"
         "FORMAT your response exactly like this and nothing else:\n"
         "Create a single image that is a STRICT 2x2 grid (2 equal columns, 2 equal rows, "
-        "4 identical-size cells, thin neutral divider), each cell a complete vertical ad "
-        "that reuses the inspiration's exact headline and CTA and only changes the photo.\n"
-        'Headline on every cell (verbatim): "[exact headline]".\n'
-        'CTA on every cell (verbatim): "[exact cta]".\n'
-        "TOP-LEFT cell photo: [new article-relevant scene].\n"
-        "TOP-RIGHT cell photo: [new article-relevant scene].\n"
-        "BOTTOM-LEFT cell photo: [new article-relevant scene].\n"
-        "BOTTOM-RIGHT cell photo: [new article-relevant scene].\n"
-        "The 4 cells are equal and tile perfectly; no single full-image ad; no stacking; "
-        "text legible and correctly spelled; no real brands."
+        "4 identical-size cells, thin neutral divider). EACH cell follows the same 3-band "
+        "layout: solid-white top band (~26% height) with a bold black sans-serif headline, "
+        "photographic middle band (~60% height), solid-white bottom band (~14% height) with "
+        "a bold black sans-serif \"Read More\" CTA in the article's language. Same headline "
+        "and CTA on every cell; vary the middle photo per cell.\n"
+        'Headline (verbatim, same on every cell, in the article\'s language): "[8-14 word headline]".\n'
+        'CTA (verbatim, same on every cell, in the article\'s language): "[short Read-More CTA]".\n'
+        "TOP-LEFT cell photo: [new article-relevant scene, photographic, no text].\n"
+        "TOP-RIGHT cell photo: [different article-relevant scene, photographic, no text].\n"
+        "BOTTOM-LEFT cell photo: [different article-relevant scene, photographic, no text].\n"
+        "BOTTOM-RIGHT cell photo: [different article-relevant scene, photographic, no text].\n"
+        "Every cell uses the 3-band layout (white-top, photo-middle, white-bottom); white "
+        "bands are SOLID white with bold black sans-serif text; no text overlays on the "
+        "photo; no real brands; cells tile perfectly with a thin neutral divider."
     )
 
 

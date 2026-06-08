@@ -154,18 +154,25 @@ async def test_build_collage_asks_for_text_cta_and_forbids_real_brands() -> None
     assert "2x2" in user_msg or "2 columns" in user_msg
     assert "TOP-LEFT" in user_msg
     assert "BOTTOM-RIGHT" in user_msg
-    # NEW: marketing text + CTA, in the source language.
+    # Marketing text + CTA, in the ARTICLE's language (2026-06-08: switched
+    # from "inspiration's language" to "article's language" when we made the
+    # default look stop depending on the seed image — see the rewrite of
+    # _collage_user_message).
     assert "headline" in user_msg.lower()
     assert "cta" in user_msg.lower() or "call-to-action" in user_msg.lower()
-    assert "same language" in user_msg.lower()
-    # Keep the inspiration's text/CTA verbatim; change only the photo.
+    assert "article's language" in user_msg.lower()
+    # 3-band layout is mandatory (white top + photo + white bottom) so every
+    # row produces the same shape regardless of seed style.
+    assert "3-band" in user_msg.lower() or "three-band" in user_msg.lower()
+    assert "solid white" in user_msg.lower() or "solid-white" in user_msg.lower()
+    # The SAME headline / CTA on every cell (verbatim across the 4 panels).
     assert "verbatim" in user_msg.lower()
-    assert "change only the photo" in user_msg.lower()
     # Real brands are forbidden in the generated panels (legal requirement).
     assert "no real brands" in user_msg.lower()
     assert "trademark" in user_msg.lower()
-    # Regression: the old no-text rule is gone (text/CTA are now required).
-    assert "NO text" not in user_msg
+    # Regression guard: the prompt must NOT tell kie to keep the inspiration's
+    # layout — that produced the seed-dependent variation Yoav complained
+    # about. The new prompt mandates our own 3-band shape regardless of seed.
     assert "AUTOMOTIVE RULE" not in user_msg
 
 
