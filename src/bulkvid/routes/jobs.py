@@ -24,7 +24,14 @@ from pydantic import BaseModel, Field
 from bulkvid.auth import AuthError, ForbiddenError, GoogleIdentityVerifier, Identity
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger, read_job_log_lines
-from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow, SimpleRow
+from bulkvid.models.row import (
+    CardChoice,
+    CartoonRow,
+    FourImagesVO2Row,
+    ImageVORow,
+    SimpleRow,
+    SimpleX4Row,
+)
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     JOB_RUNNING,
@@ -32,6 +39,7 @@ from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
+    TAB_SIMPLE_X4,
     Job,
     JobQueue,
     QueueBusy,
@@ -92,6 +100,28 @@ class CartoonRowIn(BaseModel):
     open_comments: str = ""
 
 
+class CardChoiceIn(BaseModel):
+    template_id: str = ""    # validated to "" | "1" | "2" in the server-side coercion below
+    cta: str = ""
+
+
+class SimpleX4RowIn(BaseModel):
+    """Shape submitted by Apps Script for ``simple x4`` rows. Same as
+    ImageVORowIn plus 4 per-video CardChoice picks."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_url: str
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cards: list[CardChoiceIn] = Field(default_factory=list)
+    open_comments: str = ""
+
+
 class SubmitJobIn(BaseModel):
     sheet_id: str
     worksheet: str
@@ -102,6 +132,8 @@ class SubmitJobIn(BaseModel):
     rows_simple: list[ImageVORowIn] | None = None
     # The cartoon tab generates animated videos from text (no seed image).
     rows_cartoon: list[CartoonRowIn] | None = None
+    # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
+    rows_simple_x4: list[SimpleX4RowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -113,6 +145,42 @@ class SubmitJobOut(BaseModel):
     job_id: str
     status: str
     row_count: int
+
+
+def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
+    """Coerce a SimpleX4RowIn from the wire into a SimpleX4Row dataclass.
+
+    Server-side hardening (defense in depth — Apps Script also validates):
+      * ``template_id`` clamped to {"", "1", "2"} — invalid values are
+        silently downgraded to "" (no overlay) so a typo doesn't fail the row.
+      * ``cta`` truncated to 80 chars (matches the renderer's pill max-width).
+      * ``cards`` padded / trimmed to exactly 4 entries — Apps Script always
+        sends 4 but a forged payload could send any count.
+    """
+    raw_cards = list(r.cards or [])
+    while len(raw_cards) < 4:
+        raw_cards.append(CardChoiceIn())
+    raw_cards = raw_cards[:4]
+    cards = [
+        CardChoice(
+            template_id=(c.template_id if c.template_id in ("", "1", "2") else ""),
+            cta=(c.cta or "")[:80],
+        )
+        for c in raw_cards
+    ]
+    return SimpleX4Row(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=r.manual_image_url,
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        cards=cards,
+        open_comments=r.open_comments,
+    )
 
 
 class JobOut(BaseModel):
@@ -333,6 +401,14 @@ async def submit_job(
         if not payload.rows_cartoon:
             raise HTTPException(400, "rows_cartoon is required for tab_type=cartoon")
         rows = [CartoonRow(**r.model_dump()) for r in payload.rows_cartoon]
+    elif payload.tab_type == TAB_SIMPLE_X4:
+        if not payload.rows_simple_x4:
+            raise HTTPException(
+                400, "rows_simple_x4 is required for tab_type=simple_x4"
+            )
+        rows = [
+            _build_simple_x4_row(r) for r in payload.rows_simple_x4
+        ]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

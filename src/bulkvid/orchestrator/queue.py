@@ -28,11 +28,13 @@ from typing import Any
 
 from bulkvid.logging import get_logger
 from bulkvid.models.row import (
+    CardChoice,
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
     SimpleRow,
+    SimpleX4Row,
 )
 from bulkvid.orchestrator import db as _db
 
@@ -57,6 +59,7 @@ TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
 TAB_CARTOON = "cartoon"
+TAB_SIMPLE_X4 = "simple_x4"
 
 # Idempotency-key replay window. A submit POST that PA's frontend dropped on
 # the way back to the client gets retried by the Apps Script, with the SAME
@@ -161,16 +164,31 @@ def _new_job_id() -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow, tab: str
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row,
+    tab: str,
 ) -> str:
     data = asdict(row)
     data["__tab__"] = tab
     return json.dumps(data, ensure_ascii=False)
 
 
+def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
+    """Rebuild a SimpleX4Row, restoring the nested CardChoice dataclasses
+    that ``asdict`` flattens to dicts."""
+    raw_cards = data.pop("cards", []) or []
+    cards = [
+        CardChoice(
+            template_id=str(c.get("template_id") or ""),
+            cta=str(c.get("cta") or ""),
+        )
+        for c in raw_cards
+    ]
+    return SimpleX4Row(cards=cards, **data)
+
+
 def _payload_to_row(
     payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -179,6 +197,8 @@ def _payload_to_row(
         return SimpleRow(**data)
     if tab == TAB_CARTOON:
         return CartoonRow(**data)
+    if tab == TAB_SIMPLE_X4:
+        return _hydrate_simple_x4(data)
     return ImageVORow(**data)
 
 
@@ -726,7 +746,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -735,4 +755,6 @@ def payload_to_row(
         return SimpleRow(**payload)
     if tab == TAB_CARTOON:
         return CartoonRow(**payload)
+    if tab == TAB_SIMPLE_X4:
+        return _hydrate_simple_x4(payload)
     return ImageVORow(**payload)

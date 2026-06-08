@@ -71,6 +71,9 @@ tmp/
 scratch/
 *.log
 
+# Card-renderer dev scratch (regenerable via tools/render_card_samples.py)
+apps_script/template_previews/_samples/
+
 # OS
 desktop.ini
 

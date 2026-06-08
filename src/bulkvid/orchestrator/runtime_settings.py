@@ -231,6 +231,14 @@ SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 SETTING_SCRIPT_TEMPLATE_LIBRARY = "script_template_library"
 SETTING_TEMPLATE_SELECTOR_ENABLED = "template_selector_enabled"
 
+# Simple x4 card-template feature.
+# Plan ``_plans/2026-06-08-simple-x4-template-cards.md`` §Settings audit.
+SETTING_CARD_TEMPLATES_ENABLED = "card_templates_enabled"
+SETTING_CARD_TEMPLATE_1_DEFAULT_CTA = "card_template_1_default_cta"
+SETTING_CARD_TEMPLATE_2_DEFAULT_CTA = "card_template_2_default_cta"
+SETTING_CARD_PREVIEW_URL_TEMPLATE_1 = "card_preview_url_template_1"
+SETTING_CARD_PREVIEW_URL_TEMPLATE_2 = "card_preview_url_template_2"
+
 
 SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
     SettingDef(
@@ -369,6 +377,64 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "'true' or 'false'. When false, blank columns fall back to the "
             "hardcoded literal opener (the legacy behavior). Flip off "
             "instantly here if the selector ever misbehaves in production."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_TEMPLATES_ENABLED,
+        label="Simple x4 card templates: enabled",
+        default="true",
+        multiline=False,
+        description=(
+            "Master switch for the simple x4 card-template feature. Accepts "
+            "'true' or 'false'. When false, every per-video Template* cell "
+            "on the simple x4 tab is treated as blank and the row renders "
+            "with today's kie.ai-only output. Flip off as an instant kill "
+            "switch if the renderer ever misbehaves in production — no "
+            "redeploy needed."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_TEMPLATE_1_DEFAULT_CTA,
+        label="Card template 1: default CTA",
+        default="DISCOVER MORE >>",
+        multiline=False,
+        description=(
+            "Fallback CTA text drawn on the Template 1 pill when the row's "
+            "CTA cell is blank. Set to empty to render the card with no "
+            "pill at all when both are blank."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_TEMPLATE_2_DEFAULT_CTA,
+        label="Card template 2: default CTA",
+        default="See The Full Guide >>",
+        multiline=False,
+        description=(
+            "Fallback CTA text drawn on the Template 2 pill when the row's "
+            "CTA cell is blank. Set to empty to render the card with no "
+            "pill at all when both are blank."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_PREVIEW_URL_TEMPLATE_1,
+        label="Card template 1: preview URL",
+        default="",
+        multiline=False,
+        description=(
+            "Public URL of the Template 1 preview PNG, used by the Apps "
+            "Script migration menu to populate the row-1 =IMAGE() formula. "
+            "Set this AFTER running tools/upload_template_previews.py — "
+            "that script prints the URL on success."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_CARD_PREVIEW_URL_TEMPLATE_2,
+        label="Card template 2: preview URL",
+        default="",
+        multiline=False,
+        description=(
+            "Public URL of the Template 2 preview PNG. Same pattern as "
+            "Template 1 above."
         ),
     ),
 )

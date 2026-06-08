@@ -35,6 +35,7 @@ from bulkvid.models.row import (
     ImageVORow,
     RowResult,
     SimpleRow,
+    SimpleX4Row,
 )
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
@@ -42,6 +43,7 @@ from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
+from bulkvid.orchestrator.row_processor_simple_x4 import process_simple_x4_row
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_4IMAGES,
     SETTING_ROW_TIMEOUT_CARTOON,
@@ -71,12 +73,17 @@ _TAB_SIMPLE = "simple"
 _TAB_IMAGE_VO = "image_vo"
 _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
+_TAB_SIMPLE_X4 = "simple_x4"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
     _TAB_IMAGE_VO: 900.0,       # 15 min — image gen is heavier
     _TAB_4IMAGES: 720.0,        # 12 min
     _TAB_CARTOON: 1200.0,       # 20 min — planner + multi-shot
+    # simple_x4 shares image_vo's heavy image-gen path + adds one small
+    # headline GPT call + CPU-bound overlay work. Same budget — overlay
+    # work is sub-second, headline call is <2s.
+    _TAB_SIMPLE_X4: 900.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -84,6 +91,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_IMAGE_VO: SETTING_ROW_TIMEOUT_IMAGE_VO,
     _TAB_4IMAGES: SETTING_ROW_TIMEOUT_4IMAGES,
     _TAB_CARTOON: SETTING_ROW_TIMEOUT_CARTOON,
+    # simple_x4 reuses the image_vo timeout setting — same shape of work.
+    _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -95,6 +104,8 @@ def _tab_for_row(row: object) -> str:
     """Map a row instance to the timeout tab name."""
     if isinstance(row, SimpleRow):
         return _TAB_SIMPLE
+    if isinstance(row, SimpleX4Row):
+        return _TAB_SIMPLE_X4
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -173,6 +184,8 @@ async def _dispatch_to_processor(
     """
     if isinstance(row, SimpleRow):
         return await process_simple_row(row, clients, job_id=job_id)
+    if isinstance(row, SimpleX4Row):
+        return await process_simple_x4_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):

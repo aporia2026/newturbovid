@@ -29,12 +29,19 @@ from google.oauth2.service_account import Credentials
 from bulkvid.adapters._retry import with_retry
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
-from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
+from bulkvid.models.row import (
+    CardChoice,
+    CartoonRow,
+    FourImagesVO2Row,
+    ImageVORow,
+    SimpleX4Row,
+)
 from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
+    TAB_SIMPLE_X4,
 )
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
@@ -138,6 +145,53 @@ class _FourImagesCols:
 
 IMAGE_VO_COLS = _ImageVOCols()
 FOUR_IMAGES_COLS = _FourImagesCols()
+
+
+@dataclass(frozen=True)
+class _SimpleX4Cols:
+    """Layout for the ``simple x4`` tab after the 2026-06-08 migration.
+
+    Inherits A-H from the Image-VO layout, inserts 8 columns for per-video
+    Template + CTA pairs, then shifts Open Comments + Ready Video 1-4
+    right by 8. Plan ``_plans/2026-06-08-simple-x4-template-cards.md`` §D.1.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image: int = 3     # D
+    voice_over: int = 4       # E
+    zapcap: int = 5           # F
+    aspect_ratio: int = 6     # G
+    script_pattern: int = 7   # H
+    template_1: int = 8       # I  (NEW)
+    cta_1: int = 9            # J  (NEW)
+    template_2: int = 10      # K  (NEW)
+    cta_2: int = 11           # L  (NEW)
+    template_3: int = 12      # M  (NEW)
+    cta_3: int = 13           # N  (NEW)
+    template_4: int = 14      # O  (NEW)
+    cta_4: int = 15           # P  (NEW)
+    open_comments: int = 16   # Q  (shifted from 8)
+    ready_video_start: int = 17   # R = 0-indexed col 17 (shifted from 9)
+
+
+SIMPLE_X4_COLS = _SimpleX4Cols()
+
+
+# Header rows BEFORE data starts.
+#   - Image-VO / Simple / Cartoon / 4Images: 1 header row → data at sheet row 2
+#   - Simple x4 (post-migration): 2 header rows (row 1 = template previews,
+#     row 2 = column names) → data at sheet row 3
+#
+# Centralised so the readers (read_*_rows, read_processed_row_nums) agree.
+_HEADER_ROWS_BY_TAB: dict[str, int] = {
+    TAB_IMAGE_VO: 1,
+    TAB_FOUR_IMAGES: 1,
+    TAB_SIMPLE: 1,
+    TAB_CARTOON: 1,
+    TAB_SIMPLE_X4: 2,
+}
 
 
 # ── Cell parsing helpers ────────────────────────────────────────────────────
@@ -267,11 +321,15 @@ class SheetsClient:
         return [ws.title for ws in spreadsheet.worksheets()]
 
     def _read_processed_row_nums_sync(
-        self, sheet_id: str, worksheet_name: str, ready_video_col_0based: int
+        self,
+        sheet_id: str,
+        worksheet_name: str,
+        ready_video_col_0based: int,
+        header_rows: int = 1,
     ) -> set[int]:
         data = self._read_all_values_sync(sheet_id, worksheet_name)
         processed: set[int] = set()
-        for offset, raw in enumerate(data[1:], start=2):
+        for offset, raw in enumerate(data[header_rows:], start=header_rows + 1):
             if _cell(raw, ready_video_col_0based):
                 processed.add(offset)
         return processed
@@ -313,6 +371,8 @@ class SheetsClient:
             col = IMAGE_VO_COLS.ready_video_start
         elif layout == TAB_FOUR_IMAGES:
             col = FOUR_IMAGES_COLS.ready_video_start
+        elif layout == TAB_SIMPLE_X4:
+            col = SIMPLE_X4_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -320,6 +380,7 @@ class SheetsClient:
             sheet_id,
             worksheet_name,
             col,
+            _HEADER_ROWS_BY_TAB.get(layout, 1),
             op="sheets read_processed",
         )
 
@@ -444,6 +505,90 @@ class SheetsClient:
         )
         return rows
 
+    async def read_simple_x4_rows(
+        self, sheet_id: str, worksheet_name: str
+    ) -> list[SimpleX4Row]:
+        """Read the ``simple x4`` tab (post-migration layout).
+
+        Row 1 holds the template preview images; row 2 holds the column-name
+        headers; row 3+ is data — so we skip ``data[:2]`` (NOT ``data[:1]``
+        like the other readers). Plan §D.1.
+
+        Per-video template values OUTSIDE ``{"", "1", "2"}`` are logged and
+        coerced to empty so a typo on one cell never poisons the whole row.
+        """
+        data = await self._to_thread_with_retry(
+            self._read_all_values_sync,
+            sheet_id,
+            worksheet_name,
+            op="sheets read_simple_x4",
+        )
+        rows: list[SimpleX4Row] = []
+        if not data:
+            return rows
+
+        cols = SIMPLE_X4_COLS
+        required = [cols.article, cols.manual_image]
+        header_rows = _HEADER_ROWS_BY_TAB[TAB_SIMPLE_X4]
+
+        for offset, raw in enumerate(data[header_rows:], start=header_rows + 1):
+            if _row_is_blank(raw, required):
+                continue
+            article = _cell(raw, cols.article)
+            seed = _cell(raw, cols.manual_image)
+            if not article or not seed:
+                _log.warning(
+                    "skip_incomplete_simple_x4_row",
+                    sheet_row=offset,
+                    has_article=bool(article),
+                    has_seed=bool(seed),
+                )
+                continue
+
+            template_idxs = (cols.template_1, cols.template_2, cols.template_3, cols.template_4)
+            cta_idxs = (cols.cta_1, cols.cta_2, cols.cta_3, cols.cta_4)
+            cards: list[CardChoice] = []
+            for i, (t_idx, c_idx) in enumerate(zip(template_idxs, cta_idxs, strict=True)):
+                raw_template = _cell(raw, t_idx)
+                template_id = raw_template if raw_template in ("", "1", "2") else ""
+                if raw_template and template_id == "":
+                    _log.warning(
+                        "simple_x4_bad_template_value",
+                        sheet_row=offset,
+                        video_index=i + 1,
+                        value=raw_template[:40],
+                    )
+                cards.append(
+                    CardChoice(
+                        template_id=template_id,
+                        cta=_cell(raw, c_idx)[:80],    # bound CTA at 80 chars (plan §D.8)
+                    )
+                )
+
+            rows.append(
+                SimpleX4Row(
+                    row_num=offset,
+                    country=_cell(raw, cols.country),
+                    vertical=_cell(raw, cols.vertical),
+                    article_url=article,
+                    manual_image_url=seed,
+                    voice_over=_yes(_cell(raw, cols.voice_over), default=True),
+                    zapcap=_yes(_cell(raw, cols.zapcap), default=False),
+                    aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
+                    script_pattern=_cell(raw, cols.script_pattern),
+                    cards=cards,
+                    open_comments=_cell(raw, cols.open_comments),
+                )
+            )
+
+        _log.info(
+            "read_simple_x4_rows",
+            sheet_id=sheet_id,
+            worksheet=worksheet_name,
+            row_count=len(rows),
+        )
+        return rows
+
     async def read_cartoon_rows(
         self, sheet_id: str, worksheet_name: str
     ) -> list[CartoonRow]:
@@ -510,6 +655,8 @@ class SheetsClient:
                 if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE, TAB_CARTOON)
                 else FOUR_IMAGES_COLS.ready_video_start
                 if tab_type == TAB_FOUR_IMAGES
+                else SIMPLE_X4_COLS.ready_video_start
+                if tab_type == TAB_SIMPLE_X4
                 else None
             )
             if ready_start is None:

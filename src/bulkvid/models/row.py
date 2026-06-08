@@ -42,6 +42,44 @@ class ImageVORow:
 
 
 @dataclass
+class CardChoice:
+    """Per-video card-template selection on the ``simple x4`` tab.
+
+    Empty ``template_id`` means "no card overlay — use the kie-generated
+    image as-is" (today's behavior). ``"1"`` / ``"2"`` pick a Pillow-rendered
+    overlay; ``cta`` is the button text (empty → fall back to the
+    per-template default in the settings registry).
+    """
+
+    template_id: str = ""             # "" | "1" | "2"
+    cta: str = ""                     # operator text, ≤80 chars
+
+
+@dataclass
+class SimpleX4Row:
+    """Simple x4 tab input row — 4 videos generated from one Manual Image
+    via the image_vo pipeline, each with its own optional card overlay.
+
+    Same input columns as Image-VO, plus 4 ``(template, cta)`` pairs (one
+    per generated video). ``cards`` is always exactly length 4; entries
+    with empty ``template_id`` are rendered without an overlay (matches
+    today's behavior). Plan ``_plans/2026-06-08-simple-x4-template-cards.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    cards: list[CardChoice]           # exactly 4
+    open_comments: str
+
+
+@dataclass
 class SimpleRow:
     """Simple tab input row — one video from the user's existing Manual Image.
 
