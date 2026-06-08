@@ -179,6 +179,34 @@ class _SimpleX4Cols:
 SIMPLE_X4_COLS = _SimpleX4Cols()
 
 
+@dataclass(frozen=True)
+class _CartoonCols:
+    """Layout for the ``cartoon`` tab after the 2026-06-08 CTA column insertion.
+
+    Inherits A-H from the Image-VO layout (Manual Image at D is ignored for
+    cartoon — scenes are generated from scratch), inserts 2 columns for the
+    operator's CTA toggle + text, then shifts Open Comments + Ready Video 1/2
+    right by 2. Cartoon only writes back TWO Ready Video URLs (the row produces
+    two ideas, not four), so ready_video_start covers cols L + M only.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image: int = 3     # D  (ignored — cartoon generates from scratch)
+    voice_over: int = 4       # E
+    zapcap: int = 5           # F
+    aspect_ratio: int = 6     # G
+    script_pattern: int = 7   # H
+    cta_enabled: int = 8      # I  (NEW — Yes/No dropdown)
+    cta_text: int = 9         # J  (NEW — operator text; empty → per-language default)
+    open_comments: int = 10   # K  (shifted from 8)
+    ready_video_start: int = 11   # L = 0-indexed col 11 (shifted from 9)
+
+
+CARTOON_COLS = _CartoonCols()
+
+
 # Header rows BEFORE data starts.
 #   - Image-VO / Simple / Cartoon / 4Images: 1 header row → data at sheet row 2
 #   - Simple x4 (post-migration): 2 header rows (row 1 = template previews,
@@ -367,8 +395,10 @@ class SheetsClient:
         cell is non-empty — i.e. rows that have already been processed.
         Used by the local runner so the default "process all unprocessed rows"
         path can skip rows that already have output."""
-        if layout in (TAB_IMAGE_VO, TAB_SIMPLE, TAB_CARTOON):
+        if layout in (TAB_IMAGE_VO, TAB_SIMPLE):
             col = IMAGE_VO_COLS.ready_video_start
+        elif layout == TAB_CARTOON:
+            col = CARTOON_COLS.ready_video_start
         elif layout == TAB_FOUR_IMAGES:
             col = FOUR_IMAGES_COLS.ready_video_start
         elif layout == TAB_SIMPLE_X4:
@@ -592,9 +622,11 @@ class SheetsClient:
     async def read_cartoon_rows(
         self, sheet_id: str, worksheet_name: str
     ) -> list[CartoonRow]:
-        """Read the cartoon tab. Shares the Image-VO column layout, but the
-        Manual Image column (D) is ignored — cartoon scenes are generated from
-        scratch — so only the article URL is required."""
+        """Read the cartoon tab. The Manual Image column (D) is ignored —
+        cartoon scenes are generated from scratch — so only the article URL
+        is required. Post-2026-06-08 the tab has a CTA (Yes/No) column at I
+        and a CTA Text column at J; Open Comments + Ready Videos shift right
+        by 2 (see ``_CartoonCols``)."""
         data = await self._to_thread_with_retry(
             self._read_all_values_sync,
             sheet_id,
@@ -605,7 +637,7 @@ class SheetsClient:
         if not data:
             return rows
 
-        cols = IMAGE_VO_COLS
+        cols = CARTOON_COLS
         for offset, raw in enumerate(data[1:], start=2):
             article = _cell(raw, cols.article)
             if not article:
@@ -622,6 +654,8 @@ class SheetsClient:
                     zapcap=_yes(_cell(raw, cols.zapcap), default=False),
                     aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
                     script_pattern=_cell(raw, cols.script_pattern),
+                    cta_enabled=_yes(_cell(raw, cols.cta_enabled), default=False),
+                    cta_text=_cell(raw, cols.cta_text)[:80],    # bound at 80 chars
                     open_comments=_cell(raw, cols.open_comments),
                 )
             )
@@ -652,7 +686,9 @@ class SheetsClient:
         for (sheet_id, worksheet, tab_type), batch in grouped.items():
             ready_start = (
                 IMAGE_VO_COLS.ready_video_start
-                if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE, TAB_CARTOON)
+                if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
+                else CARTOON_COLS.ready_video_start
+                if tab_type == TAB_CARTOON
                 else FOUR_IMAGES_COLS.ready_video_start
                 if tab_type == TAB_FOUR_IMAGES
                 else SIMPLE_X4_COLS.ready_video_start

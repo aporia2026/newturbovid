@@ -163,6 +163,16 @@ class Settings(BaseSettings):
     BULKVID_SHEET_WRITE_INTERVAL_SECONDS: float = 5.0
     BULKVID_MAX_ROWS_PER_BATCH: int = 5000
 
+    # Per-provider concurrency caps — cap in-flight requests against ONE
+    # external provider across the WHOLE worker, independent of the runner-
+    # level row cap. Added 2026-06-08 after a 277-row batch hit 46% failures
+    # from Rendi platform overload + Gemini TTS per-minute quota bursts.
+    # Plan: ``_plans/2026-06-08-200-row-batch-failures.md`` §Phase 1.
+    # Both values are v1 guesses to be retuned from production semaphore-wait
+    # data; see each adapter for default-choice reasoning.
+    BULKVID_RENDI_MAX_CONCURRENT: int = 6
+    BULKVID_GEMINI_TTS_MAX_CONCURRENT: int = 4
+
     # ── Feature flags ────────────────────────────────────────────────────
     BULKVID_INTERNAL_PARALLEL: int = 1
     BULKVID_ARTICLE_CACHE: int = 1

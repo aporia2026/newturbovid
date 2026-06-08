@@ -14,7 +14,9 @@ Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 (Models), §11 (Cost).
 
 from __future__ import annotations
 
+import asyncio
 import io
+import time
 import wave
 from dataclasses import dataclass
 from typing import Any
@@ -29,6 +31,34 @@ from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
 
 _log = get_logger("tts")
+
+
+# ── Per-provider concurrency ─────────────────────────────────────────────────
+#
+# Gemini TTS has a per-minute quota that's tight on TTS preview models. When
+# 10 concurrent rows burst into Gemini at the same instant (one ``synthesize``
+# per ``simple`` row), the quota trips and 429 RESOURCE_EXHAUSTED storms
+# across rows (observed 2026-06-07: 54 of 277 rows failed at TTS).
+#
+# The semaphore caps in-flight ``synthesize`` calls across ALL row processors.
+# Default 4 is intentional: 4 × ~3-5s synth each = ~50-80 calls/min peak,
+# comfortably under a typical 200-RPM Vertex quota with headroom for the
+# retry layer to absorb whatever does trip.
+#
+# Plan: ``_plans/2026-06-08-200-row-batch-failures.md`` §Phase 1 / Part 4.
+GEMINI_TTS_DEFAULT_MAX_CONCURRENT = 4
+
+# Threshold above which we emit a semaphore-wait log. Below this, the cap
+# isn't biting — no log. Above this, the cap IS the bottleneck and we want
+# the signal so we can retune.
+GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS = 1.0
+
+# Per-retry ceiling for Gemini TTS specifically. The shared ``with_retry``
+# default is 30s, but Gemini's quota window is per-MINUTE — a Retry-After of
+# 30-60s should be honored fully, otherwise the second retry hits the same
+# windowed quota and bounces again. 65s gives a single ~1-minute window
+# enough room to roll over plus a small jitter margin.
+GEMINI_TTS_RETRY_MAX_SECONDS = 65.0
 
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
@@ -236,15 +266,27 @@ class GeminiTTSClient:
         location: str = "us-central1",
         model: str = DEFAULT_MODEL,
         credentials_info: dict[str, Any] | None = None,
+        max_concurrent: int = GEMINI_TTS_DEFAULT_MAX_CONCURRENT,
         client: Any | None = None,
     ) -> None:
         if not project:
             raise ValueError("GeminiTTSClient requires a Vertex AI project")
+        if max_concurrent < 1:
+            raise ValueError("GeminiTTSClient max_concurrent must be >= 1")
         self._project = project
         self._location = location
         self._model = model
         self._credentials_info = credentials_info
         self._client = client  # injected (tests) or built lazily
+        # Per-provider semaphore — built lazily on first acquire so import-time
+        # construction outside an event loop is safe.
+        self._max_concurrent = max_concurrent
+        self._sem: asyncio.Semaphore | None = None
+
+    def _get_sem(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._max_concurrent)
+        return self._sem
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -329,16 +371,27 @@ class GeminiTTSClient:
                     raise
                 raise wrapped from e
 
-        response = await with_retry(
-            _call,
-            op="gemini tts",
-            retryable=(
-                GeminiTTSRateLimitError,
-                GeminiTTSServerError,
-                GeminiTTSTimeoutError,
-                GeminiTTSConnectionError,
-            ),
-        )
+        # Per-provider cap. The whole synth (incl. retry-honored waits) holds
+        # the slot — the goal is to prevent the BURST that trips the quota,
+        # not just one in-flight HTTP call. Lifted ``max_seconds`` so a 60s
+        # Retry-After (typical per-minute quota signal) is honored fully.
+        sem = self._get_sem()
+        wait_start = time.monotonic()
+        async with sem:
+            waited = time.monotonic() - wait_start
+            if waited >= GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS:
+                _log.info("gemini_tts_semaphore_wait", queued_for_s=round(waited, 2))
+            response = await with_retry(
+                _call,
+                op="gemini tts",
+                retryable=(
+                    GeminiTTSRateLimitError,
+                    GeminiTTSServerError,
+                    GeminiTTSTimeoutError,
+                    GeminiTTSConnectionError,
+                ),
+                max_seconds=GEMINI_TTS_RETRY_MAX_SECONDS,
+            )
 
         pcm = _extract_audio_bytes(response)
         if not pcm:
@@ -406,4 +459,5 @@ def build_client_from_settings(settings: Settings | None = None) -> GeminiTTSCli
         project=s.VERTEX_AI_PROJECT_ID,
         location=s.VERTEX_AI_LOCATION,
         credentials_info=build_vertex_credentials_info(s),
+        max_concurrent=s.BULKVID_GEMINI_TTS_MAX_CONCURRENT,
     )

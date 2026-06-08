@@ -97,6 +97,8 @@ class CartoonRowIn(BaseModel):
     zapcap: bool = False
     aspect_ratio: str = "9:16"
     script_pattern: str = ""
+    cta_enabled: bool = False    # Yoav 2026-06-08 — Sheet column CTA Yes/No
+    cta_text: str = ""           # operator text; empty → per-language fallback
     open_comments: str = ""
 
 

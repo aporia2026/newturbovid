@@ -14,13 +14,18 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import respx
+import structlog.testing
 
 from bulkvid.adapters.rendi import (
     COST_RENDI_COMMAND_USD,
     DEFAULT_DIMENSIONS_BY_RATIO,
+    RENDI_DEFAULT_MAX_CONCURRENT,
+    RENDI_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS,
     RendiAuthError,
     RendiClient,
     RendiCommandFailedError,
@@ -667,3 +672,142 @@ def test_cartoon_concat_command_rejects_zero_clips() -> None:
 
 def test_cost_constant_positive() -> None:
     assert COST_RENDI_COMMAND_USD > 0
+
+
+# ── Full-body logging on FAILED + per-provider semaphore ────────────────────
+#
+# Coverage for ``_plans/2026-06-08-200-row-batch-failures.md`` §Phase 1.
+# Adds three protections that landed in response to the 277-row simple-tab
+# batch failure (46% failure rate, primarily Rendi platform overload).
+
+
+@respx.mock
+async def test_poll_failed_logs_full_response_body() -> None:
+    # Reproduces the 2026-06-07 production shape: Rendi marks the command
+    # FAILED with an empty error dict and no stderr. Pre-change code logged
+    # ``error_message=""`` and dropped the body, leaving operators blind.
+    # Post-change code MUST include the full body in the log record so the
+    # next variant of this failure shape lands debuggable.
+    failed_body = {"status": "FAILED", "error": {}, "command_id": "cmd-empty"}
+    respx.get(f"{BASE}/v1/commands/cmd-empty").mock(
+        return_value=httpx.Response(200, json=failed_body)
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        async with RendiClient(api_key=API_KEY, base_url=BASE) as client:
+            with pytest.raises(RendiCommandFailedError):
+                await client.poll("cmd-empty", max_attempts=2, delay_seconds=0.0)
+
+    failed = [e for e in logs if e.get("event") == "rendi_poll_failed"]
+    assert failed, "expected one rendi_poll_failed log event"
+    assert failed[0].get("full_body") == failed_body, (
+        "rendi_poll_failed must include the full Rendi response body so the "
+        "next unknown FAILED shape is diagnosable (see plan §Phase 1 Part 1)"
+    )
+
+
+async def test_constructor_rejects_max_concurrent_zero() -> None:
+    with pytest.raises(ValueError):
+        RendiClient(api_key=API_KEY, max_concurrent=0)
+
+
+async def test_semaphore_default_matches_module_constant() -> None:
+    # Sanity: the factory pulls the default from the module constant. If the
+    # constant moves, the public default moves with it.
+    client = RendiClient(api_key=API_KEY)
+    sem = client._get_sem()
+    # ``Semaphore._value`` is the remaining capacity at idle == initial value.
+    assert sem._value == RENDI_DEFAULT_MAX_CONCURRENT
+
+
+@respx.mock
+async def test_semaphore_caps_concurrent_submit_and_poll() -> None:
+    # Probe: with max_concurrent=2, only 2 _submit_and_poll calls should be
+    # mid-flight at any instant. We track peak concurrency observed inside
+    # the submit handler (which fires only after the slot is acquired).
+    in_flight = {"now": 0, "peak": 0}
+    submit_block = asyncio.Event()    # holds submits open until released
+
+    async def _submit_handler(request: httpx.Request) -> httpx.Response:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        await submit_block.wait()    # park while holding the semaphore slot
+        return httpx.Response(200, json={"command_id": f"cmd-{in_flight['now']}"})
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit_handler)
+    respx.get(url__regex=rf"{BASE}/v1/commands/.+").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "output_files": {"out_1": {"storage_url": "https://r.dev/o.mp4"}},
+            },
+        )
+    )
+
+    async with RendiClient(api_key=API_KEY, base_url=BASE, max_concurrent=2) as client:
+        async def _one() -> str:
+            try:
+                url, _ = await client._submit_and_poll(
+                    "cmd", {"in_1": "x"}, {"out_1": "o.mp4"},
+                    max_attempts=2, delay_seconds=0.0, retry_backoff_seconds=0.0,
+                )
+                return url
+            finally:
+                in_flight["now"] -= 1
+
+        tasks = [asyncio.create_task(_one()) for _ in range(5)]
+        # Let the scheduler acquire as many slots as the cap allows.
+        await asyncio.sleep(0.05)
+        assert in_flight["peak"] == 2, (
+            f"expected peak concurrency 2, saw {in_flight['peak']} "
+            "(semaphore is NOT capping cross-row Rendi commands)"
+        )
+        submit_block.set()
+        await asyncio.gather(*tasks)
+
+
+@respx.mock
+async def test_semaphore_wait_logged_when_threshold_exceeded() -> None:
+    # When the cap bites for longer than the log threshold, we want a
+    # rendi_semaphore_wait event. The second call must wait for the first.
+    submit_block = asyncio.Event()
+
+    async def _slow_submit(request: httpx.Request) -> httpx.Response:
+        await submit_block.wait()
+        return httpx.Response(200, json={"command_id": "cmd-1"})
+
+    respx.post(f"{BASE}/v1/run-ffmpeg-command").mock(side_effect=_slow_submit)
+    respx.get(url__regex=rf"{BASE}/v1/commands/.+").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "SUCCESS",
+                "output_files": {"out_1": {"storage_url": "https://r.dev/o.mp4"}},
+            },
+        )
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        async with RendiClient(
+            api_key=API_KEY, base_url=BASE, max_concurrent=1
+        ) as client:
+            async def _one() -> None:
+                await client._submit_and_poll(
+                    "cmd", {"in_1": "x"}, {"out_1": "o.mp4"},
+                    max_attempts=2, delay_seconds=0.0, retry_backoff_seconds=0.0,
+                )
+
+            t1 = asyncio.create_task(_one())
+            t2 = asyncio.create_task(_one())
+            # Wait long enough that t2's queue time crosses the threshold.
+            await asyncio.sleep(RENDI_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS + 0.2)
+            submit_block.set()
+            await asyncio.gather(t1, t2)
+
+    waits = [e for e in logs if e.get("event") == "rendi_semaphore_wait"]
+    assert waits, (
+        "expected at least one rendi_semaphore_wait event when the cap is biting"
+    )
+    # The recorded wait should at least equal the slept time minus jitter.
+    assert waits[0]["queued_for_s"] >= RENDI_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS

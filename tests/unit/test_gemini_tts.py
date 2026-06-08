@@ -16,20 +16,34 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import structlog.testing
 
 from bulkvid.adapters import _retry
+from bulkvid.adapters import gemini_tts as _gemini_tts_mod
+
+# Capture the real ``asyncio.sleep`` BEFORE any fixture replaces it. The
+# autouse ``_no_sleep_between_retries`` fixture below monkeypatches
+# ``_retry.asyncio.sleep`` — which IS ``asyncio.sleep`` globally — to a
+# no-op so retry backoffs don't slow the suite. Tests that need to yield
+# the event loop (semaphore-cap probes, log-wait probes) call ``_real_sleep``
+# instead so the scheduler actually advances other tasks.
+_real_sleep = asyncio.sleep
 from bulkvid.adapters.gemini_tts import (
     COST_GEMINI_TTS_PER_CHAR_USD,
     DEFAULT_VOICE,
     GEMINI_TTS_CHANNELS,
+    GEMINI_TTS_DEFAULT_MAX_CONCURRENT,
+    GEMINI_TTS_RETRY_MAX_SECONDS,
     GEMINI_TTS_SAMPLE_RATE_HZ,
     GEMINI_TTS_SAMPLE_WIDTH_BYTES,
+    GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS,
     VOICE_BY_LANGUAGE,
     GeminiTTSClient,
     GeminiTTSNoAudioError,
@@ -330,3 +344,127 @@ async def test_synthesize_does_not_retry_unknown_error() -> None:
         await tts.synthesize(text="hello", language="en")
 
     assert fake_client.aio.models.generate_content.await_count == 1
+
+
+# ── Per-provider semaphore + lifted retry ceiling ───────────────────────────
+#
+# Coverage for ``_plans/2026-06-08-200-row-batch-failures.md`` §Phase 1 Part 4.
+# Added 2026-06-08 after the 277-row simple-tab batch hit 54 TTS_FAILED rows
+# from per-minute Gemini quota bursts.
+
+
+def test_constructor_rejects_max_concurrent_zero() -> None:
+    with pytest.raises(ValueError):
+        GeminiTTSClient(project="amit-tts", max_concurrent=0)
+
+
+async def test_semaphore_default_matches_module_constant() -> None:
+    # Sanity: factory default == module constant. If one moves the other moves.
+    client = GeminiTTSClient(project="amit-tts")
+    sem = client._get_sem()
+    assert sem._value == GEMINI_TTS_DEFAULT_MAX_CONCURRENT
+
+
+async def test_semaphore_caps_concurrent_synth() -> None:
+    # With max_concurrent=2, only 2 ``synthesize`` calls should be mid-flight
+    # at any instant. Probe the peak via a shared counter inside the fake
+    # generate_content (which runs after the slot is acquired).
+    #
+    # NB: we bind the async function DIRECTLY to the SimpleNamespace rather
+    # than wrapping it in AsyncMock. ``AsyncMock(side_effect=async_fn)``
+    # calls the async function but does NOT auto-await the returned
+    # coroutine — the synthesize await receives a coroutine, not a real
+    # response, and our in-flight probe never bumps.
+    in_flight = {"now": 0, "peak": 0}
+    release = asyncio.Event()
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)    # half a second of audio
+
+    async def _generate(**_: Any) -> SimpleNamespace:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        try:
+            await release.wait()    # hold the slot
+            return _make_fake_response(pcm)
+        finally:
+            in_flight["now"] -= 1
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=_generate))
+    )
+
+    tts = GeminiTTSClient(project="amit-tts", max_concurrent=2, client=fake_client)
+
+    async def _one() -> None:
+        await tts.synthesize(text="hello", language="en")
+
+    tasks = [asyncio.create_task(_one()) for _ in range(5)]
+    # Let the scheduler grant up to max_concurrent slots before we release.
+    # Use ``_real_sleep`` because the autouse retry-no-sleep fixture has
+    # patched ``asyncio.sleep`` itself to a no-op.
+    await _real_sleep(0.05)
+    assert in_flight["peak"] == 2, (
+        f"expected peak concurrency 2, saw {in_flight['peak']} "
+        "(semaphore is NOT capping cross-row Gemini TTS calls)"
+    )
+    release.set()
+    await asyncio.gather(*tasks)
+
+
+async def test_semaphore_wait_logged_when_threshold_exceeded() -> None:
+    # When the cap bites for longer than the log threshold, we want a
+    # gemini_tts_semaphore_wait event so we can see the cap is biting.
+    release = asyncio.Event()
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)
+
+    async def _generate(**_: Any) -> SimpleNamespace:
+        await release.wait()
+        return _make_fake_response(pcm)
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace(generate_content=_generate))
+    )
+    tts = GeminiTTSClient(project="amit-tts", max_concurrent=1, client=fake_client)
+
+    with structlog.testing.capture_logs() as logs:
+        t1 = asyncio.create_task(tts.synthesize(text="a", language="en"))
+        t2 = asyncio.create_task(tts.synthesize(text="b", language="en"))
+        await _real_sleep(GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS + 0.2)
+        release.set()
+        await asyncio.gather(t1, t2)
+
+    waits = [e for e in logs if e.get("event") == "gemini_tts_semaphore_wait"]
+    assert waits, (
+        "expected at least one gemini_tts_semaphore_wait event when the cap is biting"
+    )
+    assert waits[0]["queued_for_s"] >= GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS
+
+
+async def test_synthesize_passes_lifted_max_seconds_to_with_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bug-fix-as-test (rule 18): Gemini's per-minute quota window needs a
+    # Retry-After honor ceiling well above 30s. The shared with_retry default
+    # is 30s, which would clamp a 60s Retry-After to half its window — the
+    # second attempt then hits the SAME quota window and bounces. This test
+    # locks in max_seconds=GEMINI_TTS_RETRY_MAX_SECONDS (65s) for the
+    # Gemini-TTS call site specifically.
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)
+    fake_client = _make_fake_client(_make_fake_response(pcm))
+
+    captured: dict[str, Any] = {}
+
+    async def _spy_with_retry(fn: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return await fn()
+
+    monkeypatch.setattr(_gemini_tts_mod, "with_retry", _spy_with_retry)
+
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+    await tts.synthesize(text="hello", language="en")
+
+    assert captured.get("max_seconds") == GEMINI_TTS_RETRY_MAX_SECONDS, (
+        f"Gemini synthesize must pass max_seconds={GEMINI_TTS_RETRY_MAX_SECONDS} "
+        f"to with_retry (got {captured.get('max_seconds')!r}). The default 30s "
+        "clamps Retry-After below the per-minute quota window — second attempt "
+        "hits the same window and bounces."
+    )

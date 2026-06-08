@@ -81,6 +81,19 @@ const SIMPLE_X4_COLS = {
   lastInputCol: 17,
 };
 
+// Cartoon tab (post-2026-06-08 CTA column insertion). Inherits A-H from the
+// Image-VO layout, inserts CTA (Yes/No dropdown) at I and CTA Text at J,
+// then shifts Open Comments + Ready Video 1/2 right by 2. Cartoon only
+// produces 2 videos per row (not 4), so readyVideo columns end at M.
+const CARTOON_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  voiceOver: 5, zapcap: 6, aspectRatio: 7, scriptPattern: 8,
+  ctaEnabled: 9, ctaText: 10,
+  openComments: 11,
+  readyVideo1: 12, readyVideo2: 13,
+  lastInputCol: 11,
+};
+
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
 const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
@@ -237,9 +250,11 @@ function _readFourImagesRow(sheet, rowNum) {
 
 
 function _readCartoonRow(sheet, rowNum) {
-  // Cartoon shares the Image-VO layout but ignores Manual Image (scenes are
-  // generated from scratch), so the payload omits manual_image_url.
-  const cols = IMAGE_VO_COLS;
+  // Cartoon uses CARTOON_COLS — post-2026-06-08 layout has CTA (Yes/No) at I
+  // and CTA Text at J, with Open Comments + Ready Video columns shifted right
+  // by 2. Manual Image (D) is present in the sheet but ignored (cartoon
+  // scenes are generated from scratch, no seed image).
+  const cols = CARTOON_COLS;
   const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
   return {
     row_num: rowNum,
@@ -250,6 +265,8 @@ function _readCartoonRow(sheet, rowNum) {
     zapcap: _yes(_cell(values, cols.zapcap), false),
     aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
     script_pattern: _cell(values, cols.scriptPattern),
+    cta_enabled: _yes(_cell(values, cols.ctaEnabled), false),
+    cta_text: _cell(values, cols.ctaText).slice(0, 80),    // bound at 80 chars
     open_comments: _cell(values, cols.openComments),
   };
 }
@@ -397,6 +414,7 @@ function generateAllUnprocessed() {
   const cols = (
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+    : tabType === TAB_CARTOON ? CARTOON_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -450,6 +468,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     const videoCol = (
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+      : tabType === TAB_CARTOON ? CARTOON_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {

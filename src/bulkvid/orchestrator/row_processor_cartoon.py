@@ -36,7 +36,16 @@ from bulkvid.adapters.kie import (
     nano_banana_2_text_to_image,
     seedance_image_to_video,
 )
-from bulkvid.adapters.rendi import SPEECH_ATEMPO, normalize_aspect_ratio
+from bulkvid.adapters.rendi import (
+    SPEECH_ATEMPO,
+    dimensions_for_ratio,
+    normalize_aspect_ratio,
+)
+from bulkvid.adapters.zapcap import (
+    ZapCapRenderOptions,
+    ZapCapStyleOptions,
+    ZapCapSubsOptions,
+)
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
@@ -48,6 +57,7 @@ from bulkvid.models.row import (
     RowResult,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.pipeline.cartoon_cta import render_cartoon_cta_overlay_bytes
 from bulkvid.pipeline.cartoon_prompt import (
     CARTOON_TARGET_WORDS,
     CartoonIdea,
@@ -55,6 +65,7 @@ from bulkvid.pipeline.cartoon_prompt import (
     image_prompt_for_shot,
     shorten_voiceover,
 )
+from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
@@ -254,6 +265,49 @@ async def process_cartoon_row(
                 metadata["chosen_template_id"] = plan.chosen_template_id
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
+
+        # ─── CTA overlay setup (Yoav 2026-06-08) ─────────────────────────
+        # When the row's CTA column is set to Yes, every generated cartoon
+        # video gets a yellow CTA pill overlaid at the bottom. CTA text:
+        #   * operator's CTA Text column if non-empty
+        #   * else per-language "Read More" fallback (matches simple_x4 default)
+        # The overlay PNG is rendered ONCE per row (same text on all ideas),
+        # uploaded to storage, then composited onto each stitched cartoon
+        # video via Rendi. When ``CTA = No``, no overlay step runs and the
+        # row behaves exactly like the legacy cartoon path.
+        cta_overlay_url: str | None = None
+        cta_text_used: str = ""
+        if row.cta_enabled:
+            cta_text_used = (row.cta_text.strip() or
+                             default_cta_for_language(lang.language))
+            try:
+                overlay_w, overlay_h = dimensions_for_ratio(row.aspect_ratio)
+                overlay_bytes = render_cartoon_cta_overlay_bytes(
+                    cta_text_used,
+                    canvas_width=overlay_w,
+                    canvas_height=overlay_h,
+                )
+                overlay_upload = await clients.storage.upload_bytes(
+                    overlay_bytes,
+                    key=f"bulkvid/cta_overlays/{slug}.png",
+                    content_type="image/png",
+                )
+                costs.storage += overlay_upload.cost_usd
+                cta_overlay_url = overlay_upload.url
+                metadata["cta_enabled"] = True
+                metadata["cta_text_used"] = cta_text_used[:80]
+            except Exception as e:
+                # Overlay render/upload failure: ship videos WITHOUT the CTA
+                # rather than killing the whole row. Loud log so the operator
+                # can spot it.
+                _log.error(
+                    "cartoon_cta_overlay_failed_skipped",
+                    error=str(e)[:200], cta_text=cta_text_used[:80],
+                )
+                metadata["cta_enabled"] = False
+                metadata["cta_overlay_error"] = str(e)[:200]
+        else:
+            metadata["cta_enabled"] = False
 
         # ─── Stage 3+4: build each idea into a finished video (concurrently) ───
 
@@ -459,9 +513,27 @@ async def process_cartoon_row(
                     atempo=vo_atempo,
                 )
                 costs.rendi += stitched.cost_usd
+                cleanup_command_ids: list[str] = [stitched.command_id]
 
-                # 4e. Persist to our storage, then free the Rendi copy.
-                data = await _download(stitched.url, timeout=180.0)
+                # 4d.5. Optional CTA overlay (Yoav 2026-06-08). When the
+                # row's CTA column is Yes, composite the pre-rendered yellow
+                # pill PNG onto the stitched video via Rendi ffmpeg overlay.
+                # The PNG was rendered + uploaded once per row at the top of
+                # process_cartoon_row; reused across both ideas (same CTA
+                # text on both videos in a row).
+                video_url_for_persist = stitched.url
+                if cta_overlay_url:
+                    overlaid = await clients.rendi.overlay_image_on_video(
+                        video_url=stitched.url,
+                        overlay_url=cta_overlay_url,
+                        output_filename=f"v{idx + 1}_cta.mp4",
+                    )
+                    costs.rendi += overlaid.cost_usd
+                    cleanup_command_ids.append(overlaid.command_id)
+                    video_url_for_persist = overlaid.url
+
+                # 4e. Persist to our storage, then free the Rendi copies.
+                data = await _download(video_url_for_persist, timeout=180.0)
                 up = await clients.storage.upload_bytes(
                     data,
                     key=f"bulkvid/videos/{slug}/v{idx + 1}.mp4",
@@ -469,15 +541,25 @@ async def process_cartoon_row(
                 )
                 costs.storage += up.cost_usd
                 final_url = up.url
-                await clients.rendi.cleanup_commands([stitched.command_id])
+                await clients.rendi.cleanup_commands(cleanup_command_ids)
 
-                # 4f. Optional ZapCap. On failure keep the uncaptioned video.
+                # 4f. Optional ZapCap. When the CTA pill is on, push the
+                # caption position higher (top=30) so it doesn't cover the
+                # pill at the bottom; matches the simple_x4 templated-cell
+                # behavior. On failure keep the uncaptioned video.
                 if row.zapcap and clients.zapcap is not None:
                     try:
+                        zapcap_opts: ZapCapRenderOptions | None = None
+                        if cta_overlay_url:
+                            zapcap_opts = ZapCapRenderOptions(
+                                subs=ZapCapSubsOptions(),
+                                style=ZapCapStyleOptions(top=30, font_size=36),
+                            )
                         cap_url, cost = await clients.zapcap.caption_video(
                             video_bytes=data,
                             language=lang.language,
                             filename=f"v{idx + 1}.mp4",
+                            render_options=zapcap_opts,
                             video_duration_seconds=target_video_seconds,
                         )
                         costs.zapcap += cost

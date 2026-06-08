@@ -105,11 +105,18 @@ class CartoonRow:
     """Cartoon tab input row — animated, multi-shot videos generated from text.
 
     Same input columns as Image-VO (the "Manual Image" column is present in the
-    sheet but ignored: cartoon scenes are generated from scratch, no seed). Each
-    row produces TWO independent ~6-7s videos, each a stitched sequence of short
-    Seedance image-to-video clips. Two ``Ready Video`` cells are written back.
+    sheet but ignored: cartoon scenes are generated from scratch, no seed),
+    PLUS two CTA columns (Yoav 2026-06-08):
+      * ``cta_enabled`` — operator picks Yes/No on the Sheet's CTA column.
+        When True, a yellow CTA pill is overlaid at the bottom of every
+        generated cartoon video.
+      * ``cta_text`` — operator's CTA text. Empty falls back to the per-
+        language "Read More" table (``cta_defaults.default_cta_for_language``).
 
-    See ``orchestrator/row_processor_cartoon.py`` and ``pipeline/cartoon_prompt.py``.
+    Each row produces TWO independent ~6-7s videos, each a stitched sequence of
+    short Seedance image-to-video clips. Two ``Ready Video`` cells are written
+    back. See ``orchestrator/row_processor_cartoon.py``,
+    ``pipeline/cartoon_prompt.py``, and ``pipeline/cartoon_cta.py``.
     """
 
     row_num: int
@@ -121,6 +128,8 @@ class CartoonRow:
     aspect_ratio: str                 # e.g. "9:16"
     script_pattern: str
     open_comments: str
+    cta_enabled: bool = False         # NEW — default False (no CTA pill)
+    cta_text: str = ""                # NEW — operator text; empty = per-language default
 
 
 @dataclass

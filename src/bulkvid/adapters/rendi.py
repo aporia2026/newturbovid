@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,28 @@ COST_RENDI_COMMAND_USD = 0.01
 # Auto-retry transient Rendi failures (timeouts / network) this many extra times.
 # Genuine ffmpeg failures and auth errors are NOT retried.
 RENDI_RETRIES = 2
+
+# Per-provider concurrency cap. Rendi is a multi-tenant FFmpeg-as-a-service —
+# the account-wide vCPU pool is finite. When 10 concurrent rows each fire a
+# Rendi command at peak burst (one per ``simple`` row), Rendi's scheduler can
+# kill commands silently (observed 2026-06-07: 71 of 277 rows received
+# ``status=FAILED`` with empty error+stderr in an 11-minute window). The
+# semaphore caps in-flight commands across ALL row processors regardless of
+# the runner's ``BULKVID_MAX_CONCURRENT_ROWS``. Default 6 is intentional:
+#   - 6 × 4 vCPU/command = 24 vCPU asked of Rendi at peak — meaningful
+#     reduction from the today-peak of 10 (i.e. ~40 vCPU) without strangling
+#     throughput on small batches.
+#   - Labelled a **v1 guess**: retune from production semaphore-wait data once
+#     Phase 1 ships. The right number is "small enough that Rendi never returns
+#     empty-error-FAILED, large enough that semaphore waits stay <5s on the
+#     P95 row."
+# Plan ``_plans/2026-06-08-200-row-batch-failures.md`` §Phase 1 / Part 3.
+RENDI_DEFAULT_MAX_CONCURRENT = 6
+
+# Threshold above which we emit a semaphore-wait log line. Below this, the
+# cap isn't biting — no need to log. Above this, the cap is the bottleneck
+# and we want to see it. Per the post-council "instrument it" requirement.
+RENDI_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS = 1.0
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -226,6 +249,21 @@ _MUSIC_MIX_TEMPLATE = (
 )
 
 
+# Composite a transparent overlay PNG on top of an existing video at (0, 0).
+# Used by the cartoon CTA path (``pipeline/cartoon_cta.py``): the overlay PNG
+# is the same dimensions as the video with everything transparent except a
+# yellow CTA pill at the bottom — the result is the cartoon video with a
+# permanent CTA pill burned in. ``-map 0:a?`` keeps the video's audio track
+# when present; the ``?`` makes it optional so silent videos still pass.
+_OVERLAY_IMAGE_TEMPLATE = (
+    "-i {{in_1}} -i {{in_2}} "
+    '-filter_complex "[0:v][1:v]overlay=0:0:format=auto[outv]" '
+    '-map "[outv]" -map 0:a? '
+    "-c:v libx264 -pix_fmt yuv420p "
+    "-c:a copy {{out_1}}"
+)
+
+
 def render_resize_command(width: int, height: int) -> str:
     return _RESIZE_TEMPLATE.replace("__W__", str(width)).replace("__H__", str(height))
 
@@ -276,6 +314,10 @@ def render_fit_silent_command(
 
 def render_music_mix_command() -> str:
     return _MUSIC_MIX_TEMPLATE
+
+
+def render_overlay_image_command() -> str:
+    return _OVERLAY_IMAGE_TEMPLATE
 
 
 def render_cartoon_concat_command(
@@ -390,10 +432,13 @@ class RendiClient:
         read_timeout: float = 60.0,
         default_vcpu: int = 4,
         default_max_run_seconds: int = 300,
+        max_concurrent: int = RENDI_DEFAULT_MAX_CONCURRENT,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("RendiClient requires an api_key")
+        if max_concurrent < 1:
+            raise ValueError("RendiClient max_concurrent must be >= 1")
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
@@ -401,6 +446,11 @@ class RendiClient:
         self._default_max_run_seconds = default_max_run_seconds
         self._owned_client = client is None
         self._client = client or httpx.AsyncClient(timeout=self._timeout)
+        # Per-provider concurrency cap — see RENDI_DEFAULT_MAX_CONCURRENT.
+        # Built lazily on first acquire so a client instantiated outside the
+        # running asyncio loop (tests, sync import) doesn't blow up.
+        self._max_concurrent = max_concurrent
+        self._sem: asyncio.Semaphore | None = None
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -499,9 +549,15 @@ class RendiClient:
                 else:
                     msg = str(err)
                     stderr = body.get("ffmpeg_stderr") or ""
+                # Capture the full body so a future FAILED shape we haven't seen
+                # before (e.g. Rendi platform overload returning empty error+
+                # stderr — observed 2026-06-07 on Evgeny's 277-row batch) lands
+                # in the log instead of being collapsed to "{}". See
+                # _plans/2026-06-08-200-row-batch-failures.md §Phase 1 / Part 1.
                 _log.error(
                     "rendi_poll_failed",
                     command_id=command_id,
+                    full_body=body,
                     error_message=msg,
                     ffmpeg_stderr=stderr[:500],
                 )
@@ -524,6 +580,13 @@ class RendiClient:
 
     # ── High-level helpers ─────────────────────────────────────────────────
 
+    def _get_sem(self) -> asyncio.Semaphore:
+        """Lazy-init the per-provider semaphore so import-time construction
+        outside an event loop is safe (tests, sync wiring code)."""
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._max_concurrent)
+        return self._sem
+
     async def _submit_and_poll(
         self,
         ffmpeg_command: str,
@@ -540,29 +603,44 @@ class RendiClient:
         Re-submits a fresh command on timeouts / transient submit-poll errors.
         Does NOT retry genuine ffmpeg failures or auth errors (a retry would
         just repeat them). Returns ``(output_url, command_id)``.
+
+        Wrapped in the per-provider ``asyncio.Semaphore`` so the in-flight
+        command count against Rendi is capped across the whole worker, not
+        just per-row. The slot is held for the full submit+poll+retry cycle.
         """
-        last_exc: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                command_id = await self.submit(ffmpeg_command, input_files, output_files)
-                url = await self.poll(
-                    command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
-                )
-                return url, command_id
-            except (RendiAuthError, RendiCommandFailedError):
-                raise
-            except (RendiTimeoutError, RendiError) as e:
-                last_exc = e
-                if attempt < retries:
-                    _log.warning(
-                        "rendi_retry", attempt=attempt + 1, total=retries + 1,
-                        error=str(e)[:200],
+        sem = self._get_sem()
+        wait_start = time.monotonic()
+        async with sem:
+            waited = time.monotonic() - wait_start
+            if waited >= RENDI_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS:
+                # Cap is biting — visible signal that we're rate-limited by
+                # the semaphore (not by Rendi itself). Helps tune the cap.
+                _log.info("rendi_semaphore_wait", queued_for_s=round(waited, 2))
+
+            last_exc: Exception | None = None
+            for attempt in range(retries + 1):
+                try:
+                    command_id = await self.submit(
+                        ffmpeg_command, input_files, output_files
                     )
-                    await asyncio.sleep(retry_backoff_seconds)
-                    continue
-                raise
-        assert last_exc is not None
-        raise last_exc
+                    url = await self.poll(
+                        command_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+                    )
+                    return url, command_id
+                except (RendiAuthError, RendiCommandFailedError):
+                    raise
+                except (RendiTimeoutError, RendiError) as e:
+                    last_exc = e
+                    if attempt < retries:
+                        _log.warning(
+                            "rendi_retry", attempt=attempt + 1, total=retries + 1,
+                            error=str(e)[:200],
+                        )
+                        await asyncio.sleep(retry_backoff_seconds)
+                        continue
+                    raise
+            assert last_exc is not None
+            raise last_exc
 
     async def resize_image(
         self,
@@ -680,6 +758,32 @@ class RendiClient:
         )
         return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
 
+    async def overlay_image_on_video(
+        self,
+        video_url: str,
+        overlay_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Composite a transparent overlay PNG on top of a video at (0, 0).
+
+        The overlay PNG should be the SAME dimensions as the video frame —
+        the alpha channel decides what passes through. Used by the cartoon
+        CTA path to burn a yellow CTA pill onto the bottom of each cartoon
+        video (the overlay PNG is mostly transparent with the pill at the
+        bottom). Audio is copied through unchanged. Auto-retried.
+        """
+        url, command_id = await self._submit_and_poll(
+            render_overlay_image_command(),
+            {"in_1": video_url, "in_2": overlay_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
     async def concat_clips_with_audio(
         self,
         clip_urls: list[str],
@@ -780,4 +884,5 @@ def build_client_from_settings(settings: Settings | None = None) -> RendiClient:
         base_url=s.RENDI_BASE_URL,
         default_vcpu=s.RENDI_DEFAULT_VCPU,
         default_max_run_seconds=s.RENDI_MAX_COMMAND_RUN_SECONDS,
+        max_concurrent=s.BULKVID_RENDI_MAX_CONCURRENT,
     )
