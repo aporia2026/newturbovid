@@ -17,13 +17,15 @@ const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
 
-// Card-template preview asset URLs. Run `python tools/upload_template_previews.py`
-// from the repo to upload the PNGs to GCS, then paste the returned URLs here.
-// The migration menu (`migrateSimpleX4Columns`) writes these as =IMAGE() formulas
-// into row 1. Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7.
+// Card-template preview asset URLs. The PNGs live in the HF Space repo
+// (LFS-tracked) and are served directly by HuggingFace's resolver, which
+// returns a 302 → signed CDN URL with Content-Type: image/png. Sheets
+// =IMAGE() follows the redirect cleanly, so no separate hosting needed.
+// Update the path here if the Space repo name changes.
+// Plan _plans/2026-06-08-simple-x4-template-cards.md §D.7.
 const CARD_TEMPLATE_PREVIEW_URLS = {
-  '1': 'https://storage.googleapis.com/aporia-unleash/bulkvid/templates/template_1.png',
-  '2': 'https://storage.googleapis.com/aporia-unleash/bulkvid/templates/template_2.png',
+  '1': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_1.png',
+  '2': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_2.png',
 };
 
 // Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
