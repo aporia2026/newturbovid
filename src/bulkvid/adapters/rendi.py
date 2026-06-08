@@ -253,14 +253,26 @@ _MUSIC_MIX_TEMPLATE = (
 # Used by the cartoon CTA path (``pipeline/cartoon_cta.py``): the overlay PNG
 # is the same dimensions as the video with everything transparent except a
 # yellow CTA pill at the bottom — the result is the cartoon video with a
-# permanent CTA pill burned in. ``-map 0:a?`` keeps the video's audio track
-# when present; the ``?`` makes it optional so silent videos still pass.
+# permanent CTA pill burned in.
+#
+# Implementation notes (Yoav 2026-06-08 prod test — earlier draft of this
+# command had both cartoon ideas failing silently on Rendi):
+#   * Plain ``[0:v][1:v]overlay=0:0`` — dropped ``format=auto`` since it
+#     was the suspect in the silent FAILED responses; the default format
+#     negotiation handles RGBA-onto-YUV blends fine.
+#   * ``-map 0:a?`` keeps the input video's audio when present; ``?`` makes
+#     it optional so silent inputs don't trip the mapper.
+#   * Re-encode audio to AAC instead of ``-c:a copy`` — copy can fail on
+#     unusual container/codec combos; AAC is universal and ZapCap
+#     re-encodes downstream anyway.
+#   * ``-shortest`` clamps output to the video's duration — the PNG is a
+#     single-frame input that overlay re-uses for every video frame.
 _OVERLAY_IMAGE_TEMPLATE = (
     "-i {{in_1}} -i {{in_2}} "
-    '-filter_complex "[0:v][1:v]overlay=0:0:format=auto[outv]" '
+    '-filter_complex "[0:v][1:v]overlay=0:0[outv]" '
     '-map "[outv]" -map 0:a? '
     "-c:v libx264 -pix_fmt yuv420p "
-    "-c:a copy {{out_1}}"
+    "-c:a aac -b:a 192k -shortest {{out_1}}"
 )
 
 

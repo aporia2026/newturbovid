@@ -519,18 +519,28 @@ async def process_cartoon_row(
                 # row's CTA column is Yes, composite the pre-rendered yellow
                 # pill PNG onto the stitched video via Rendi ffmpeg overlay.
                 # The PNG was rendered + uploaded once per row at the top of
-                # process_cartoon_row; reused across both ideas (same CTA
-                # text on both videos in a row).
+                # process_cartoon_row; reused across both ideas.
+                #
+                # NON-FATAL: an overlay failure falls back to the stitched
+                # video WITHOUT the CTA pill. Loud log so the operator can
+                # spot it. Matches the ZapCap-keep-original pattern below —
+                # one new step never tanks an otherwise-good row.
                 video_url_for_persist = stitched.url
                 if cta_overlay_url:
-                    overlaid = await clients.rendi.overlay_image_on_video(
-                        video_url=stitched.url,
-                        overlay_url=cta_overlay_url,
-                        output_filename=f"v{idx + 1}_cta.mp4",
-                    )
-                    costs.rendi += overlaid.cost_usd
-                    cleanup_command_ids.append(overlaid.command_id)
-                    video_url_for_persist = overlaid.url
+                    try:
+                        overlaid = await clients.rendi.overlay_image_on_video(
+                            video_url=stitched.url,
+                            overlay_url=cta_overlay_url,
+                            output_filename=f"v{idx + 1}_cta.mp4",
+                        )
+                        costs.rendi += overlaid.cost_usd
+                        cleanup_command_ids.append(overlaid.command_id)
+                        video_url_for_persist = overlaid.url
+                    except Exception as cta_err:
+                        _log.error(
+                            "cartoon_cta_overlay_failed_kept_original",
+                            idea=idx + 1, error=str(cta_err)[:300],
+                        )
 
                 # 4e. Persist to our storage, then free the Rendi copies.
                 data = await _download(video_url_for_persist, timeout=180.0)
