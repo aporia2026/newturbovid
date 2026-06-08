@@ -31,6 +31,7 @@ from bulkvid.models.row import (
     ImageVORow,
     SimpleRow,
     SimpleX4Row,
+    TextOnImgRow,
 )
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
@@ -40,6 +41,7 @@ from bulkvid.orchestrator.queue import (
     TAB_IMAGE_VO,
     TAB_SIMPLE,
     TAB_SIMPLE_X4,
+    TAB_TEXT_ON_IMG,
     Job,
     JobQueue,
     QueueBusy,
@@ -124,6 +126,24 @@ class SimpleX4RowIn(BaseModel):
     open_comments: str = ""
 
 
+class TextOnImgRowIn(BaseModel):
+    """Wire shape for the ``paste text on img`` tab — Image-VO inputs plus
+    the operator-typed ``text`` to overlay on the manual image. Plan
+    ``_plans/2026-06-09-paste-text-on-img-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_url: str
+    text: str = ""              # bounded server-side at 240 chars below
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    open_comments: str = ""
+
+
 class SubmitJobIn(BaseModel):
     sheet_id: str
     worksheet: str
@@ -136,6 +156,8 @@ class SubmitJobIn(BaseModel):
     rows_cartoon: list[CartoonRowIn] | None = None
     # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
     rows_simple_x4: list[SimpleX4RowIn] | None = None
+    # paste text on img: manual image + center-overlay text (plan 2026-06-09).
+    rows_text_on_img: list[TextOnImgRowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -181,6 +203,29 @@ def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
         aspect_ratio=r.aspect_ratio,
         script_pattern=r.script_pattern,
         cards=cards,
+        open_comments=r.open_comments,
+    )
+
+
+def _build_text_on_img_row(r: TextOnImgRowIn) -> TextOnImgRow:
+    """Coerce a TextOnImgRowIn from the wire into a TextOnImgRow.
+
+    Server-side hardening: trim the overlay ``text`` at 240 chars. A
+    longer string would auto-shrink to the floor font size and become
+    unreadable anyway — 240 chars is ~3 long sentences, comfortably
+    above any realistic ad headline.
+    """
+    return TextOnImgRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=r.manual_image_url,
+        text=(r.text or "").strip()[:240],
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
         open_comments=r.open_comments,
     )
 
@@ -410,6 +455,14 @@ async def submit_job(
             )
         rows = [
             _build_simple_x4_row(r) for r in payload.rows_simple_x4
+        ]
+    elif payload.tab_type == TAB_TEXT_ON_IMG:
+        if not payload.rows_text_on_img:
+            raise HTTPException(
+                400, "rows_text_on_img is required for tab_type=text_on_img"
+            )
+        rows = [
+            _build_text_on_img_row(r) for r in payload.rows_text_on_img
         ]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")

@@ -35,6 +35,7 @@ from bulkvid.models.row import (
     RowResult,
     SimpleRow,
     SimpleX4Row,
+    TextOnImgRow,
 )
 from bulkvid.orchestrator import db as _db
 
@@ -60,6 +61,7 @@ TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
 TAB_CARTOON = "cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
+TAB_TEXT_ON_IMG = "text_on_img"
 
 # Idempotency-key replay window. A submit POST that PA's frontend dropped on
 # the way back to the client gets retried by the Apps Script, with the SAME
@@ -164,7 +166,7 @@ def _new_job_id() -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -188,7 +190,7 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
 
 def _payload_to_row(
     payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -199,6 +201,8 @@ def _payload_to_row(
         return CartoonRow(**data)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(data)
+    if tab == TAB_TEXT_ON_IMG:
+        return TextOnImgRow(**data)
     return ImageVORow(**data)
 
 
@@ -746,7 +750,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -757,4 +761,6 @@ def payload_to_row(
         return CartoonRow(**payload)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(payload)
+    if tab == TAB_TEXT_ON_IMG:
+        return TextOnImgRow(**payload)
     return ImageVORow(**payload)

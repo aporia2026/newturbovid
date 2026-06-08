@@ -16,6 +16,7 @@ const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
+const TAB_TEXT_ON_IMG = 'text_on_img';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -100,6 +101,18 @@ const CARTOON_COLS = {
   lastInputCol: 11,
 };
 
+// paste text on img (2026-06-09): A-D from Image-VO, then a Text column at
+// E (the overlay text), then the standard F-J input columns shifted right
+// by 1. One video per row, so Ready Video lands at K.
+const TEXT_ON_IMG_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  text: 5,
+  voiceOver: 6, zapcap: 7, aspectRatio: 8, scriptPattern: 9,
+  openComments: 10,
+  readyVideo1: 11,
+  lastInputCol: 10,
+};
+
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
 const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
@@ -158,6 +171,12 @@ function configureBackendUrl() {
 function _detectTabType(sheet) {
   // Detect by sheet NAME first (these tabs share the Image-VO columns).
   const name = String(sheet.getName() || '').toLowerCase().trim();
+  // "paste text on img" -> manual image + center-overlay text (2026-06-09).
+  // Checked BEFORE "simple" because the name doesn't contain "simple" — but
+  // ordered up top alongside the other name-based detections for clarity.
+  if (name.indexOf('text on img') !== -1 || name.indexOf('paste text') !== -1) {
+    return TAB_TEXT_ON_IMG;
+  }
   // "simple x4" -> needs disambiguation: post-migration it has 2 header rows
   // and the new Template/CTA columns; pre-migration it's the legacy image_vo
   // shape. Must be checked BEFORE plain "simple" since the name contains it.
@@ -278,6 +297,28 @@ function _readCartoonRow(sheet, rowNum) {
 }
 
 
+function _readTextOnImgRow(sheet, rowNum) {
+  // paste text on img: Image-VO columns A-D, plus Text (E), then F-J shifted
+  // right by 1. The Text column is the overlay text — bounded at 240 chars
+  // (matches the server-side coercion in _build_text_on_img_row).
+  const cols = TEXT_ON_IMG_COLS;
+  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  return {
+    row_num: rowNum,
+    country: _cell(values, cols.country),
+    vertical: _cell(values, cols.vertical),
+    article_url: _cell(values, cols.article),
+    manual_image_url: _cell(values, cols.manualImage),
+    text: _cell(values, cols.text).slice(0, 240),
+    voice_over: _yes(_cell(values, cols.voiceOver), true),
+    zapcap: _yes(_cell(values, cols.zapcap), false),
+    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    script_pattern: _cell(values, cols.scriptPattern),
+    open_comments: _cell(values, cols.openComments),
+  };
+}
+
+
 function _readSimpleX4Row(sheet, rowNum) {
   // Post-migration simple_x4 layout: same A-H as image_vo + 4 (template, cta)
   // pairs + open_comments at col Q. Backend rejects Template* values that
@@ -327,6 +368,16 @@ function _validateFourImages(r) {
   if (!r.article_url) return 'article URL missing';
   if (r.how_many < 1 || r.how_many > 4) return 'how_many must be 1..4';
   if (r.image_urls.length !== r.how_many) return 'need ' + r.how_many + ' image URLs';
+  return null;
+}
+
+
+function _validateTextOnImg(r) {
+  if (!r.article_url) return 'article URL missing';
+  if (!r.manual_image_url) return 'manual image URL missing';
+  // Empty Text is allowed (the renderer ships the image as-is). Length is
+  // bounded by _readTextOnImgRow's .slice(0, 240) above — no upper-bound
+  // check needed here.
   return null;
 }
 
@@ -421,6 +472,7 @@ function generateAllUnprocessed() {
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
+    : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -440,14 +492,17 @@ function generateAllUnprocessed() {
 
 
 function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
-  // Simple + Image-VO share the same input columns/readers; 4Images, cartoon, simple_x4 differ.
+  // Simple + Image-VO share the same input columns/readers; the other tabs
+  // each have their own reader (different column maps).
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
+    : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
+    : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
     : _validateImageVO;
 
   let rows = [];
@@ -475,6 +530,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
+      : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -515,6 +571,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
+  else if (tabType === TAB_TEXT_ON_IMG) payload.rows_text_on_img = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);

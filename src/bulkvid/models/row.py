@@ -101,6 +101,28 @@ class SimpleRow:
 
 
 @dataclass
+class TextOnImgRow:
+    """``paste text on img`` tab input row — one video from the user's
+    Manual Image with the operator-typed ``text`` overlaid in the center
+    (heavy white, thick black outline). Same VO pipeline as the simple
+    tab — article fetch → script gen → TTS. Exactly one ``Ready Video``
+    is written back. Plan ``_plans/2026-06-09-paste-text-on-img-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str
+    text: str                         # the overlay text — central to this tab
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+
+
+@dataclass
 class CartoonRow:
     """Cartoon tab input row — animated, multi-shot videos generated from text.
 
