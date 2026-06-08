@@ -277,6 +277,7 @@ async def process_cartoon_row(
         # row behaves exactly like the legacy cartoon path.
         cta_overlay_url: str | None = None
         cta_text_used: str = ""
+        cta_setup_error: str | None = None        # surfaced into row.error
         if row.cta_enabled:
             cta_text_used = (row.cta_text.strip() or
                              default_cta_for_language(lang.language))
@@ -298,14 +299,16 @@ async def process_cartoon_row(
                 metadata["cta_text_used"] = cta_text_used[:80]
             except Exception as e:
                 # Overlay render/upload failure: ship videos WITHOUT the CTA
-                # rather than killing the whole row. Loud log so the operator
-                # can spot it.
+                # rather than killing the whole row. Loud log AND surface to
+                # row.error so the operator sees it in the sidebar without
+                # digging through HF Space logs.
+                cta_setup_error = str(e)[:200]
                 _log.error(
                     "cartoon_cta_overlay_failed_skipped",
-                    error=str(e)[:200], cta_text=cta_text_used[:80],
+                    error=cta_setup_error, cta_text=cta_text_used[:80],
                 )
                 metadata["cta_enabled"] = False
-                metadata["cta_overlay_error"] = str(e)[:200]
+                metadata["cta_overlay_error"] = cta_setup_error
         else:
             metadata["cta_enabled"] = False
 
@@ -634,15 +637,34 @@ async def process_cartoon_row(
             )
 
         metadata["videos_produced"] = len(video_urls)
+
+        # Build a sidebar-visible CTA warning when the row otherwise
+        # succeeded but the operator's CTA pill didn't actually land on
+        # one or more videos. Without this, a row that intentionally ran
+        # with CTA off and a row that ran with CTA on but quietly lost
+        # the pill look identical from the sidebar. Truncated at 1000
+        # chars to match the RowResult.error budget (see _fail()).
+        cta_warning_parts: list[str] = []
+        if cta_setup_error:
+            cta_warning_parts.append(
+                f"CTA overlay skipped for all videos — setup failed: {cta_setup_error}"
+            )
+        if cta_overlay_errors:
+            cta_warning_parts.append(
+                "CTA overlay failed on " + "; ".join(cta_overlay_errors)
+            )
+        cta_warning = " | ".join(cta_warning_parts)[:1000] or None
+
         if zapcap_failed:
             metadata["zapcap_applied"] = False
             return _ok(
                 row, video_urls, t0, costs, metadata,
                 status=STATUS_ZAPCAP_FAILED_KEPT_NO_CAPTIONS,
+                warning=cta_warning,
             )
         if row.zapcap and clients.zapcap is not None:
             metadata["zapcap_applied"] = True
-        return _ok(row, video_urls, t0, costs, metadata)
+        return _ok(row, video_urls, t0, costs, metadata, warning=cta_warning)
 
     except Exception as e:
         _log.exception("row_internal_error", error=str(e))
@@ -660,6 +682,7 @@ def _ok(
     metadata: dict[str, Any],
     *,
     status: str = STATUS_SUCCESS,
+    warning: str | None = None,
 ) -> RowResult:
     elapsed = round(time.monotonic() - t0, 3)
     metadata["cost_breakdown"] = costs.__dict__.copy()
@@ -669,6 +692,7 @@ def _ok(
         cost_usd=costs.total,
         elapsed_seconds=elapsed,
         video_count=len(video_urls),
+        warning=warning,
     )
     return RowResult(
         row_num=row.row_num,
@@ -676,6 +700,7 @@ def _ok(
         video_urls=video_urls,
         cost_usd=costs.total,
         elapsed_seconds=elapsed,
+        error=warning,
         metadata=metadata,
     )
 

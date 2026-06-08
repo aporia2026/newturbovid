@@ -644,3 +644,40 @@ async def test_cartoon_zapcap_applied(monkeypatch) -> None:
     assert result.metadata.get("zapcap_applied") is True
     # Captioned outputs were persisted.
     assert any("videos_captioned" in key for key, _ in clients.storage.calls)
+
+
+@respx.mock
+async def test_cartoon_cta_overlay_failure_surfaces_to_row_error(monkeypatch) -> None:
+    """When CTA is enabled and the per-idea overlay step fails, the row
+    still ships its videos (non-fatal) but the failure has to land in
+    ``result.error`` so the operator sees it in the sidebar — without
+    this, a row that quietly lost its CTA pill is indistinguishable
+    from a row that ran with CTA off."""
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+
+    # Force every overlay attempt to fail; concat still succeeds, so
+    # the videos ship without the CTA pill.
+    async def _overlay_boom(*, video_url, overlay_url, output_filename):
+        raise RuntimeError("rendi overlay boom")
+
+    clients.rendi.overlay_image_on_video = _overlay_boom    # type: ignore[attr-defined]
+
+    row = CartoonRow(
+        row_num=2, country="MX", vertical="automotive",
+        article_url="https://example.com/article",
+        voice_over=True, zapcap=False, aspect_ratio="09:16",
+        script_pattern="How To", open_comments="",
+        cta_enabled=True, cta_text="Get Your Quote",
+    )
+
+    result = await process_cartoon_row(row, clients, job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == rpc.CARTOON_NUM_IDEAS
+    assert result.error is not None
+    assert "CTA overlay failed" in result.error
+    assert "rendi overlay boom" in result.error
+    assert result.metadata.get("cta_overlay_errors")
+    assert result.metadata.get("cta_overlay_applied") is False

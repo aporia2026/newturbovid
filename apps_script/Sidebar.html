@@ -186,6 +186,23 @@
       font-family: inherit; font-size: 12px;
     }
 
+    /* Soft-warning variant: row succeeded (videos shipped) but a
+       non-fatal step like the cartoon CTA overlay failed. Amber, not
+       red — operator should notice without thinking the row broke. */
+    .warn-block {
+      background: var(--c-amber-soft); border-radius: 4px;
+      padding: 8px 10px; margin: 6px 0;
+      font-size: 12px; color: var(--c-amber);
+      word-break: break-word;
+    }
+    .warn-block .error-head .error-label { color: var(--c-amber); }
+    .warn-block .copy-btn {
+      color: var(--c-amber); border-color: var(--c-amber-soft);
+    }
+    .rowline .warn-suffix {
+      color: var(--c-amber); font-size: 11px; margin-left: 6px;
+    }
+
     .logwrap { margin-top: 8px; }
     .logbar { margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
     .logbar .log-status { font-size: 11px; color: var(--c-subtle); margin-left: auto; }
@@ -428,6 +445,13 @@
                        (r.video_urls.length > 1 ? (i + 1) : '') + '</a>';
               }).join(' ')
             : 'done';
+          // Non-fatal warning on an otherwise-successful row (e.g. the
+          // cartoon CTA overlay failed but the videos still shipped):
+          // append an amber suffix so the operator notices. Full text
+          // lands in the job-level warn-block below.
+          if (r.error) {
+            right += '<span class="warn-suffix">⚠ warning</span>';
+          }
         } else if (st === 'failed') {
           right = _escape(r.error ? String(r.error).substring(0, 140) : 'failed');
         } else {
@@ -537,6 +561,32 @@
           '</div>';
       }
 
+      // Non-fatal warnings: rows that finished successfully (videos
+      // shipped) but reported a soft failure like the cartoon CTA
+      // overlay step. Same UI shape as the error block, amber palette
+      // so a glance distinguishes "broken" from "minor".
+      var warnBlock = '';
+      var warnRows = (_rowsCache[jid] || []).filter(function (r) {
+        return r.status === 'done' && r.error;
+      });
+      if (warnRows.length) {
+        var warnId = 'warn-' + jid;
+        var warnText = warnRows.map(function (r) {
+          return 'Row ' + r.row_num + ': ' + String(r.error);
+        }).join('\n');
+        var warnLabel = warnRows.length === 1
+          ? 'Warning on row ' + warnRows[0].row_num
+          : 'Warnings on ' + warnRows.length + ' rows';
+        warnBlock =
+          '<div class="warn-block">' +
+            '<div class="error-head">' +
+              '<span class="error-label">' + warnLabel + '</span>' +
+              '<button class="copy-btn" onclick="_copyText(\'' + warnId + '\', this)">Copy</button>' +
+            '</div>' +
+            '<pre id="' + warnId + '">' + _escape(warnText) + '</pre>' +
+          '</div>';
+      }
+
       return '' +
         '<div class="job">' +
           '<div class="job-id">' + jid + ' · ' + (j.worksheet || '') + '</div>' +
@@ -548,6 +598,7 @@
           '<div class="row"><span class="label">Cost</span><span class="value">$' + (j.cost_usd || 0).toFixed(4) + '</span></div>' +
           rowsBlock +
           errorBlock +
+          warnBlock +
           '<div style="margin-top:8px; display:flex; gap:6px;">' +
             '<button class="danger" onclick="killJob(\'' + jid + '\')">Kill job</button>' +
             '<button onclick="toggleLog(\'' + jid + '\')">' + (open ? 'Hide logs' : 'View logs') + '</button>' +
