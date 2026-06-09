@@ -24,6 +24,59 @@ async def test_get_returns_registered_default_when_unset(store: SettingsStore) -
     assert await store.get("script_system_prompt") == "default-prompt"
 
 
+async def test_set_works_when_connection_lacks_context_manager(
+    store: SettingsStore,
+) -> None:
+    """Regression for chat 2026-06-09: the production libsql remote
+    connection (``_LibsqlConn``) does NOT implement the context-manager
+    protocol, so the previous ``with self._conn:`` block raised
+    ``TypeError: '_LibsqlConn' object does not support the context
+    manager protocol``. The picker page tripped on this when it tried
+    to cache the auto-fetched avatar list.
+
+    Wrap the real sqlite3 connection in a proxy that hides ``__enter__``
+    / ``__exit__``, then confirm ``set`` still writes via the
+    autocommit fallback path."""
+    real_conn = store._conn
+
+    class _NoContextManagerProxy:
+        """Forwards attribute access EXCEPT for the context-manager
+        dunders. Mimics what httpx's libsql wrapper actually does."""
+        def __init__(self, inner):
+            self.__dict__["_inner"] = inner
+
+        def __getattr__(self, name):
+            if name in ("__enter__", "__exit__"):
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._inner, name, value)
+
+    store._conn = _NoContextManagerProxy(real_conn)    # type: ignore[assignment]
+    try:
+        # Smoke test: set should succeed via the nullcontext fallback.
+        old = await store.set(
+            "kie_model", "first-write", updated_by="regression-test",
+        )
+        assert old is None    # never written before
+        # Round-trip: the value reads back correctly.
+        assert await store.get("kie_model") == "first-write"
+        # Idempotent write: same value returns the old value, no error.
+        old = await store.set(
+            "kie_model", "first-write", updated_by="regression-test",
+        )
+        assert old == "first-write"
+        # Updating to a new value also works through the fallback path.
+        old = await store.set(
+            "kie_model", "updated", updated_by="regression-test",
+        )
+        assert old == "first-write"
+        assert await store.get("kie_model") == "updated"
+    finally:
+        store._conn = real_conn    # type: ignore[assignment]
+
+
 async def test_ensure_cache_retries_once_on_cold_start_failure(store: SettingsStore) -> None:
     """Regression for job-1780936528-524e40fb row 3.
 

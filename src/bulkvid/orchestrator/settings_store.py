@@ -115,9 +115,23 @@ class SettingsStore:
         return row["value"] if row is not None else None
 
     def _set_sync(self, key: str, value: str, updated_by: str) -> str | None:
-        """Set value. Returns old value (or None if new key)."""
+        """Set value. Returns old value (or None if new key).
+
+        Uses ``self._conn`` as a transactional context manager when the
+        backend supports it (plain sqlite3 in dev/tests). The libsql
+        remote connection (production Turso) doesn't implement the
+        context-manager protocol and is in autocommit mode anyway, so
+        we fall through to direct execution there. Chat 2026-06-09:
+        the avatar catalog write blew up with ``TypeError: _LibsqlConn
+        object does not support the context manager protocol`` before
+        this guard was in place.
+        """
         now = _now_iso()
-        with self._conn:
+        # Pick a transactional context if the connection supports one;
+        # otherwise yield nothing (each execute autocommits on libsql).
+        from contextlib import nullcontext
+        txn = self._conn if hasattr(self._conn, "__enter__") else nullcontext()
+        with txn:
             cur = self._conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
             )
