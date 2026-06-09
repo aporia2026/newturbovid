@@ -48,14 +48,18 @@ _log = get_logger("tiktok_avatar")
 # can override per-environment via env var without touching code.
 
 _DEFAULT_BASE = "https://business-api.tiktok.com/open_api/v1.3"
-# All three endpoints live under ``/creative/digital_avatar/`` — same
-# namespace as the operator's confirmed-working ``Avatar.py`` list call.
-# The previous ``/business/symphony/avatar/`` guess returned 404 and
-# killed the avatar row instantly when it tried to create a narration
-# task (chat 2026-06-09). Override per-deploy via env vars if TikTok
-# bumps the API version.
-_DEFAULT_CREATE_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/create/"
-_DEFAULT_GET_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/task/get/"
+# All three endpoints live under ``/creative/digital_avatar/`` but at
+# different subpaths. The CREATE + GET (poll) endpoints live under
+# ``/video/task/``; only the LIST endpoint sits at the top level. Values
+# copied verbatim from the operator's working ``stage_4_create_video.py``
+# (``Config.TIKTOK_CREATE_URL`` / ``Config.TIKTOK_GET_URL``, chat
+# 2026-06-09). Earlier sessions guessed ``/business/symphony/avatar/``
+# (returns 40006 "no schema found" — token has no entitlement for that
+# namespace) and ``/creative/digital_avatar/create/`` (plain 404 — URL
+# doesn't exist). Override per-deploy via env vars if TikTok bumps the
+# API version.
+_DEFAULT_CREATE_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/video/task/create/"
+_DEFAULT_GET_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/video/task/get/"
 _DEFAULT_AVATAR_LIST_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/get/"
 
 # Pagination + retry constants for the list endpoint, copied verbatim
