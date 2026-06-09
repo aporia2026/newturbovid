@@ -504,3 +504,68 @@ async def test_heartbeat_quiet_when_no_rows_stuck(
     # Summary fires, no warning called.
     assert fake_log.info.called
     fake_log.warning.assert_not_called()
+
+
+async def test_runner_loop_survives_heartbeat_settings_store_error(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for HF outage 2026-06-09: when ``_emit_heartbeat``
+    raised (settings_store ``IndexError: no column named 'key'``), the
+    exception escaped the ``while not self._shutdown`` loop, the worker
+    process exited 1, and supervisord restarted it ~every 30s. The
+    runner must instead log the failure and continue polling.
+    """
+    from unittest.mock import MagicMock
+
+    # Force a heartbeat on the very first idle tick so the test doesn't
+    # have to wait for the production 30-poll cadence.
+    monkeypatch.setattr(runner_mod, "_HEARTBEAT_EVERY", 1)
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    # Inject a heartbeat that always raises — same shape the libsql bug
+    # produced via ``store.get()`` → ``_load_sync`` → IndexError.
+    call_count = {"n": 0}
+
+    async def _exploding_heartbeat(self, *, idle: bool) -> None:    # noqa: ARG001
+        call_count["n"] += 1
+        raise IndexError("no column named 'key'")
+
+    monkeypatch.setattr(
+        BatchRunner, "_emit_heartbeat", _exploding_heartbeat
+    )
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.005,
+    )
+
+    async def _shutdown_after_heartbeats() -> None:
+        # Wait until we've seen at least two heartbeat attempts — proves
+        # the loop didn't die after the first failure.
+        while call_count["n"] < 2:
+            await asyncio.sleep(0.01)
+        runner.request_shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_after_heartbeats()),
+        timeout=3.0,
+    )
+
+    # The wrapped catch logged a warning at least once (most likely
+    # twice — once per heartbeat attempt).
+    assert fake_log.warning.called, (
+        "expected runner_heartbeat_failed warning; the loop must surface "
+        "the suppressed exception instead of swallowing it silently"
+    )
+    failure_calls = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "runner_heartbeat_failed"
+    ]
+    assert failure_calls, (
+        "expected at least one 'runner_heartbeat_failed' warning; "
+        f"saw warnings: {fake_log.warning.call_args_list!r}"
+    )
+    # And the loop got through more than one tick, so the catch worked.
+    assert call_count["n"] >= 2

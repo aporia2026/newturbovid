@@ -117,6 +117,15 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
 DEFAULT_STUCK_ROW_THRESHOLD_SECONDS = 300.0
 
 
+# Heartbeat cadence: number of consecutive empty polls before the runner
+# emits a heartbeat. With the default ``poll_idle_seconds=1.0`` this is
+# one heartbeat every ~30s — frequent enough to spot a stalled runner,
+# infrequent enough not to flood logs. Module-level so the regression
+# test in ``test_runner.py`` can patch it down to 1 for fast triggering
+# without rewriting the runner loop.
+_HEARTBEAT_EVERY = 30
+
+
 def _tab_for_row(row: object) -> str:
     """Map a row instance to the timeout tab name."""
     if isinstance(row, SimpleRow):
@@ -268,15 +277,29 @@ class BatchRunner:
             # Heartbeat counter: log every N polls (idle or busy) so a stalled
             # runner shows up in observability instead of looking identical to
             # a healthy idle one. Heartbeat now also flags any in-flight row
-            # whose elapsed time exceeds the stuck-row threshold.
+            # whose elapsed time exceeds the stuck-row threshold. The cadence
+            # constant lives at module scope so tests can patch it.
             _polls_since_heartbeat = 0
-            _HEARTBEAT_EVERY = 30
             while not self._shutdown.is_set():
                 queued = await self._queue.claim_next_row()
                 if queued is None:
                     _polls_since_heartbeat += 1
                     if _polls_since_heartbeat >= _HEARTBEAT_EVERY:
-                        await self._emit_heartbeat(idle=True)
+                        # Heartbeat is observational. A failure here (most
+                        # likely a transient settings_store read error, e.g.
+                        # the libsql ``no column named 'key'`` outage on
+                        # 2026-06-09) must NOT escape the loop, because that
+                        # would crash the worker process and force a
+                        # supervisord restart cycle. Log the failure and
+                        # carry on; one missing heartbeat is fine.
+                        try:
+                            await self._emit_heartbeat(idle=True)
+                        except Exception as e:
+                            _log.warning(
+                                "runner_heartbeat_failed",
+                                error=str(e)[:200],
+                                error_type=type(e).__name__,
+                            )
                         _polls_since_heartbeat = 0
                     # Empty queue. Wait briefly, or exit if shutdown fired.
                     try:

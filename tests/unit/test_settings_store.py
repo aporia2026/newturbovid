@@ -137,6 +137,88 @@ async def test_ensure_cache_reraises_when_both_attempts_fail(store: SettingsStor
         await store.get("script_system_prompt")
 
 
+async def test_load_sync_reads_by_index_not_by_column_name(
+    store: SettingsStore,
+) -> None:
+    """Regression for chat 2026-06-09 / HF outage:
+    ``IndexError: no column named 'key'``.
+
+    In libsql remote mode the cursor's ``description`` does not always
+    expose the column literally named ``key`` under that name, so
+    ``row["key"]`` raises ``IndexError``. The bug was latent for weeks
+    — it only fired once the settings table got its first row (the
+    avatar catalog write). This test wraps the real sqlite3 cursor in
+    a proxy that hides the column-name path entirely; if ``_load_sync``
+    or ``_get_sync`` ever regresses to ``row["key"]`` / ``row["value"]``
+    instead of positional indexing, this test fails fast.
+    """
+    # Seed a real row so the dict comprehension actually iterates.
+    await store.set("kie_model", "anchor-value", updated_by="regression-test")
+
+    real_conn = store._conn
+
+    class _NamelessCursor:
+        """Wraps a real sqlite3 cursor and returns rows that DON'T support
+        ``row["col_name"]`` access at all — only positional. This mimics
+        the libsql shape that surfaced in production: the cursor wrapper
+        couldn't resolve the column name ``key`` against ``description``,
+        so name-keyed access raised ``IndexError``.
+        """
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def fetchall(self):
+            return [tuple(r) for r in self._inner.fetchall()]
+
+        def fetchone(self):
+            r = self._inner.fetchone()
+            return None if r is None else tuple(r)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    class _NamelessConn:
+        """Connection proxy: forwards everything to the real sqlite3
+        connection EXCEPT ``execute`` for the two read paths that hit
+        the ``settings`` table — those return a ``_NamelessCursor``
+        whose rows are plain tuples, exactly the production shape.
+        """
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            cur = self._inner.execute(sql, params) if params else self._inner.execute(sql)
+            upper = sql.strip().upper()
+            if upper.startswith("SELECT KEY, VALUE FROM SETTINGS") or \
+               upper.startswith("SELECT VALUE FROM SETTINGS"):
+                return _NamelessCursor(cur)
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    store._conn = _NamelessConn(real_conn)    # type: ignore[assignment]
+    # Bust the cache so the next get() actually re-reads from the DB
+    # via the wrapped execute.
+    store._cache = {}
+    store._cache_loaded_at = 0.0
+
+    try:
+        # _load_sync hits the dict comprehension over the wrapped cursor.
+        # If the production code regresses to ``row["key"]`` this raises
+        # IndexError. With positional indexing it succeeds.
+        value = await store.get("kie_model")
+        assert value == "anchor-value"
+
+        # _get_sync hits a single-column SELECT through the same path.
+        direct = store._get_sync("kie_model")
+        assert direct == "anchor-value"
+    finally:
+        store._conn = real_conn    # type: ignore[assignment]
+
+
 async def test_get_returns_explicit_default_when_provided(store: SettingsStore) -> None:
     assert await store.get("unknown_key", default="fallback") == "fallback"
 

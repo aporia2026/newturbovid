@@ -99,20 +99,33 @@ class SettingsStore:
     # ── Sync helpers ────────────────────────────────────────────────────────
 
     def _load_sync(self) -> dict[str, str]:
+        # Integer indexing, not ``row["key"]`` / ``row["value"]``: in libsql
+        # remote mode (production Turso) the cursor wrapper's description
+        # does not expose the column literally named ``key`` under that
+        # name, so ``row["key"]`` raises ``IndexError: no column named
+        # 'key'``. Chat 2026-06-09 / plan
+        # ``_plans/2026-06-09-libsql-key-column-bug.md``: this is the only
+        # query in the codebase that reads a column called ``key``, so a
+        # targeted positional read sidesteps the libsql quirk without
+        # touching the shared ``_DictRow`` shim.
         cur = self._conn.execute("SELECT key, value FROM settings")
-        return {row["key"]: row["value"] for row in cur.fetchall()}
+        return {row[0]: row[1] for row in cur.fetchall()}
 
     def _get_sync(self, key: str) -> str | None:
         """Return the stored value for ``key`` or ``None`` if no row exists.
 
         Distinct from ``get(...)`` because the migration helper has to tell
         ``"value is empty string"`` apart from ``"key was never written"``.
+
+        Positional indexing for the same reason as ``_load_sync``: the
+        libsql cursor's description doesn't always carry the original
+        column name back from the wire.
         """
         cur = self._conn.execute(
             "SELECT value FROM settings WHERE key = ?", (key,)
         )
         row = cur.fetchone()
-        return row["value"] if row is not None else None
+        return row[0] if row is not None else None
 
     def _set_sync(self, key: str, value: str, updated_by: str) -> str | None:
         """Set value. Returns old value (or None if new key).
