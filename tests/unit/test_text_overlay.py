@@ -9,6 +9,7 @@ import io
 import pytest
 from PIL import Image
 
+from bulkvid.adapters.rendi import DEFAULT_DIMENSIONS_BY_RATIO
 from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
 
 
@@ -30,43 +31,55 @@ def _decode(data: bytes) -> Image.Image:
 
 
 @pytest.mark.parametrize(
-    "src_size",
-    [(1600, 900), (1080, 1080), (900, 1600), (2400, 1600)],
+    "ratio,expected",
+    sorted(DEFAULT_DIMENSIONS_BY_RATIO.items()),
 )
-def test_overlay_preserves_source_dimensions(
-    src_size: tuple[int, int],
+def test_overlay_returns_target_canvas_size(
+    ratio: str, expected: tuple[int, int]
 ) -> None:
-    """The output PNG must land at the SOURCE image's native dimensions,
-    not the row's target aspect. The earlier behavior cover-cropped the
-    source to the target aspect and destroyed framing — Rendi handles
-    aspect fit downstream via its blurred-background command."""
-    w, h = src_size
+    """The output PNG must land at the row's target aspect dimensions —
+    the blurred-background fit composites the (preserved) source inside.
+    Text geometry is then computed on the target canvas so visual text
+    size is consistent across rows regardless of source aspect."""
+    w, h = expected
     out = overlay_text_on_image_bytes(
-        _src_png(width=w, height=h),
+        _src_png(),
         "Casas embargadas: precios y oportunidades",
-        aspect_ratio="9:16",    # explicitly different from any of the src sizes
+        aspect_ratio=ratio,
     )
     assert isinstance(out, bytes)
     assert len(out) > 1024, "output suspiciously small"
     img = _decode(out)
     try:
-        assert img.size == (w, h), (
-            f"output {img.size} should match source {(w, h)}, not be cropped"
-        )
+        assert img.size == (w, h)
     finally:
         img.close()
 
 
-def test_overlay_aspect_ratio_param_does_not_resize() -> None:
-    """The ``aspect_ratio`` kwarg stays on the signature for API compat
-    but must NOT change the output dimensions. Same source → same
-    output size, whatever the operator picked for the row."""
-    src = _src_png(width=1200, height=600)
-    out_916 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="9:16")
-    out_11 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="1:1")
-    out_45 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="4:5")
-    sizes = {_decode(o).size for o in (out_916, out_11, out_45)}
-    assert sizes == {(1200, 600)}, f"aspect_ratio should not resize; got {sizes}"
+@pytest.mark.parametrize(
+    "src_size",
+    [(1600, 900), (1080, 1080), (900, 1600), (2400, 1600)],
+)
+def test_overlay_at_916_target_always_lands_at_1080x1920(
+    src_size: tuple[int, int],
+) -> None:
+    """v3 regression: a landscape source got tiny text after Rendi
+    letterboxed it. Now every source — landscape, square, portrait —
+    composites into the same 1080×1920 canvas and the text is rendered
+    on that canvas, so visual text size is consistent."""
+    sw, sh = src_size
+    out = overlay_text_on_image_bytes(
+        _src_png(width=sw, height=sh),
+        "Hello World",
+        aspect_ratio="9:16",
+    )
+    img = _decode(out)
+    try:
+        assert img.size == (1080, 1920), (
+            f"src {src_size} → output {img.size}, expected (1080, 1920)"
+        )
+    finally:
+        img.close()
 
 
 # ── Blank text branch ──────────────────────────────────────────────────────

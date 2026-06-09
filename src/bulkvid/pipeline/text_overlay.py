@@ -1,20 +1,30 @@
 """Pillow text-on-image overlay for the ``paste text on img`` tab.
 
 Renders heavy white text with a thick black outline, centered on both axes
-of the operator-supplied image. The text auto-wraps to fit a comfortable
-side margin and auto-shrinks to fit a max number of lines.
+of the FINAL canvas (the row's target aspect ratio), with the operator's
+source image composited inside via a blurred-background fit. Text is
+auto-wrapped to a side margin and auto-shrunk to fit a max number of
+lines — at FINAL canvas dimensions, so the visual text size is
+consistent across every row regardless of the source's aspect ratio.
 
 Pipeline integration: the row processor downloads the manual image,
-paints the overlay AT THE SOURCE'S NATIVE DIMENSIONS (no crop, no resize),
-and uploads the result. Rendi then does its blurred-background fit to
-the row's target aspect ratio — preserving the operator's original
-composition instead of chopping framed-in headlines off the sides.
+the renderer composites it into a target-aspect canvas with a blurred
+copy of itself behind, paints the text overlay on top, and uploads the
+result. Rendi then animates that pre-composed image; its
+image_to_video_fit becomes a no-op since the image is already at the
+target dimensions.
 
-Earlier the renderer cover-cropped the source to ``aspect_ratio`` first;
-that destroyed images that already had text/composition designed for
-1:1 or another aspect (e.g. a 1:1 stock photo with "Remote NHS
-Receptionists" baked across the top got chopped in half when forced
-into 9:16). See chat 2026-06-09.
+History:
+  * v1 cover-cropped the source to target — destroyed framed-in
+    composition (1:1 stock photo with "Remote NHS Receptionists" baked
+    across the top got chopped in half when forced into 9:16).
+  * v2 rendered text at the source's native dimensions and let Rendi
+    fit afterwards — preserved the source but the visual text size
+    varied wildly between rows (landscape sources got tiny text after
+    being letterboxed; portrait sources got big text). Chat 2026-06-09.
+  * v3 (current) does the blurred-background fit in Python at target
+    dimensions and renders text on the final canvas. Source preserved
+    AND text size consistent.
 
 Plan: ``_plans/2026-06-09-paste-text-on-img-tab.md``.
 """
@@ -24,10 +34,12 @@ from __future__ import annotations
 import io
 from typing import Final
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from bulkvid.adapters.rendi import dimensions_for_ratio
 from bulkvid.logging import get_logger
 from bulkvid.pipeline.card_renderer import (
+    _fit_image_cover,
     _load_font,
     _wrap_text_to_width,
 )
@@ -108,6 +120,46 @@ def _fit_overlay_font(
     return font, _wrap_text_to_width(draw, text, font, max_width)
 
 
+def _blurred_bg_fit(
+    src: Image.Image, target_w: int, target_h: int
+) -> Image.Image:
+    """Composite ``src`` into a ``target_w × target_h`` canvas with a
+    blurred, cover-cropped copy of ``src`` filling the background. Mirrors
+    Rendi's image_to_video_fit composition so the operator's source is
+    preserved (no crop) AND the output canvas is exactly the row's
+    target aspect ratio.
+
+    For a near-target-aspect source the foreground fills the canvas and
+    the blurred bg is invisible (no visible bars). For a mismatched
+    source (e.g. landscape into 9:16) the foreground sits centered with
+    blurred bars top/bottom.
+    """
+    src_w, src_h = src.size
+
+    # Background: cover-crop to fill canvas, then heavy blur. The radius
+    # scales with target size so 720p and 1080p both look smooth.
+    bg = _fit_image_cover(src, target_w, target_h)
+    try:
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=max(20, target_h // 60)))
+    except Exception:
+        pass
+
+    # Foreground: fit-inside scale (preserve aspect, no crop).
+    scale = min(target_w / src_w, target_h / src_h)
+    fg_w = max(1, int(round(src_w * scale)))
+    fg_h = max(1, int(round(src_h * scale)))
+    fg = src.resize((fg_w, fg_h), Image.Resampling.LANCZOS)
+
+    # Composite fg centered on bg.
+    try:
+        fg_x = (target_w - fg_w) // 2
+        fg_y = (target_h - fg_h) // 2
+        bg.paste(fg, (fg_x, fg_y))
+    finally:
+        fg.close()
+    return bg
+
+
 def overlay_text_on_image_bytes(
     image_bytes: bytes,
     text: str,
@@ -115,26 +167,31 @@ def overlay_text_on_image_bytes(
     aspect_ratio: str = "9:16",
     output_format: str = "PNG",
 ) -> bytes:
-    """Overlay heavy white-with-black-outline text centered on
-    ``image_bytes`` AT THE SOURCE'S NATIVE DIMENSIONS. Returns image
-    bytes (PNG by default) ready for storage upload — Rendi handles the
-    aspect-ratio fit downstream.
+    """Composite ``image_bytes`` into a target-aspect canvas with a
+    blurred-background fit, then center heavy white-with-black-outline
+    text on the FINAL canvas. Returns image bytes (PNG by default)
+    ready for storage upload.
 
-    ``aspect_ratio`` is kept on the signature for API compatibility and
-    future tuning, but the renderer no longer resizes/crops the source.
-    Forcing a 1:1 photo into 9:16 (the previous behavior) chopped any
-    edge composition the operator carefully framed.
+    Text geometry is computed against the target canvas, NOT the source
+    image, so the visual text size is consistent across every row
+    regardless of source aspect (the v2 bug — landscape sources got
+    tiny text after Rendi letterboxed them; portrait sources got big
+    text).
 
-    Empty text is allowed — returns the unmodified source so a row with
-    a typo'd or accidentally-blank Text cell still ships a valid video.
+    Empty text is allowed — returns the blurred-bg-fit image with no
+    overlay drawn, so a row with a typo'd or accidentally-blank Text
+    cell still ships a valid video.
     """
-    del aspect_ratio    # kept for API compat; intentionally unused
+    width, height = dimensions_for_ratio(aspect_ratio)
 
     with Image.open(io.BytesIO(image_bytes)) as src:
         src.load()
-        canvas = src.convert("RGB")
+        src_rgb = src.convert("RGB")
 
-    width, height = canvas.size
+    try:
+        canvas = _blurred_bg_fit(src_rgb, width, height)
+    finally:
+        src_rgb.close()
 
     text = (text or "").strip()
     if not text:
