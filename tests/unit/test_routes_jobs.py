@@ -424,6 +424,24 @@ def test_get_job_unknown_id_returns_404(client: TestClient) -> None:
     assert r.status_code == 404
 
 
+def test_jobs_avatars_route_is_not_shadowed_by_job_id_param(
+    client: TestClient,
+) -> None:
+    """Regression for chat 2026-06-09: ``GET /jobs/avatars`` returned
+    404 ``job not found`` because the literal ``/avatars`` route was
+    declared AFTER the dynamic ``/{job_id}`` route in jobs.py — FastAPI
+    matched in order and treated ``avatars`` as a job_id.
+
+    A non-404 (even an upstream TikTok error) proves the route is now
+    reachable. We don't assert 200 because the test environment has no
+    TikTok credentials, so the fetch path returns a 200 with
+    source='empty' and an error string — not a 404."""
+    r = client.get("/jobs/avatars", headers=_auth("tok-bulk1"))
+    assert r.status_code != 404, (
+        f"expected /jobs/avatars to be reachable, got {r.status_code}: {r.text[:200]}"
+    )
+
+
 def test_get_job_returns_403_for_non_owner(client: TestClient) -> None:
     r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
     job_id = r.json()["job_id"]
