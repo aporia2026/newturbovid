@@ -8,91 +8,57 @@
 <div class="card">
   <h2 style="margin-top:0">TikTok Symphony avatars</h2>
   <p class="label">
-    Curated catalog of TikTok Symphony avatars the team has access to.
-    Pick one and paste its <b>Avatar ID</b> into the <code>Avatar ID</code>
-    column on the <b>video with avatar</b> sheet tab.
-  </p>
-  <p class="label" style="font-size:12px;margin-top:8px">
-    TikTok's Symphony API doesn't expose an avatar-list endpoint that we
-    can call reliably, so this list is maintained by the team. Find the
-    avatar in TikTok's Symphony web UI, copy its ID + preview thumbnail
-    URL, and add it below.
+    Pick an avatar and paste its <b>Avatar ID</b> into the
+    <code>Avatar ID</code> column on the <b>video with avatar</b>
+    sheet tab.
   </p>
 
-  {% if flash %}
+  {% if source == "live" %}
     <p style="color:var(--success,#1e8e3e);font-size:13px;margin-top:8px">
-      ✓ {{ flash }}
+      ✓ Auto-fetched {{ count }} avatar{{ '' if count == 1 else 's' }}
+      from TikTok.
     </p>
+  {% elif source == "cache" %}
+    <p style="color:var(--amber,#b06000);font-size:13px;margin-top:8px">
+      ⚠ Live fetch failed — showing {{ count }} avatar{{ '' if count == 1 else 's' }}
+      from the last successful fetch.
+    </p>
+  {% elif source == "empty" and error %}
+    <p style="color:var(--danger);font-size:13px;margin-top:8px">
+      ⚠ Live fetch failed and no cached avatars — nothing to show yet.
+    </p>
+  {% endif %}
+
+  {% if error %}
+    <details style="margin-top:10px;font-size:12px">
+      <summary style="cursor:pointer;color:var(--danger)">
+        Show error from TikTok
+      </summary>
+      <pre style="background:var(--c-bg-alt,#f8f9fa);padding:10px;border-radius:4px;
+                  margin-top:6px;white-space:pre-wrap;word-break:break-word;
+                  font-size:11px">{{ error }}</pre>
+      <p class="label" style="font-size:12px;margin-top:8px">
+        Set these env vars on the HF Space and restart if the URL is
+        wrong:
+      </p>
+      <ul style="margin-top:4px;font-size:12px">
+        <li><code>TIKTOK_ACCESS_TOKEN</code> — Business API token (required)</li>
+        <li><code>TIKTOK_ADVERTISER_ID</code> — usually required for
+            Business API endpoints; 403 typically means this is missing</li>
+        <li><code>TIKTOK_AVATAR_LIST_URL</code> — override if the
+            standard path moved (current default ends in
+            <code>/business/symphony/avatar/list/</code>)</li>
+      </ul>
+    </details>
   {% endif %}
 </div>
 
-<div class="card" style="margin-top:12px">
-  <h3 style="margin-top:0;font-size:14px">Add or update avatar</h3>
-  <form method="post" action="/admin/avatars" style="display:grid;gap:10px">
-    {% if form_error %}
-      <p style="color:var(--danger);font-size:13px;margin:0">
-        ⚠ {{ form_error }}
-      </p>
-    {% endif %}
-
-    <div class="grid">
-      <label for="avatar_id" class="label">Avatar ID *</label>
-      <input type="text" id="avatar_id" name="avatar_id" required
-             maxlength="64"
-             placeholder="e.g. 7234567890123456789"
-             value="{{ form_values.avatar_id }}">
-    </div>
-
-    <div class="grid">
-      <label for="name" class="label">Display name</label>
-      <input type="text" id="name" name="name" maxlength="80"
-             placeholder="e.g. Anna (warm female narrator)"
-             value="{{ form_values.name }}">
-    </div>
-
-    <div class="grid">
-      <label for="gender" class="label">Gender</label>
-      <select id="gender" name="gender">
-        <option value=""        {% if form_values.gender == "" %}selected{% endif %}>(unspecified)</option>
-        <option value="female"  {% if form_values.gender == "female" %}selected{% endif %}>female</option>
-        <option value="male"    {% if form_values.gender == "male" %}selected{% endif %}>male</option>
-        <option value="neutral" {% if form_values.gender == "neutral" %}selected{% endif %}>neutral</option>
-      </select>
-    </div>
-
-    <div class="grid">
-      <label for="preview_url" class="label">Preview image URL</label>
-      <input type="url" id="preview_url" name="preview_url" maxlength="500"
-             placeholder="https://... (paste the thumbnail URL from TikTok's UI)"
-             value="{{ form_values.preview_url }}">
-    </div>
-
-    <div class="grid">
-      <label for="notes" class="label">Notes</label>
-      <input type="text" id="notes" name="notes" maxlength="240"
-             placeholder="optional — e.g. 'use for energetic scripts'"
-             value="{{ form_values.notes }}">
-    </div>
-
-    <div>
-      <button type="submit">Save avatar</button>
-      <span class="label" style="font-size:12px;margin-left:8px">
-        Adding an ID that already exists updates the existing entry.
-      </span>
-    </div>
-  </form>
-</div>
-
-<h3 style="margin-top:18px;font-size:14px">
-  Catalog ({{ count }} avatar{{ '' if count == 1 else 's' }})
-</h3>
-
 {% if not avatars %}
-  <div class="empty">
-    No avatars yet — add one above to populate the catalog.
+  <div class="empty" style="margin-top:14px">
+    No avatars yet. Set the env vars above and reload the page.
   </div>
 {% else %}
-  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px">
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-top:14px">
     {% for a in avatars %}
       <div class="card" style="padding:12px">
         {% if a.preview_url %}
@@ -109,7 +75,7 @@
           <div style="width:100%;aspect-ratio:1/1;background:#eee;border-radius:8px;
                       display:flex;align-items:center;justify-content:center;color:#999;
                       font-size:12px">
-            no preview URL
+            no preview
           </div>
         {% endif %}
         <div style="margin-top:10px">
@@ -122,23 +88,10 @@
           <code style="display:block;font-size:12px;margin-top:4px;word-break:break-all">
             {{ a.avatar_id }}
           </code>
-          {% if a.notes %}
-            <p class="label" style="font-size:12px;margin:6px 0 0">
-              {{ a.notes }}
-            </p>
-          {% endif %}
-          <div style="display:flex;gap:6px;margin-top:8px">
-            <button type="button" style="flex:1"
-                    onclick="navigator.clipboard.writeText('{{ a.avatar_id }}').then(()=>{this.textContent='Copied'; setTimeout(()=>this.textContent='Copy ID', 1500)})">
-              Copy ID
-            </button>
-            <form method="post" action="/admin/avatars/delete"
-                  style="margin:0"
-                  onsubmit="return confirm('Remove {{ a.avatar_id }} from the catalog?')">
-              <input type="hidden" name="avatar_id" value="{{ a.avatar_id }}">
-              <button type="submit" class="danger">Delete</button>
-            </form>
-          </div>
+          <button type="button" style="margin-top:8px;width:100%"
+                  onclick="navigator.clipboard.writeText('{{ a.avatar_id }}').then(()=>{this.textContent='Copied'; setTimeout(()=>this.textContent='Copy ID', 1500)})">
+            Copy ID
+          </button>
         </div>
       </div>
     {% endfor %}

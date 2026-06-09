@@ -107,6 +107,20 @@ def _slug(row_num: int, job_id: str | None = None) -> str:
     return f"{job_part}_r{row_num}_{int(time.time())}"
 
 
+# Avatar IDs from TikTok are alphanumerics + dashes/underscores; anything
+# outside that range gets stripped so the filename stays portable across
+# storage backends (GCS, S3, HF resolver) that all dislike spaces /
+# punctuation / non-ASCII. Length capped because some TikTok IDs are
+# long opaque blobs and the storage key has a max.
+_AVATAR_ID_SANITIZE_RE = __import__("re").compile(r"[^A-Za-z0-9_\-]")
+
+
+def _avatar_filename_slug(avatar_id: str) -> str:
+    """Filesystem-safe avatar_id for use inside storage keys."""
+    cleaned = _AVATAR_ID_SANITIZE_RE.sub("", avatar_id or "")[:32]
+    return cleaned or "unknown"
+
+
 @dataclass
 class _Costs:
     article: float = 0.0
@@ -439,7 +453,7 @@ async def process_avatar_row(
             data = await _download(video_url_for_persist, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
-                key=f"bulkvid/videos/{slug}/v1.mp4",
+                key=f"bulkvid/videos/{slug}/avatar_{_avatar_filename_slug(row.avatar_id)}.mp4",
                 content_type="video/mp4",
             )
             costs.storage += up.cost_usd
@@ -473,7 +487,7 @@ async def process_avatar_row(
                 cap_bytes = await _download(cap_url, timeout=180.0)
                 cap_up = await clients.storage.upload_bytes(
                     cap_bytes,
-                    key=f"bulkvid/videos_captioned/{slug}/v1.mp4",
+                    key=f"bulkvid/videos_captioned/{slug}/avatar_{_avatar_filename_slug(row.avatar_id)}.mp4",
                     content_type="video/mp4",
                 )
                 costs.storage += cap_up.cost_usd

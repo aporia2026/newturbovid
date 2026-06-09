@@ -1,20 +1,14 @@
-"""Manual avatar catalog — operator-curated list of TikTok Symphony
-avatars they want available in the sheet's ``Avatar ID`` column.
+"""Avatar catalog — read-through cache for the TikTok Symphony list.
 
-TikTok's Symphony Creative API doesn't expose an avatar-list endpoint we
-can reliably call (chat 2026-06-09: the standard path returns 403; the
-operator's existing Stage 4 implementation doesn't list either — IDs get
-copied from TikTok's web UI). This catalog is the workaround: the
-operator pastes an avatar_id + name + preview URL + gender into the
-admin form once per avatar, and the ``/admin/avatars`` page renders the
-list with copy-to-clipboard buttons so any team member can paste IDs
-into the sheet without re-finding them.
+The ``/admin/avatars`` page auto-fetches from TikTok on every load and
+writes the result into this cache via ``replace_catalog``. If a
+subsequent fetch fails (network blip, 403, endpoint moved), the page
+falls back to ``load_catalog`` and shows the last good list with the
+error visible — so a transient TikTok failure never blanks the page.
 
-Stored as a JSON array in the settings store under a single key. The
-admin form CRUD-s this list (add / delete entries). Reads are cheap
-(settings store has an in-process TTL cache).
+Stored as a JSON array in the settings store under a single key.
 
-Plan: ``_plans/2026-06-09-video-with-avatar-tab.md`` §Manual catalog.
+Plan: ``_plans/2026-06-09-video-with-avatar-tab.md`` §Auto-fetch cache.
 """
 
 from __future__ import annotations
@@ -90,6 +84,43 @@ async def load_catalog(store: SettingsStore) -> list[CatalogAvatar]:
     first run or after a parse failure (logged)."""
     raw = await store.get(SETTING_TIKTOK_AVATAR_CATALOG, default="")
     return _decode(raw or "")
+
+
+async def replace_catalog(
+    store: SettingsStore,
+    entries: list[dict[str, str]],
+    *,
+    updated_by: str = "auto-fetch",
+) -> None:
+    """Overwrite the catalog with the given entries. Used as a
+    read-through cache: the /admin/avatars page calls TikTok's list
+    endpoint and pipes the result here. Invalid entries are silently
+    skipped (defensive — a bad TikTok payload shouldn't corrupt the
+    cache)."""
+    valid: list[CatalogAvatar] = []
+    for it in entries:
+        avatar_id = str(it.get("avatar_id") or "").strip()
+        if not avatar_id or not _ID_PATTERN.match(avatar_id):
+            continue
+        if len(avatar_id) > _ID_MAX_LEN:
+            continue
+        valid.append(
+            CatalogAvatar(
+                avatar_id=avatar_id,
+                name=str(it.get("name") or "").strip()[:_NAME_MAX_LEN],
+                gender=str(it.get("gender") or "").strip().lower(),
+                preview_url=str(it.get("preview_url") or "").strip()[:_PREVIEW_URL_MAX_LEN],
+                notes=str(it.get("notes") or "").strip()[:240],
+            )
+        )
+    await store.set(
+        SETTING_TIKTOK_AVATAR_CATALOG, _encode(valid), updated_by=updated_by,
+    )
+    _log.info(
+        "avatar_catalog_replaced",
+        accepted=len(valid),
+        proposed=len(entries),
+    )
 
 
 def _validate_input(
