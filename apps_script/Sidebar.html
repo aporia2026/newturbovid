@@ -121,6 +121,33 @@
       line-height: 1.45;
     }
     .queue-banner.busy { border-color: var(--c-blue-soft); }
+    /* Worker-stuck variant — amber border + background hint so it
+       stands out from the normal banner without screaming "error".
+       The job ISN'T failed; the worker has just stopped claiming.
+       Operator should click "Stop all jobs" or wait for the next
+       deploy. Chat 2026-06-09 silent-deadlock incident. */
+    .queue-banner.stuck {
+      border-color: var(--c-amber);
+      background: var(--c-amber-soft);
+    }
+    .queue-banner.stuck .qb-counts { color: var(--c-amber); }
+    .queue-banner.stuck .qb-counts .qb-cap { color: var(--c-amber); }
+    .queue-banner .qb-stuck-warning {
+      display: none;
+      margin-top: 6px;
+      font-size: 12px; font-weight: 500;
+      color: var(--c-amber);
+      line-height: 1.45;
+    }
+    .queue-banner.stuck .qb-stuck-warning { display: block; }
+    .queue-banner .qb-stuck-warning .qb-stuck-hint {
+      display: block;
+      font-weight: 400;
+      color: var(--c-amber);
+      opacity: 0.85;
+      margin-top: 2px;
+      font-size: 11px;
+    }
     .queue-banner .qb-row {
       display: flex; justify-content: space-between;
       align-items: baseline; gap: 8px;
@@ -260,13 +287,20 @@
   <div class="summary-line" id="summary"></div>
 
   <!-- Queue-depth banner. Hidden by default (.queue-banner has
-       display:none); render() shows it only when in_flight + queued > 0. -->
+       display:none); render() shows it only when in_flight + queued > 0.
+       Gets a ``stuck`` class when ``queue_status.stuck_queued_seconds``
+       is set — surfaces a "worker not claiming" warning so operators
+       stop silently waiting through a hung worker. -->
   <div class="queue-banner" id="queue-banner">
     <div class="qb-row">
       <span class="qb-counts" id="qb-counts"></span>
       <span class="qb-eta" id="qb-eta"></span>
     </div>
     <div class="qb-bar"><div class="qb-bar-fill" id="qb-bar-fill" style="width:0%"></div></div>
+    <div class="qb-stuck-warning" id="qb-stuck-warning">
+      <span id="qb-stuck-text"></span>
+      <span class="qb-stuck-hint" id="qb-stuck-hint"></span>
+    </div>
   </div>
 
   <h4>Active</h4>
@@ -338,11 +372,19 @@
         return;
       }
       el.style.display = 'block';
-      // Bluer border when we're actually saturating the worker — gives
-      // the operator a "yes, things are running at capacity" signal.
-      var saturated = (status.in_flight || 0) >= (status.max_concurrent || 0)
+      // Stuck-queued state takes precedence over the "saturated"
+      // styling: when the worker isn't claiming, we want the amber
+      // warning, not the blue "running at capacity" border.
+      // ``stuck_queued_seconds`` is null on older backends (pre-2026-
+      // 06-09) — we silently treat that as "not stuck" so a partial
+      // deploy never false-alarms.
+      var stuckSec = status.stuck_queued_seconds || 0;
+      var stuck = stuckSec > 0;
+      var saturated = !stuck
+                      && (status.in_flight || 0) >= (status.max_concurrent || 0)
                       && (status.max_concurrent || 0) > 0;
       el.classList.toggle('busy', saturated);
+      el.classList.toggle('stuck', stuck);
 
       document.getElementById('qb-counts').innerHTML =
         (status.in_flight || 0) +
@@ -350,7 +392,10 @@
         ' in flight · ' + (status.queued || 0) + ' queued</span>';
 
       var eta = _formatEta(status.eta_seconds);
-      document.getElementById('qb-eta').textContent = eta ? ('ETA ~' + eta) : '';
+      // Hide the ETA line when stuck — a wall-clock estimate while the
+      // worker isn't claiming would just confuse the operator.
+      document.getElementById('qb-eta').textContent =
+        (stuck || !eta) ? '' : ('ETA ~' + eta);
 
       // Progress bar shows how far along the user is through their batch:
       // in_flight / (in_flight + queued). 100% when only in_flight remains.
@@ -360,6 +405,19 @@
         ? Math.round((inFlight / (inFlight + queued)) * 100)
         : 0;
       document.getElementById('qb-bar-fill').style.width = pct + '%';
+
+      // Stuck warning. Backend sets ``stuck_queued_seconds`` only when
+      // queued > 0 AND in_flight == 0 AND the oldest pending row has
+      // been waiting past the threshold (~60s). Below that threshold
+      // we say nothing — a row that's been waiting 5 s on a busy queue
+      // is normal.
+      if (stuck) {
+        document.getElementById('qb-stuck-text').textContent =
+          '⚠ Worker not claiming for ' + _formatEta(stuckSec);
+        document.getElementById('qb-stuck-hint').textContent =
+          'Click "Stop all jobs" below and resubmit. If it persists, ' +
+          'the worker may be hung — restart the backend.';
+      }
     }
 
     function _pct(j) {
