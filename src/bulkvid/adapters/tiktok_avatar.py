@@ -121,10 +121,29 @@ class TikTokAvatarClient:
         create_url: str | None = None,
         get_url: str | None = None,
         list_url: str | None = None,
-        poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
-        poll_max_attempts: int = _DEFAULT_POLL_MAX_ATTEMPTS,
+        poll_interval_seconds: float | None = None,
+        poll_max_attempts: int | None = None,
         http_timeout_seconds: float = 30.0,
     ) -> None:
+        # Poll cadence: matches the operator's existing Stage 4 pattern —
+        # ``TIKTOK_POLL_INTERVAL`` / ``TIKTOK_POLL_MAX`` env vars override the
+        # defaults. Empty / unparseable values fall back to the defaults.
+        if poll_interval_seconds is None:
+            try:
+                poll_interval_seconds = float(
+                    os.environ.get("TIKTOK_POLL_INTERVAL")
+                    or _DEFAULT_POLL_INTERVAL_SECONDS
+                )
+            except ValueError:
+                poll_interval_seconds = _DEFAULT_POLL_INTERVAL_SECONDS
+        if poll_max_attempts is None:
+            try:
+                poll_max_attempts = int(
+                    os.environ.get("TIKTOK_POLL_MAX")
+                    or _DEFAULT_POLL_MAX_ATTEMPTS
+                )
+            except ValueError:
+                poll_max_attempts = _DEFAULT_POLL_MAX_ATTEMPTS
         token = access_token or os.environ.get("TIKTOK_ACCESS_TOKEN", "")
         if not token:
             raise TikTokAvatarError(

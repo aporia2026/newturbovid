@@ -273,42 +273,143 @@ async def job_logs(
     )
 
 
-# ── TikTok Symphony avatars (browse) ─────────────────────────────────────────
+# ── TikTok Symphony avatar catalog (manual) ──────────────────────────────────
+#
+# TikTok's Symphony Creative API doesn't expose a listing endpoint we can
+# call reliably (the standard path returns 403, and the operator's
+# existing Stage 4 implementation doesn't list either — they paste IDs
+# from TikTok's web UI). This page is a manually-curated catalog: the
+# operator pastes ``avatar_id`` + ``name`` + ``preview_url`` + ``gender``
+# once per avatar, the entries are stored in the settings DB, and any
+# team member can copy IDs from here into the sheet's Avatar ID column.
+
+
+def _render_avatars_page(
+    request: Request,
+    *,
+    avatars: list[dict[str, str]],
+    form_error: str | None,
+    form_values: dict[str, str] | None,
+    flash: str | None = None,
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "avatars.html",
+        {
+            "avatars": avatars,
+            "count": len(avatars),
+            "form_error": form_error,
+            "form_values": form_values or {
+                "avatar_id": "", "name": "", "gender": "",
+                "preview_url": "", "notes": "",
+            },
+            "flash": flash,
+        },
+    )
+
+
+def _catalog_to_dicts(entries) -> list[dict[str, str]]:
+    return [
+        {
+            "avatar_id": e.avatar_id,
+            "name": e.name,
+            "gender": e.gender,
+            "preview_url": e.preview_url,
+            "notes": e.notes,
+        }
+        for e in entries
+    ]
 
 
 @router.get("/avatars", response_class=HTMLResponse)
 async def avatars_page(
-    request: Request, _user: str = Depends(_check_admin)
+    request: Request, user: str = Depends(_check_admin)
 ) -> HTMLResponse:
-    """List available TikTok Symphony avatars with previews + IDs so the
-    operator can pick one and paste the id into the ``video with avatar``
-    tab's Avatar ID column. Plan
-    ``_plans/2026-06-09-video-with-avatar-tab.md``."""
-    from bulkvid.adapters.tiktok_avatar import (
-        TikTokAvatarClient,
-        TikTokAvatarError,
+    """Render the manual avatar catalog with an add-new form."""
+    from bulkvid.pipeline.avatar_catalog import load_catalog
+
+    store = _get_settings_store(request)
+    entries = await load_catalog(store)
+    return _render_avatars_page(
+        request,
+        avatars=_catalog_to_dicts(entries),
+        form_error=None,
+        form_values=None,
     )
 
-    error: str | None = None
-    avatars: list[dict[str, str]] = []
-    try:
-        client = TikTokAvatarClient()
-        entries = await client.list_avatars()
-        avatars = [
-            {
-                "avatar_id": e.avatar_id,
-                "name": e.name,
-                "gender": e.gender,
-                "preview_url": e.preview_url,
-            }
-            for e in entries
-        ]
-    except TikTokAvatarError as e:
-        error = str(e)
-    except Exception as e:    # broad: env var missing, network, etc.
-        error = f"{type(e).__name__}: {e!s}"
-    return templates.TemplateResponse(
+
+@router.post("/avatars", response_class=HTMLResponse)
+async def avatars_add(
+    request: Request,
+    avatar_id: str = Form(""),
+    name: str = Form(""),
+    gender: str = Form(""),
+    preview_url: str = Form(""),
+    notes: str = Form(""),
+    user: str = Depends(_check_admin),
+) -> HTMLResponse:
+    """Add or upsert a catalog entry. Re-renders the page either way —
+    inline error on validation failure, fresh form on success."""
+    from bulkvid.pipeline.avatar_catalog import add_avatar, load_catalog
+
+    store = _get_settings_store(request)
+    err = await add_avatar(
+        store,
+        avatar_id=avatar_id,
+        name=name,
+        gender=gender,
+        preview_url=preview_url,
+        notes=notes,
+        updated_by=user or "admin",
+    )
+    entries = await load_catalog(store)
+    if err is not None:
+        # Render with the operator's values intact so they can fix the
+        # bad field without re-typing everything.
+        return _render_avatars_page(
+            request,
+            avatars=_catalog_to_dicts(entries),
+            form_error=err,
+            form_values={
+                "avatar_id": avatar_id,
+                "name": name,
+                "gender": gender,
+                "preview_url": preview_url,
+                "notes": notes,
+            },
+        )
+    return _render_avatars_page(
         request,
-        "avatars.html",
-        {"avatars": avatars, "error": error, "count": len(avatars)},
+        avatars=_catalog_to_dicts(entries),
+        form_error=None,
+        form_values=None,
+        flash=f"Saved avatar {avatar_id}.",
+    )
+
+
+@router.post("/avatars/delete", response_class=HTMLResponse)
+async def avatars_delete(
+    request: Request,
+    avatar_id: str = Form(""),
+    user: str = Depends(_check_admin),
+) -> HTMLResponse:
+    """Remove a catalog entry."""
+    from bulkvid.pipeline.avatar_catalog import delete_avatar, load_catalog
+
+    store = _get_settings_store(request)
+    removed = await delete_avatar(
+        store, avatar_id=avatar_id, updated_by=user or "admin",
+    )
+    entries = await load_catalog(store)
+    flash = (
+        f"Removed avatar {avatar_id}."
+        if removed
+        else f"No avatar with id {avatar_id!r}."
+    )
+    return _render_avatars_page(
+        request,
+        avatars=_catalog_to_dicts(entries),
+        form_error=None,
+        form_values=None,
+        flash=flash,
     )
