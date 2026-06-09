@@ -9,7 +9,6 @@ import io
 import pytest
 from PIL import Image
 
-from bulkvid.adapters.rendi import DEFAULT_DIMENSIONS_BY_RATIO
 from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
 
 
@@ -31,27 +30,43 @@ def _decode(data: bytes) -> Image.Image:
 
 
 @pytest.mark.parametrize(
-    "ratio,expected",
-    sorted(DEFAULT_DIMENSIONS_BY_RATIO.items()),
+    "src_size",
+    [(1600, 900), (1080, 1080), (900, 1600), (2400, 1600)],
 )
-def test_overlay_returns_png_at_target_aspect(
-    ratio: str, expected: tuple[int, int]
+def test_overlay_preserves_source_dimensions(
+    src_size: tuple[int, int],
 ) -> None:
-    """The output PNG must land at the dimensions the row's aspect_ratio
-    maps to — not the source image's dimensions."""
-    w, h = expected
+    """The output PNG must land at the SOURCE image's native dimensions,
+    not the row's target aspect. The earlier behavior cover-cropped the
+    source to the target aspect and destroyed framing — Rendi handles
+    aspect fit downstream via its blurred-background command."""
+    w, h = src_size
     out = overlay_text_on_image_bytes(
-        _src_png(),
+        _src_png(width=w, height=h),
         "Casas embargadas: precios y oportunidades",
-        aspect_ratio=ratio,
+        aspect_ratio="9:16",    # explicitly different from any of the src sizes
     )
     assert isinstance(out, bytes)
     assert len(out) > 1024, "output suspiciously small"
     img = _decode(out)
     try:
-        assert img.size == (w, h)
+        assert img.size == (w, h), (
+            f"output {img.size} should match source {(w, h)}, not be cropped"
+        )
     finally:
         img.close()
+
+
+def test_overlay_aspect_ratio_param_does_not_resize() -> None:
+    """The ``aspect_ratio`` kwarg stays on the signature for API compat
+    but must NOT change the output dimensions. Same source → same
+    output size, whatever the operator picked for the row."""
+    src = _src_png(width=1200, height=600)
+    out_916 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="9:16")
+    out_11 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="1:1")
+    out_45 = overlay_text_on_image_bytes(src, "Hello", aspect_ratio="4:5")
+    sizes = {_decode(o).size for o in (out_916, out_11, out_45)}
+    assert sizes == {(1200, 600)}, f"aspect_ratio should not resize; got {sizes}"
 
 
 # ── Blank text branch ──────────────────────────────────────────────────────

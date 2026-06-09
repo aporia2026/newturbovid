@@ -5,10 +5,16 @@ of the operator-supplied image. The text auto-wraps to fit a comfortable
 side margin and auto-shrinks to fit a max number of lines.
 
 Pipeline integration: the row processor downloads the manual image,
-cover-crops it to the row's target aspect ratio, paints the overlay, and
-uploads the result. Rendi then animates that pre-composed image into a
-video with the VO muxed in — no Rendi-side fitting, since the image is
-already at the right aspect.
+paints the overlay AT THE SOURCE'S NATIVE DIMENSIONS (no crop, no resize),
+and uploads the result. Rendi then does its blurred-background fit to
+the row's target aspect ratio — preserving the operator's original
+composition instead of chopping framed-in headlines off the sides.
+
+Earlier the renderer cover-cropped the source to ``aspect_ratio`` first;
+that destroyed images that already had text/composition designed for
+1:1 or another aspect (e.g. a 1:1 stock photo with "Remote NHS
+Receptionists" baked across the top got chopped in half when forced
+into 9:16). See chat 2026-06-09.
 
 Plan: ``_plans/2026-06-09-paste-text-on-img-tab.md``.
 """
@@ -20,10 +26,8 @@ from typing import Final
 
 from PIL import Image, ImageDraw, ImageFont
 
-from bulkvid.adapters.rendi import dimensions_for_ratio
 from bulkvid.logging import get_logger
 from bulkvid.pipeline.card_renderer import (
-    _fit_image_cover,
     _load_font,
     _wrap_text_to_width,
 )
@@ -111,24 +115,26 @@ def overlay_text_on_image_bytes(
     aspect_ratio: str = "9:16",
     output_format: str = "PNG",
 ) -> bytes:
-    """Cover-crop ``image_bytes`` to the target aspect, then center
-    heavy white-with-black-outline text on it. Returns image bytes
-    (PNG by default) ready for storage upload.
+    """Overlay heavy white-with-black-outline text centered on
+    ``image_bytes`` AT THE SOURCE'S NATIVE DIMENSIONS. Returns image
+    bytes (PNG by default) ready for storage upload — Rendi handles the
+    aspect-ratio fit downstream.
 
-    Empty text is allowed — returns the cover-cropped image with no
-    overlay drawn, so a row with a typo'd or accidentally-blank Text
-    cell still ships a valid video instead of erroring.
+    ``aspect_ratio`` is kept on the signature for API compatibility and
+    future tuning, but the renderer no longer resizes/crops the source.
+    Forcing a 1:1 photo into 9:16 (the previous behavior) chopped any
+    edge composition the operator carefully framed.
+
+    Empty text is allowed — returns the unmodified source so a row with
+    a typo'd or accidentally-blank Text cell still ships a valid video.
     """
-    width, height = dimensions_for_ratio(aspect_ratio)
+    del aspect_ratio    # kept for API compat; intentionally unused
 
     with Image.open(io.BytesIO(image_bytes)) as src:
         src.load()
-        src_rgb = src.convert("RGB")
+        canvas = src.convert("RGB")
 
-    try:
-        canvas = _fit_image_cover(src_rgb, width, height)
-    finally:
-        src_rgb.close()
+    width, height = canvas.size
 
     text = (text or "").strip()
     if not text:
