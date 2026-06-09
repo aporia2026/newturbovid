@@ -117,6 +117,28 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
 DEFAULT_STUCK_ROW_THRESHOLD_SECONDS = 300.0
 
 
+# Hard timeout around every libsql query the worker makes against the
+# shared queue. Without this, a single stalled Turso HTTP call blocks
+# the ``asyncio.to_thread`` worker thread INDEFINITELY, the runner's
+# main ``await`` never returns, no heartbeat fires, and the worker
+# silently hangs while jobs pile up in the queue. Chat 2026-06-09: the
+# operator saw exactly this — ``job_enqueued`` + ``active_jobs=1`` but
+# zero ``runner_heartbeat`` lines for 100+ seconds, so the worker was
+# deadlocked on an unresponsive libsql connection.
+#
+# 30 s is loose enough to absorb a slow libsql roundtrip (we've seen
+# cold-start spikes ~5-10 s) but tight enough that a genuinely stalled
+# connection gets caught on the next ``poll_idle`` tick rather than
+# forever. Override via env var on a per-deploy basis.
+_WORKER_QUERY_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_WORKER_QUERY_TIMEOUT_SECONDS") or 30.0
+)
+# Brief backoff after a query timeout so a flapping Turso doesn't get
+# hammered. Independent of ``poll_idle_seconds`` (which controls the
+# normal idle cadence).
+_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS = 2.0
+
+
 # Heartbeat cadence: number of consecutive empty polls before the runner
 # emits a heartbeat. With the default ``poll_idle_seconds=1.0`` this is
 # one heartbeat every ~30s — frequent enough to spot a stalled runner,
@@ -281,7 +303,41 @@ class BatchRunner:
             # constant lives at module scope so tests can patch it.
             _polls_since_heartbeat = 0
             while not self._shutdown.is_set():
-                queued = await self._queue.claim_next_row()
+                # Hard timeout around the libsql claim query. A stalled
+                # Turso HTTP roundtrip would otherwise hang this await
+                # forever — no heartbeat, no recovery (chat 2026-06-09).
+                try:
+                    queued = await asyncio.wait_for(
+                        self._queue.claim_next_row(),
+                        timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    _log.warning(
+                        "runner_claim_timeout",
+                        timeout_s=_WORKER_QUERY_TIMEOUT_SECONDS,
+                        backoff_s=_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS,
+                    )
+                    # Brief backoff so a flapping libsql doesn't get
+                    # pummeled, then continue the loop. Shutdown still
+                    # interrupts via the wait_for below.
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown.wait(),
+                            timeout=_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+                    continue
+                except Exception as e:    # noqa: BLE001 — runner must keep running
+                    _log.exception("runner_claim_error", error=str(e))
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown.wait(),
+                            timeout=_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS,
+                        )
+                    except TimeoutError:
+                        pass
+                    continue
                 if queued is None:
                     _polls_since_heartbeat += 1
                     if _polls_since_heartbeat >= _HEARTBEAT_EVERY:
@@ -446,15 +502,32 @@ class BatchRunner:
                 error=f"unhandled: {e!s}",
             )
 
+        # Same timeout discipline as the claim above: a stalled libsql
+        # write would otherwise pin this task forever and silently leak a
+        # semaphore slot. ``record_result`` is idempotent on retry because
+        # the SET writes the same status; getting through eventually is
+        # more important than waiting indefinitely on a hung roundtrip.
         try:
-            await self._queue.record_result(queued.id, result)
+            await asyncio.wait_for(
+                self._queue.record_result(queued.id, result),
+                timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            _log.warning(
+                "runner_record_result_timeout",
+                queued_id=queued.id,
+                timeout_s=_WORKER_QUERY_TIMEOUT_SECONDS,
+            )
         except Exception as e:
             _log.exception("runner_record_result_failed", error=str(e))
 
         # Look up the job's sheet routing so the writer can flush without
         # a second queue hit. If the job vanished mid-run, skip silently.
         try:
-            job = await self._queue.get_job(queued.job_id)
+            job = await asyncio.wait_for(
+                self._queue.get_job(queued.job_id),
+                timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
+            )
             if job is None:
                 return
             write = PendingWrite(

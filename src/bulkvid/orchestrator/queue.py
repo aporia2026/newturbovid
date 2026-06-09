@@ -642,6 +642,53 @@ class JobQueue:
 
         return in_flight, queued, queued_per_tab
 
+    def _user_oldest_pending_row_age_seconds_sync(
+        self, *, user_email: str | None,
+    ) -> int | None:
+        """Age in seconds of the OLDEST ROW_PENDING row for this user
+        (or whole fleet when ``user_email is None``).
+
+        Returns ``None`` when no rows are queued. Used by the sidebar's
+        stuck-queued detector: if rows have been pending for longer than
+        a few seconds AND the worker has nothing in flight, the worker
+        has stalled out — we want to surface that visibly instead of the
+        operator silently waiting.
+
+        Row age = ``now() − jobs.created_at`` for the parent job, NOT the
+        per-row ``started_at`` (which is ``NULL`` for pending rows by
+        definition). Computed in SQL with ``strftime`` to avoid moving
+        the row data into Python.
+        """
+        if user_email is None:
+            cur = self._conn.execute(
+                "SELECT MIN(strftime('%s', 'now') - strftime('%s', j.created_at)) "
+                "AS age_s "
+                "FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?)",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT MIN(strftime('%s', 'now') - strftime('%s', j.created_at)) "
+                "AS age_s "
+                "FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "AND j.user_email = ?",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING, user_email),
+            )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        # MIN over an empty set yields NULL; column may also be None on
+        # libsql when the join produced no rows.
+        raw = row["age_s"] if hasattr(row, "keys") else row[0]
+        if raw is None:
+            return None
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return None
+
     def _eta_medians_sync(self, *, sample_size: int = 50) -> dict[str, float]:
         """Median ``finished_at - started_at`` in seconds, grouped by
         ``tab_type``, over the last ``sample_size`` successfully-done
@@ -822,6 +869,15 @@ class JobQueue:
         admin view (whole fleet)."""
         return await asyncio.to_thread(
             self._user_queue_depth_sync, user_email=user_email,
+        )
+
+    async def user_oldest_pending_row_age_seconds(
+        self, *, user_email: str | None,
+    ) -> int | None:
+        """Async wrapper for ``_user_oldest_pending_row_age_seconds_sync``."""
+        return await asyncio.to_thread(
+            self._user_oldest_pending_row_age_seconds_sync,
+            user_email=user_email,
         )
 
     async def kill_job(self, job_id: str) -> bool:

@@ -397,12 +397,33 @@ class QueueStatusOut(BaseModel):
     ``None`` when no medians are available yet (cold start) so the
     sidebar can hide the "ETA" line instead of showing a misleading 0.
 
+    ``stuck_queued_seconds`` is non-None only when the worker has rows
+    pending but NOTHING in flight AND the oldest pending row has been
+    waiting longer than ``STUCK_QUEUED_THRESHOLD_SECONDS``. Surfaces a
+    "worker not claiming" warning in the sidebar so the operator stops
+    silently waiting and clicks "Stop all jobs" / pings on-call. The
+    threshold is intentionally generous (default 60 s) so a brief libsql
+    blip or a slow cold-start doesn't false-trigger.
+
     Plan: chat 2026-06-09; queue depth + ETA banner in the sidebar."""
 
     in_flight: int
     queued: int
     max_concurrent: int
     eta_seconds: int | None = None
+    stuck_queued_seconds: int | None = None
+
+
+# Worker is considered "stuck" if the oldest pending row has been waiting
+# longer than this with nothing else in flight. Threshold deliberately
+# loose: the runner polls every 1 s in normal operation, so 60 s = 60
+# missed claims, which is well past any plausible libsql hiccup. Tunable
+# without a redeploy via env override below if we need to dial in.
+import os as _os    # noqa: E402 — used only by the env override
+
+STUCK_QUEUED_THRESHOLD_SECONDS = int(
+    _os.environ.get("BULKVID_STUCK_QUEUED_THRESHOLD_SECONDS") or 60
+)
 
 
 class PollOut(BaseModel):
@@ -790,11 +811,37 @@ async def poll_jobs(
             # at ~half their tab's median so the banner doesn't double-
             # count seconds that have already elapsed.
             eta_seconds = max(0, int(weighted / max_concurrent))
+
+        # Stuck-queued detector: only fires when the worker has rows
+        # pending AND nothing in flight AND the oldest pending row has
+        # been waiting longer than the threshold. In normal operation
+        # (worker actively claiming) ``in_flight > 0``, so this stays
+        # None and the sidebar shows no warning. Plan: chat 2026-06-09.
+        stuck_queued_seconds: int | None = None
+        if queued > 0 and in_flight == 0:
+            try:
+                oldest_age = await queue.user_oldest_pending_row_age_seconds(
+                    user_email=filter_email,
+                )
+            except Exception as e:    # noqa: BLE001
+                _log.warning("stuck_queued_age_failed", err=str(e)[:200])
+                oldest_age = None
+            if oldest_age is not None and oldest_age >= STUCK_QUEUED_THRESHOLD_SECONDS:
+                stuck_queued_seconds = oldest_age
+                _log.warning(
+                    "stuck_queued_detected",
+                    user_email=identity.email,
+                    queued=queued,
+                    oldest_age_seconds=oldest_age,
+                    threshold_seconds=STUCK_QUEUED_THRESHOLD_SECONDS,
+                )
+
         queue_status = QueueStatusOut(
             in_flight=in_flight,
             queued=queued,
             max_concurrent=max_concurrent,
             eta_seconds=eta_seconds,
+            stuck_queued_seconds=stuck_queued_seconds,
         )
     except Exception as e:    # noqa: BLE001 — never let queue-depth 500 a poll
         _log.warning("queue_status_failed", err=str(e)[:200])

@@ -706,6 +706,9 @@ def test_poll_empty_state(client: TestClient) -> None:
             # banner can hide the "ETA" line on its own and not have to
             # conflate "no queue" with "no medians yet".
             "eta_seconds": 0,
+            # No queued rows → stuck-detect short-circuits to None
+            # (nothing to be stuck on). Sidebar hides the warning.
+            "stuck_queued_seconds": None,
         },
     }
 

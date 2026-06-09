@@ -506,6 +506,64 @@ async def test_heartbeat_quiet_when_no_rows_stuck(
     fake_log.warning.assert_not_called()
 
 
+async def test_runner_loop_survives_claim_timeout(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for chat 2026-06-09: a stalled libsql ``claim_next_row``
+    call would hang the worker's ``await`` forever, no heartbeat fires,
+    the queue piles up. With ``asyncio.wait_for`` wrapping the claim, a
+    stuck call times out, logs ``runner_claim_timeout``, backs off
+    briefly, and the loop continues — proving the worker is no longer
+    pinned by a single bad libsql HTTP roundtrip.
+    """
+    from unittest.mock import MagicMock
+
+    # Shrink the timeouts so the test doesn't have to wait 30 seconds.
+    monkeypatch.setattr(runner_mod, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(runner_mod, "_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS", 0.01)
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    # Replace claim_next_row with a never-returning coroutine to simulate
+    # a stalled libsql HTTP roundtrip.
+    call_count = {"n": 0}
+
+    async def _stuck_claim() -> None:
+        call_count["n"] += 1
+        await asyncio.Event().wait()    # never returns
+
+    monkeypatch.setattr(queue, "claim_next_row", _stuck_claim)
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.01,
+    )
+
+    async def _shutdown_after_timeouts() -> None:
+        # Wait for at least two claim attempts -> proves the loop
+        # cycled past a stuck call (didn't deadlock).
+        while call_count["n"] < 2:
+            await asyncio.sleep(0.02)
+        runner.request_shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_after_timeouts()),
+        timeout=3.0,
+    )
+
+    # Saw at least two attempts (loop didn't hang on the first).
+    assert call_count["n"] >= 2
+    # Logged the timeout warning at least once.
+    timeout_warnings = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "runner_claim_timeout"
+    ]
+    assert timeout_warnings, (
+        f"expected at least one 'runner_claim_timeout' warning, saw: "
+        f"{fake_log.warning.call_args_list!r}"
+    )
+
+
 async def test_runner_loop_survives_heartbeat_settings_store_error(
     queue: JobQueue, monkeypatch: pytest.MonkeyPatch
 ) -> None:
