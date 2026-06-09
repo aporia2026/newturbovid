@@ -27,12 +27,16 @@ operator can configure them, but they have no effect on the output.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
+from bulkvid.adapters.rendi import normalize_aspect_ratio
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_IMAGE_DOWNLOAD_FAILED,
@@ -55,9 +59,53 @@ async def _download(url: str, *, timeout: float = 60.0) -> bytes:
         return resp.content
 
 
-def _slug(row_num: int, job_id: str | None = None) -> str:
-    job_part = (job_id or "job").replace("/", "_")
-    return f"{job_part}_r{row_num}_{int(time.time())}"
+def _slug_segment(value: str, *, fallback: str = "na") -> str:
+    """Normalize a free-text segment for use inside a storage object key:
+    lowercase, collapse runs of non-alphanumerics into a single ``-``, trim
+    leading/trailing ``-``. Empty/whitespace input yields ``fallback`` so we
+    never produce a name with ``__`` runs from blank cells."""
+    out = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return out or fallback
+
+
+def _country_code(value: str, *, fallback: str = "NA") -> str:
+    """Country codes are conventionally uppercase ISO-style (``DE``, ``MX``).
+    Keep them uppercase in the filename for at-a-glance recognition."""
+    out = re.sub(r"[^A-Z0-9]+", "", (value or "").upper())
+    return out or fallback
+
+
+def _size_slug(aspect_ratio: str) -> str:
+    """``9:16`` → ``9x16``. ``:`` is unfriendly in URLs and filenames; ``x`` is
+    the conventional separator for pixel sizes. Falls back through
+    ``normalize_aspect_ratio`` so weird inputs (``09:16``, ``WxH`` pixel
+    inputs, ``auto``) all land on a known-good string first."""
+    return normalize_aspect_ratio(aspect_ratio).replace(":", "x")
+
+
+def _image_object_key(row: TextOnImgRow, *, now: datetime | None = None) -> str:
+    """Build a readable, sortable storage key for the composed PNG.
+
+    Shape: ``bulkvid/text_on_img/{COUNTRY}_{vertical}_{date}_{size}_r{row}_{6hex}.png``.
+    Each segment is bounded:
+      * country: 2-4 char ISO-style code, uppercase
+      * vertical: slugified, capped at 40 chars (operators occasionally
+        paste long taglines into the column)
+      * date: UTC ``YYYY-MM-DD`` so dates sort lexicographically
+      * size: aspect ratio with ``:`` replaced by ``x``
+      * row: sheet row number — gives inter-row uniqueness within a batch
+      * 6 hex: ``uuid4().hex[:6]`` — prevents collisions on same-row
+        regenerations in the same UTC day (operator might re-run, parallel
+        in-flight jobs, etc.).
+    """
+    n = now or datetime.now(timezone.utc)
+    country = _country_code(row.country)
+    vertical = _slug_segment(row.vertical, fallback="general")[:40]
+    date_part = n.strftime("%Y-%m-%d")
+    size = _size_slug(row.aspect_ratio)
+    short = uuid.uuid4().hex[:6]
+    fname = f"{country}_{vertical}_{date_part}_{size}_r{row.row_num}_{short}.png"
+    return f"bulkvid/text_on_img/{fname}"
 
 
 def _is_valid_http_url(url: str) -> bool:
@@ -84,7 +132,7 @@ async def process_text_on_img_row(
     set_context(batch_id=job_id, row_num=row.row_num)
     t0 = time.monotonic()
     costs = _Costs()
-    slug = _slug(row.row_num, job_id)
+    object_key = _image_object_key(row)
     metadata: dict[str, Any] = {
         "row_num": row.row_num,
         "country": row.country,
@@ -149,7 +197,7 @@ async def process_text_on_img_row(
         try:
             composed_upload = await clients.storage.upload_bytes(
                 composed_bytes,
-                key=f"bulkvid/text_on_img/{slug}/composed.png",
+                key=object_key,
                 content_type="image/png",
             )
             costs.storage += composed_upload.cost_usd

@@ -105,7 +105,8 @@ def _row(
 @respx.mock
 async def test_happy_path_returns_one_image_url() -> None:
     """Happy path: manual image downloaded, composed PNG uploaded, one URL
-    returned, status SUCCESS."""
+    returned, status SUCCESS. The storage key includes country, vertical,
+    UTC date, size, row number, and a short uniqueness tail."""
     respx.get("https://example.com/ad.png").mock(
         return_value=httpx.Response(200, content=_src_png()),
     )
@@ -116,16 +117,21 @@ async def test_happy_path_returns_one_image_url() -> None:
     assert result.status == STATUS_SUCCESS
     assert len(result.video_urls) == 1
     assert result.video_urls[0].startswith("https://storage.test/bulkvid/text_on_img/")
-    assert result.video_urls[0].endswith("/composed.png")
+    assert result.video_urls[0].endswith(".png")
     assert result.metadata["tab"] == "text_on_img"
     assert result.metadata["overlay_chars"] > 0
     assert result.metadata["composed_image_bytes"] > 1024
-    # Exactly ONE storage upload — the composed image. No VO upload, no
-    # captioned-video upload, no source-image upload.
+    # Exactly ONE storage upload — the composed image.
     assert len(storage.calls) == 1
     key, content_type, _ = storage.calls[0]
     assert content_type == "image/png"
-    assert key.endswith("/composed.png")
+    # Filename carries the row's identifying metadata so the URL is readable
+    # when it lands in the Ready Image cell.
+    filename = key.rsplit("/", 1)[-1]
+    assert filename.startswith("ES_real-estate_")    # COUNTRY_vertical_…
+    assert "_9x16_" in filename                       # size with : -> x
+    assert "_r2_" in filename                         # sheet row 2
+    assert filename.endswith(".png")
 
 
 @respx.mock
@@ -218,3 +224,89 @@ async def test_cost_breakdown_only_storage() -> None:
     breakdown = result.metadata["cost_breakdown"]
     assert set(breakdown.keys()) == {"storage"}
     assert breakdown["storage"] > 0
+
+
+# ── Object-key naming ───────────────────────────────────────────────────────
+
+
+import re
+from datetime import datetime, timezone
+
+from bulkvid.orchestrator.row_processor_text_on_img import _image_object_key
+
+
+def test_image_object_key_full_shape() -> None:
+    """Full shape: bulkvid/text_on_img/COUNTRY_vertical_YYYY-MM-DD_WxH_rN_HEX.png."""
+    row = TextOnImgRow(
+        row_num=7,
+        country="de",                         # lowercased input -> uppercased in name
+        vertical="Car Deals PR",              # gets slugified to lowercase-dashed
+        article_url="",
+        manual_image_url="https://x/y.png",
+        text="ignored for naming",
+        voice_over=False, zapcap=False,
+        aspect_ratio="09:16",                 # leading zero gets normalized -> 9x16
+        script_pattern="", open_comments="",
+    )
+    key = _image_object_key(row, now=datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc))
+
+    assert key.startswith("bulkvid/text_on_img/")
+    assert re.fullmatch(
+        r"bulkvid/text_on_img/DE_car-deals-pr_2026-06-09_9x16_r7_[0-9a-f]{6}\.png",
+        key,
+    ), key
+
+
+def test_image_object_key_empty_fields_fall_back_gracefully() -> None:
+    """Blank country / vertical must not produce ``__`` runs in the name —
+    the slug helpers substitute readable fallbacks instead."""
+    row = TextOnImgRow(
+        row_num=3,
+        country="",                           # -> NA
+        vertical="",                          # -> general
+        article_url="", manual_image_url="https://x/y.png",
+        text="", voice_over=False, zapcap=False,
+        aspect_ratio="1:1",
+        script_pattern="", open_comments="",
+    )
+    key = _image_object_key(row, now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    fname = key.rsplit("/", 1)[-1]
+
+    assert "__" not in fname     # no empty segments
+    assert fname.startswith("NA_general_2026-01-01_1x1_r3_")
+    assert fname.endswith(".png")
+
+
+def test_image_object_key_handles_weird_vertical_chars() -> None:
+    """Verticals with slashes, ampersands, multiple spaces all collapse to
+    a single ``-`` between alphanumeric runs."""
+    row = TextOnImgRow(
+        row_num=5,
+        country="US",
+        vertical="Home & Garden / DIY  tools",
+        article_url="", manual_image_url="https://x/y.png",
+        text="", voice_over=False, zapcap=False,
+        aspect_ratio="9:16",
+        script_pattern="", open_comments="",
+    )
+    key = _image_object_key(row, now=datetime(2026, 6, 9, tzinfo=timezone.utc))
+    fname = key.rsplit("/", 1)[-1]
+
+    assert "home-garden-diy-tools" in fname
+    assert "  " not in fname     # no double spaces
+    assert "//" not in fname     # no path-traversal-ish runs
+
+
+def test_image_object_key_collisions_unlikely_across_runs() -> None:
+    """Two back-to-back keys for the same row must differ (random hex tail
+    prevents re-runs in the same UTC day from clobbering each other)."""
+    row = TextOnImgRow(
+        row_num=2,
+        country="DE", vertical="Car Deals PR",
+        article_url="", manual_image_url="https://x/y.png",
+        text="", voice_over=False, zapcap=False,
+        aspect_ratio="9:16",
+        script_pattern="", open_comments="",
+    )
+    keys = {_image_object_key(row) for _ in range(50)}
+    assert len(keys) == 50    # all distinct
