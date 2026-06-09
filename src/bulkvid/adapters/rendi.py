@@ -269,6 +269,24 @@ _OVERLAY_IMAGE_TEMPLATE = (
 )
 
 
+# Overlay a video on top of another video, with the OVERLAY's audio used
+# for output. Used by the avatar tab: in_1 is the AI-generated background
+# (silent), in_2 is the TikTok avatar video (carries the narration).
+# Avatar is scaled to a fixed width preserving aspect ratio, then placed
+# at (margin_x, height - overlay_h - margin_y) — bottom-left corner.
+# ``-shortest`` means the output ends when the shorter of the two inputs
+# ends; the avatar narration usually drives total length (the background
+# is padded to its expected ~8 s, and audio truncation would clip mid-word).
+_OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE = (
+    "-i {{in_1}} -i {{in_2}} "
+    '-filter_complex "[1:v]scale=__OVERLAY_W__:-1[av];'
+    '[0:v][av]overlay=__MARGIN_X__:H-h-__MARGIN_Y__" '
+    "-map 0:v -map 1:a "
+    "-c:v libx264 -pix_fmt yuv420p "
+    "-c:a aac -b:a 192k -shortest {{out_1}}"
+)
+
+
 def render_resize_command(width: int, height: int) -> str:
     return _RESIZE_TEMPLATE.replace("__W__", str(width)).replace("__H__", str(height))
 
@@ -323,6 +341,24 @@ def render_music_mix_command() -> str:
 
 def render_overlay_image_command() -> str:
     return _OVERLAY_IMAGE_TEMPLATE
+
+
+def render_overlay_video_bottom_left_command(
+    *, overlay_width_px: int, margin_x: int, margin_y: int,
+) -> str:
+    """Bottom-left video-on-video overlay with audio from the overlay.
+
+    Pixel-precise pin positions (no W*0.30 expressions — ffmpeg's scale
+    filter rejects those). Used by the ``video with avatar`` row
+    processor: caller computes ``overlay_width_px`` from the row's
+    aspect ratio (e.g. 30 % of 1080 = 324 px).
+    """
+    return (
+        _OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE
+        .replace("__OVERLAY_W__", str(overlay_width_px))
+        .replace("__MARGIN_X__", str(margin_x))
+        .replace("__MARGIN_Y__", str(margin_y))
+    )
 
 
 def render_cartoon_concat_command(
@@ -783,6 +819,40 @@ class RendiClient:
         url, command_id = await self._submit_and_poll(
             render_overlay_image_command(),
             {"in_1": video_url, "in_2": overlay_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def overlay_video_bottom_left(
+        self,
+        background_video_url: str,
+        overlay_video_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        overlay_width_px: int,
+        margin_x: int = 40,
+        margin_y: int = 40,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Composite ``overlay_video_url`` at the bottom-left of
+        ``background_video_url`` and use the OVERLAY's audio for output.
+
+        Used by the ``video with avatar`` tab: the background is the
+        silent 8 s concatenated kie/Seedance clip, the overlay is the
+        TikTok Symphony avatar video (carries narration audio). Scales
+        the overlay to ``overlay_width_px`` preserving aspect ratio.
+        Auto-retried.
+        """
+        url, command_id = await self._submit_and_poll(
+            render_overlay_video_bottom_left_command(
+                overlay_width_px=overlay_width_px,
+                margin_x=margin_x,
+                margin_y=margin_y,
+            ),
+            {"in_1": background_video_url, "in_2": overlay_video_url},
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,

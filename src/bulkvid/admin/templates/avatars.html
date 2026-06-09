@@ -1,0 +1,66 @@
+{% extends "_base.html" %}
+
+{% block title %}TikTok Avatars · TurboVid Admin{% endblock %}
+
+{% block content %}
+<p><a href="/admin/">← Back to dashboard</a></p>
+
+<div class="card">
+  <h2 style="margin-top:0">TikTok Symphony avatars</h2>
+  <p class="label">
+    Pick an avatar and paste its <b>Avatar ID</b> into the <code>Avatar ID</code>
+    column on the <b>video with avatar</b> sheet tab. The avatar narrates the
+    operator-generated script over an AI-generated background video.
+  </p>
+
+  {% if error %}
+    <p style="color:var(--danger)">⚠ {{ error }}</p>
+    <p class="label" style="font-size:12px">
+      Common causes:
+      <ul style="margin-top:4px">
+        <li><code>TIKTOK_ACCESS_TOKEN</code> env var not set on this host</li>
+        <li>Token expired or revoked</li>
+        <li>TikTok's avatar list endpoint moved
+            (override via <code>TIKTOK_AVATAR_LIST_URL</code> env var)</li>
+      </ul>
+    </p>
+  {% else %}
+    <p class="label">{{ count }} avatar{{ '' if count == 1 else 's' }} available.</p>
+  {% endif %}
+</div>
+
+{% if avatars %}
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-top:14px">
+    {% for a in avatars %}
+      <div class="card" style="padding:12px">
+        {% if a.preview_url %}
+          <img src="{{ a.preview_url }}" alt="{{ a.name }}"
+               style="width:100%;aspect-ratio:1/1;object-fit:cover;border-radius:8px;background:#eee"
+               loading="lazy">
+        {% else %}
+          <div style="width:100%;aspect-ratio:1/1;background:#eee;border-radius:8px;
+                      display:flex;align-items:center;justify-content:center;color:#999">
+            no preview
+          </div>
+        {% endif %}
+        <div style="margin-top:10px">
+          <div style="font-weight:600;font-size:14px">
+            {{ a.name or '(unnamed)' }}
+            {% if a.gender %}
+              <span class="label" style="font-weight:400;font-size:12px">· {{ a.gender }}</span>
+            {% endif %}
+          </div>
+          <code style="display:block;font-size:12px;margin-top:4px;word-break:break-all">
+            {{ a.avatar_id }}
+          </code>
+          <button type="button"
+                  onclick="navigator.clipboard.writeText('{{ a.avatar_id }}').then(()=>{this.textContent='Copied'; setTimeout(()=>this.textContent='Copy ID', 1500)})"
+                  style="margin-top:8px;width:100%">
+            Copy ID
+          </button>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
+{% endblock %}

@@ -101,6 +101,29 @@ class SimpleRow:
 
 
 @dataclass
+class AvatarRow:
+    """``video with avatar`` tab input row — 8 s video with two
+    AI-generated scenes (4 s each) narrated by a TikTok Symphony avatar
+    composited at the bottom-left. Exactly one ``Ready Video`` is
+    written back. Plan ``_plans/2026-06-09-video-with-avatar-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str             # blank → text-to-image; else image-to-image seed
+    avatar_id: str                    # TikTok Symphony avatar id (per row)
+    voice_over: bool                  # default True — the avatar narrates
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    cta_enabled: bool                 # Yes/No — yellow pill at bottom if Yes
+    cta_text: str                     # blank → per-language fallback
+    open_comments: str
+
+
+@dataclass
 class TextOnImgRow:
     """``paste text on img`` tab input row — one video from the user's
     Manual Image with the operator-typed ``text`` overlaid in the center

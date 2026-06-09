@@ -17,6 +17,7 @@ const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
 const TAB_TEXT_ON_IMG = 'text_on_img';
+const TAB_AVATAR = 'avatar';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -113,6 +114,19 @@ const TEXT_ON_IMG_COLS = {
   lastInputCol: 10,
 };
 
+// video with avatar (2026-06-09): A-D from Image-VO, plus Avatar ID at E,
+// shifted F-I, then CTA Yes/No + CTA Text mirroring cartoon, then Open
+// Comments + Ready Video. One video per row, so Ready Video lands at M.
+const AVATAR_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  avatarId: 5,
+  voiceOver: 6, zapcap: 7, aspectRatio: 8, scriptPattern: 9,
+  ctaEnabled: 10, ctaText: 11,
+  openComments: 12,
+  readyVideo1: 13,
+  lastInputCol: 12,
+};
+
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
 const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
@@ -171,6 +185,10 @@ function configureBackendUrl() {
 function _detectTabType(sheet) {
   // Detect by sheet NAME first (these tabs share the Image-VO columns).
   const name = String(sheet.getName() || '').toLowerCase().trim();
+  // "video with avatar" / "avatar" -> kie+seedance scenes + TikTok avatar
+  // narration overlaid at bottom-left (2026-06-09). Checked BEFORE
+  // generic name matches.
+  if (name.indexOf('avatar') !== -1) return TAB_AVATAR;
   // "paste text on img" -> manual image + center-overlay text (2026-06-09).
   // Checked BEFORE "simple" because the name doesn't contain "simple" — but
   // ordered up top alongside the other name-based detections for clarity.
@@ -297,6 +315,30 @@ function _readCartoonRow(sheet, rowNum) {
 }
 
 
+function _readAvatarRow(sheet, rowNum) {
+  // video with avatar: A-D from Image-VO, plus Avatar ID at E. The Avatar
+  // ID is the TikTok Symphony avatar to narrate the video — operator picks
+  // from /admin/avatars and pastes the ID here. CTA columns mirror cartoon.
+  const cols = AVATAR_COLS;
+  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  return {
+    row_num: rowNum,
+    country: _cell(values, cols.country),
+    vertical: _cell(values, cols.vertical),
+    article_url: _cell(values, cols.article),
+    manual_image_url: _cell(values, cols.manualImage),
+    avatar_id: _cell(values, cols.avatarId).slice(0, 64),
+    voice_over: _yes(_cell(values, cols.voiceOver), true),
+    zapcap: _yes(_cell(values, cols.zapcap), false),
+    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    script_pattern: _cell(values, cols.scriptPattern),
+    cta_enabled: _yes(_cell(values, cols.ctaEnabled), false),
+    cta_text: _cell(values, cols.ctaText).slice(0, 80),
+    open_comments: _cell(values, cols.openComments),
+  };
+}
+
+
 function _readTextOnImgRow(sheet, rowNum) {
   // paste text on img: Image-VO columns A-D, plus Text (E), then F-J shifted
   // right by 1. The Text column is the overlay text — bounded at 240 chars
@@ -368,6 +410,13 @@ function _validateFourImages(r) {
   if (!r.article_url) return 'article URL missing';
   if (r.how_many < 1 || r.how_many > 4) return 'how_many must be 1..4';
   if (r.image_urls.length !== r.how_many) return 'need ' + r.how_many + ' image URLs';
+  return null;
+}
+
+
+function _validateAvatar(r) {
+  if (!r.article_url) return 'article URL missing';
+  if (!r.avatar_id) return 'avatar ID missing — pick one from /admin/avatars';
   return null;
 }
 
@@ -473,6 +522,7 @@ function generateAllUnprocessed() {
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
+    : tabType === TAB_AVATAR ? AVATAR_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -498,11 +548,13 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_CARTOON ? _readCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
+    : tabType === TAB_AVATAR ? _readAvatarRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
+    : tabType === TAB_AVATAR ? _validateAvatar
     : _validateImageVO;
 
   let rows = [];
@@ -531,6 +583,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
+      : tabType === TAB_AVATAR ? AVATAR_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -572,6 +625,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
   else if (tabType === TAB_TEXT_ON_IMG) payload.rows_text_on_img = rows;
+  else if (tabType === TAB_AVATAR) payload.rows_avatar = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);

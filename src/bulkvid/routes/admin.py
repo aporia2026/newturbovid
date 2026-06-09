@@ -271,3 +271,44 @@ async def job_logs(
         "logs.html",
         {"job_id": job_id, "row": row, "lines": lines, "exists": exists},
     )
+
+
+# ── TikTok Symphony avatars (browse) ─────────────────────────────────────────
+
+
+@router.get("/avatars", response_class=HTMLResponse)
+async def avatars_page(
+    request: Request, _user: str = Depends(_check_admin)
+) -> HTMLResponse:
+    """List available TikTok Symphony avatars with previews + IDs so the
+    operator can pick one and paste the id into the ``video with avatar``
+    tab's Avatar ID column. Plan
+    ``_plans/2026-06-09-video-with-avatar-tab.md``."""
+    from bulkvid.adapters.tiktok_avatar import (
+        TikTokAvatarClient,
+        TikTokAvatarError,
+    )
+
+    error: str | None = None
+    avatars: list[dict[str, str]] = []
+    try:
+        client = TikTokAvatarClient()
+        entries = await client.list_avatars()
+        avatars = [
+            {
+                "avatar_id": e.avatar_id,
+                "name": e.name,
+                "gender": e.gender,
+                "preview_url": e.preview_url,
+            }
+            for e in entries
+        ]
+    except TikTokAvatarError as e:
+        error = str(e)
+    except Exception as e:    # broad: env var missing, network, etc.
+        error = f"{type(e).__name__}: {e!s}"
+    return templates.TemplateResponse(
+        request,
+        "avatars.html",
+        {"avatars": avatars, "error": error, "count": len(avatars)},
+    )

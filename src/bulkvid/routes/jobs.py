@@ -27,6 +27,7 @@ from bulkvid.logging import get_logger, read_job_log_lines
 from bulkvid.models.row import (
     CardChoice,
     CartoonRow,
+    AvatarRow,
     FourImagesVO2Row,
     ImageVORow,
     SimpleRow,
@@ -36,6 +37,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     JOB_RUNNING,
+    TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
@@ -126,6 +128,26 @@ class SimpleX4RowIn(BaseModel):
     open_comments: str = ""
 
 
+class AvatarRowIn(BaseModel):
+    """Wire shape for the ``video with avatar`` tab — Image-VO inputs
+    plus a per-row ``avatar_id`` (TikTok Symphony) and CTA columns
+    mirroring cartoon. Plan ``_plans/2026-06-09-video-with-avatar-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_url: str = ""   # optional — empty = text-to-image
+    avatar_id: str               # required — pick from /admin/avatars
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
 class TextOnImgRowIn(BaseModel):
     """Wire shape for the ``paste text on img`` tab — Image-VO inputs plus
     the operator-typed ``text`` to overlay on the manual image. Plan
@@ -158,6 +180,8 @@ class SubmitJobIn(BaseModel):
     rows_simple_x4: list[SimpleX4RowIn] | None = None
     # paste text on img: manual image + center-overlay text (plan 2026-06-09).
     rows_text_on_img: list[TextOnImgRowIn] | None = None
+    # video with avatar: 2-shot kie/Seedance + TikTok avatar overlay (plan 2026-06-09).
+    rows_avatar: list[AvatarRowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -203,6 +227,31 @@ def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
         aspect_ratio=r.aspect_ratio,
         script_pattern=r.script_pattern,
         cards=cards,
+        open_comments=r.open_comments,
+    )
+
+
+def _build_avatar_row(r: AvatarRowIn) -> AvatarRow:
+    """Coerce an AvatarRowIn into an AvatarRow.
+
+    Server-side hardening:
+      * ``avatar_id`` trimmed; row is rejected if blank (the row
+        processor also guards this — defense in depth).
+      * ``cta_text`` truncated at 80 chars (matches cartoon's bound).
+    """
+    return AvatarRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=r.manual_image_url,
+        avatar_id=(r.avatar_id or "").strip()[:64],
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
         open_comments=r.open_comments,
     )
 
@@ -463,6 +512,14 @@ async def submit_job(
             )
         rows = [
             _build_text_on_img_row(r) for r in payload.rows_text_on_img
+        ]
+    elif payload.tab_type == TAB_AVATAR:
+        if not payload.rows_avatar:
+            raise HTTPException(
+                400, "rows_avatar is required for tab_type=avatar"
+            )
+        rows = [
+            _build_avatar_row(r) for r in payload.rows_avatar
         ]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")

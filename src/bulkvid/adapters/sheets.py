@@ -37,6 +37,7 @@ from bulkvid.models.row import (
     SimpleX4Row,
 )
 from bulkvid.orchestrator.queue import (
+    TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
@@ -233,6 +234,34 @@ class _CartoonCols:
 CARTOON_COLS = _CartoonCols()
 
 
+@dataclass(frozen=True)
+class _AvatarCols:
+    """Layout for the ``video with avatar`` tab (2026-06-09).
+
+    Image-VO columns A-D, then an Avatar ID column at E (per-row TikTok
+    Symphony avatar pick), then the Voice Over / ZapCap / aspect /
+    script-pattern columns shifted right by 1, then CTA Yes/No + Text
+    columns mirroring cartoon, then Open Comments + Ready Video.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image: int = 3     # D
+    avatar_id: int = 4        # E  (NEW — TikTok Symphony avatar id)
+    voice_over: int = 5       # F  (shifted from E)
+    zapcap: int = 6           # G
+    aspect_ratio: int = 7     # H
+    script_pattern: int = 8   # I
+    cta_enabled: int = 9      # J  (Yes/No dropdown)
+    cta_text: int = 10        # K
+    open_comments: int = 11   # L
+    ready_video_start: int = 12   # M = 0-indexed col 12
+
+
+AVATAR_COLS = _AvatarCols()
+
+
 # Header rows BEFORE data starts.
 #   - Image-VO / Simple / Cartoon / 4Images: 1 header row → data at sheet row 2
 #   - Simple x4 (post-migration): 2 header rows (row 1 = template previews,
@@ -246,6 +275,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
     TAB_TEXT_ON_IMG: 1,
+    TAB_AVATAR: 1,
 }
 
 
@@ -432,6 +462,8 @@ class SheetsClient:
             col = SIMPLE_X4_COLS.ready_video_start
         elif layout == TAB_TEXT_ON_IMG:
             col = TEXT_ON_IMG_COLS.ready_video_start
+        elif layout == TAB_AVATAR:
+            col = AVATAR_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -724,6 +756,8 @@ class SheetsClient:
                 if tab_type == TAB_SIMPLE_X4
                 else TEXT_ON_IMG_COLS.ready_video_start
                 if tab_type == TAB_TEXT_ON_IMG
+                else AVATAR_COLS.ready_video_start
+                if tab_type == TAB_AVATAR
                 else None
             )
             if ready_start is None:

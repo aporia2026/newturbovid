@@ -30,6 +30,7 @@ from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_INTERNAL_ERROR,
     STATUS_ROW_TIMEOUT,
+    AvatarRow,
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
@@ -41,6 +42,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
+from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
@@ -77,6 +79,7 @@ _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
 _TAB_SIMPLE_X4 = "simple_x4"
 _TAB_TEXT_ON_IMG = "text_on_img"
+_TAB_AVATAR = "avatar"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
@@ -90,6 +93,10 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # text_on_img is essentially simple + one Pillow text-overlay step
     # (CPU, sub-second). Same budget as simple.
     _TAB_TEXT_ON_IMG: 720.0,
+    # avatar adds a TikTok Symphony call (30-90s typical) to the cartoon
+    # flow. Same 20-min ceiling — multi-shot planner + image-gen + the
+    # parallel avatar call all fit in the cartoon budget.
+    _TAB_AVATAR: 1200.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -101,6 +108,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
     # text_on_img reuses the simple timeout — same shape of work + overlay.
     _TAB_TEXT_ON_IMG: SETTING_ROW_TIMEOUT_SIMPLE,
+    # avatar reuses cartoon's timeout — multi-shot pipeline + TikTok poll.
+    _TAB_AVATAR: SETTING_ROW_TIMEOUT_CARTOON,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -116,6 +125,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_SIMPLE_X4
     if isinstance(row, TextOnImgRow):
         return _TAB_TEXT_ON_IMG
+    if isinstance(row, AvatarRow):
+        return _TAB_AVATAR
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -198,6 +209,8 @@ async def _dispatch_to_processor(
         return await process_simple_x4_row(row, clients, job_id=job_id)
     if isinstance(row, TextOnImgRow):
         return await process_text_on_img_row(row, clients, job_id=job_id)
+    if isinstance(row, AvatarRow):
+        return await process_avatar_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):
