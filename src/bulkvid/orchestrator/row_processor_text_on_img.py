@@ -207,9 +207,17 @@ async def process_text_on_img_row(
         try:
             source_image_bytes = await _download(row.manual_image_url, timeout=60.0)
         except Exception as e:
+            # httpx errors sometimes stringify to "" (e.g. ConnectError on
+            # a TLS handshake failure). Include the exception class AND the
+            # URL host so the sidebar surfaces an actionable cause —
+            # "manual image download failed: " with nothing after the colon
+            # is the worst possible debugging signal.
+            url_host = (row.manual_image_url or "")[:80]
+            err_str = str(e) or repr(e) or type(e).__name__
             return _fail(
                 row, STATUS_IMAGE_DOWNLOAD_FAILED,
-                f"manual image download failed: {e!s}",
+                f"manual image download failed ({type(e).__name__}): "
+                f"{err_str} — url={url_host}",
                 t0, costs, metadata,
             )
 

@@ -42,6 +42,7 @@ from bulkvid.orchestrator.queue import (
     TAB_IMAGE_VO,
     TAB_SIMPLE,
     TAB_SIMPLE_X4,
+    TAB_TEXT_ON_IMG,
 )
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
@@ -180,6 +181,31 @@ SIMPLE_X4_COLS = _SimpleX4Cols()
 
 
 @dataclass(frozen=True)
+class _TextOnImgCols:
+    """Layout for the ``paste text on img`` tab (2026-06-09).
+
+    Image-VO columns A-D, then a ``text`` column at E (the overlay text),
+    then the standard F-J input columns shifted right by 1. Writes back
+    exactly ONE Ready Video URL to column K.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image: int = 3     # D
+    text: int = 4             # E  (NEW — overlay text)
+    voice_over: int = 5       # F  (shifted from E)
+    zapcap: int = 6           # G  (shifted from F)
+    aspect_ratio: int = 7     # H  (shifted from G)
+    script_pattern: int = 8   # I  (shifted from H)
+    open_comments: int = 9    # J  (shifted from I)
+    ready_video_start: int = 10  # K = 0-indexed col 10 (shifted from 9)
+
+
+TEXT_ON_IMG_COLS = _TextOnImgCols()
+
+
+@dataclass(frozen=True)
 class _CartoonCols:
     """Layout for the ``cartoon`` tab after the 2026-06-08 CTA column insertion.
 
@@ -219,6 +245,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_SIMPLE: 1,
     TAB_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
+    TAB_TEXT_ON_IMG: 1,
 }
 
 
@@ -403,6 +430,8 @@ class SheetsClient:
             col = FOUR_IMAGES_COLS.ready_video_start
         elif layout == TAB_SIMPLE_X4:
             col = SIMPLE_X4_COLS.ready_video_start
+        elif layout == TAB_TEXT_ON_IMG:
+            col = TEXT_ON_IMG_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -693,6 +722,8 @@ class SheetsClient:
                 if tab_type == TAB_FOUR_IMAGES
                 else SIMPLE_X4_COLS.ready_video_start
                 if tab_type == TAB_SIMPLE_X4
+                else TEXT_ON_IMG_COLS.ready_video_start
+                if tab_type == TAB_TEXT_ON_IMG
                 else None
             )
             if ready_start is None:
