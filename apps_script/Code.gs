@@ -142,6 +142,7 @@ function onOpen() {
     .addItem('Generate all unprocessed', 'generateAllUnprocessed')
     .addSeparator()
     .addItem('Show job status sidebar', 'showJobsSidebar')
+    .addItem('Pick avatar for current row…', 'pickAvatarForCurrentRow')
     .addSeparator()
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Configure backend URL', 'configureBackendUrl')
@@ -1039,4 +1040,77 @@ function killAllJobs() {
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
+}
+
+
+// ─── Avatar picker (in-sheet modal) ──────────────────────────────────────────
+//
+// Opens a modal dialog showing every TikTok Symphony avatar (thumbnail +
+// name + gender). Operator clicks one, dialog closes, the avatar_id is
+// written to the row's Avatar ID cell + a friendly note. Backed by the
+// bearer-authed GET /jobs/avatars endpoint, which fetches live from
+// TikTok with cache fallback (same data the /admin/avatars page shows).
+
+function pickAvatarForCurrentRow() {
+  const ui = SpreadsheetApp.getUi();
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const tabType = _detectTabType(sheet);
+  if (tabType !== TAB_AVATAR) {
+    ui.alert(
+      'Avatar picker only works on the "video with avatar" tab. ' +
+      'Active tab type: ' + (tabType || 'unknown')
+    );
+    return;
+  }
+  const cell = sheet.getActiveCell();
+  const row = cell.getRow();
+  if (row < 2) {
+    ui.alert('Click on a data row (row 2 or below) first.');
+    return;
+  }
+  // Stash the target row in DocumentProperties so the HTML callback
+  // can find it after the dialog opens and the active cell drifts.
+  PropertiesService.getDocumentProperties()
+    .setProperty('AVATAR_PICK_TARGET_ROW', String(row));
+
+  const html = HtmlService.createHtmlOutputFromFile('AvatarPicker')
+    .setWidth(960)
+    .setHeight(720);
+  ui.showModalDialog(html, 'Pick an avatar for row ' + row);
+}
+
+
+/** Called from the AvatarPicker modal: fetch the catalog from the backend.
+ *  Returns the same shape as the FastAPI route — see GET /jobs/avatars. */
+function getAvatarCatalog() {
+  try {
+    return _fetchJson('/jobs/avatars', { method: 'get' });
+  } catch (e) {
+    return {
+      avatars: [],
+      source: 'empty',
+      error: String((e && e.message) || e),
+    };
+  }
+}
+
+
+/** Called from the AvatarPicker modal when the operator clicks an avatar.
+ *  Writes the avatar_id into the previously-stashed target row + adds a
+ *  note showing the human-readable name + gender for context. */
+function setAvatarIdForPickedRow(avatarId, displayName, gender) {
+  const row = parseInt(
+    PropertiesService.getDocumentProperties()
+      .getProperty('AVATAR_PICK_TARGET_ROW') || '0',
+    10
+  );
+  if (!row) return { ok: false, error: 'no target row stashed' };
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const cell = sheet.getRange(row, AVATAR_COLS.avatarId);
+  cell.setValue(avatarId);
+  const noteParts = [];
+  if (displayName) noteParts.push(displayName);
+  if (gender) noteParts.push('(' + gender + ')');
+  cell.setNote(noteParts.length ? noteParts.join(' ') : '');
+  return { ok: true, row: row };
 }

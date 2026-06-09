@@ -86,6 +86,63 @@ async def load_catalog(store: SettingsStore) -> list[CatalogAvatar]:
     return _decode(raw or "")
 
 
+def _entries_to_dicts(entries: list[CatalogAvatar]) -> list[dict[str, str]]:
+    return [
+        {
+            "avatar_id": e.avatar_id,
+            "name": e.name,
+            "gender": e.gender,
+            "preview_url": e.preview_url,
+        }
+        for e in entries
+    ]
+
+
+async def fetch_or_load_catalog(
+    store: SettingsStore,
+    *,
+    updated_by: str = "auto-fetch",
+) -> tuple[list[dict[str, str]], str, str | None]:
+    """Live-fetch from TikTok with cache fallback.
+
+    Tries the live endpoint first. On success: replaces the cache and
+    returns ``("live", avatars, None)``. On failure: returns the cached
+    list with the error so the caller can surface it inline.
+
+    Returns ``(avatars, source, error)`` where ``source`` is
+    ``"live" | "cache" | "empty"``.
+    """
+    # Local import to keep the catalog module free of adapter cycles.
+    from bulkvid.adapters.tiktok_avatar import (
+        TikTokAvatarClient,
+        TikTokAvatarError,
+    )
+
+    error: str | None = None
+    try:
+        client = TikTokAvatarClient()
+        live = await client.list_avatars()
+        as_dicts = [
+            {
+                "avatar_id": e.avatar_id,
+                "name": e.name,
+                "gender": e.gender,
+                "preview_url": e.preview_url,
+            }
+            for e in live
+        ]
+        await replace_catalog(store, as_dicts, updated_by=updated_by)
+        return as_dicts, ("live" if as_dicts else "empty"), None
+    except TikTokAvatarError as e:
+        error = str(e)
+    except Exception as e:    # noqa: BLE001 — broad: env var missing, network, etc.
+        error = f"{type(e).__name__}: {e!s}"
+
+    cached = await load_catalog(store)
+    cached_dicts = _entries_to_dicts(cached)
+    return cached_dicts, ("cache" if cached_dicts else "empty"), error
+
+
 async def replace_catalog(
     store: SettingsStore,
     entries: list[dict[str, str]],

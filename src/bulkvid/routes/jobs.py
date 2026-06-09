@@ -763,3 +763,47 @@ async def kill_job(
         ) from e
     _log.info("job_kill", job_id=job_id, by=identity.email, killed=killed)
     return {"job_id": job_id, "killed": killed}
+
+
+# ── Avatar catalog (for Apps Script's in-sheet picker) ───────────────────────
+#
+# The ``video with avatar`` tab needs a way for operators to pick avatars
+# WITHOUT leaving the sheet. This endpoint returns the cached catalog as
+# JSON, bearer-authed against the user's Google OAuth ID token — same
+# auth pattern as every other /jobs/* endpoint. Apps Script calls it
+# via ``pollAvatars()`` to populate the in-sheet picker modal.
+
+
+class AvatarPickerEntry(BaseModel):
+    avatar_id: str
+    name: str
+    gender: str
+    preview_url: str
+
+
+class AvatarPickerOut(BaseModel):
+    avatars: list[AvatarPickerEntry]
+    source: str               # "live" | "cache" | "empty"
+    error: str | None
+
+
+@router.get("/avatars", response_model=AvatarPickerOut)
+async def list_avatars_for_picker(
+    request: Request,
+    identity: Identity = Depends(get_identity),
+) -> AvatarPickerOut:
+    """Return the avatar catalog as JSON for the Apps Script picker.
+    Same fetch-with-cache-fallback strategy as /admin/avatars."""
+    from bulkvid.pipeline.avatar_catalog import fetch_or_load_catalog
+
+    store = getattr(request.app.state, "settings_store", None)
+    if store is None:
+        raise HTTPException(500, "settings_store not configured")
+    avatars, source, error = await fetch_or_load_catalog(
+        store, updated_by=identity.email or "sheet-picker",
+    )
+    return AvatarPickerOut(
+        avatars=[AvatarPickerEntry(**a) for a in avatars],
+        source=source,
+        error=error,
+    )

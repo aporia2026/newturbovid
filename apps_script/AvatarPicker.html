@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    :root {
+      --c-text: #202124;
+      --c-muted: #5f6368;
+      --c-border: #dadce0;
+      --c-bg: #ffffff;
+      --c-bg-alt: #f8f9fa;
+      --c-blue: #1a73e8;
+      --c-blue-soft: #e8f0fe;
+      --c-red: #d93025;
+      --c-amber: #b06000;
+      --c-amber-soft: #fef7e0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   "Helvetica Neue", Arial, sans-serif;
+      margin: 0; padding: 12px; color: var(--c-text); font-size: 13px;
+      background: var(--c-bg);
+    }
+
+    .topbar {
+      display: flex; gap: 10px; align-items: center; margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .topbar input[type=search] {
+      flex: 1; min-width: 200px; padding: 8px 10px;
+      border: 1px solid var(--c-border); border-radius: 4px; font-size: 13px;
+    }
+    .topbar select {
+      padding: 8px 10px; border: 1px solid var(--c-border);
+      border-radius: 4px; font-size: 13px; background: white;
+    }
+    .topbar .status {
+      font-size: 12px; color: var(--c-muted); margin-left: auto;
+    }
+    .topbar .status.live   { color: #1e8e3e; }
+    .topbar .status.cache  { color: var(--c-amber); }
+    .topbar .status.empty  { color: var(--c-red); }
+
+    .error-block {
+      background: #fce8e6; border-radius: 4px; padding: 8px 10px;
+      margin-bottom: 12px; font-size: 12px; color: var(--c-red);
+      word-break: break-word;
+    }
+    .error-block pre {
+      margin: 4px 0 0 0; white-space: pre-wrap; word-break: break-word;
+      font-family: inherit; font-size: 11px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      border: 1px solid var(--c-border); border-radius: 8px; padding: 8px;
+      cursor: pointer; background: var(--c-bg); transition: 0.12s ease;
+    }
+    .card:hover {
+      border-color: var(--c-blue); background: var(--c-blue-soft);
+      transform: translateY(-1px);
+    }
+    .card img {
+      width: 100%; aspect-ratio: 1/1; object-fit: cover;
+      border-radius: 6px; background: #eee; display: block;
+    }
+    .card .no-thumb {
+      width: 100%; aspect-ratio: 1/1; border-radius: 6px;
+      background: #eee; display: flex; align-items: center;
+      justify-content: center; color: #999; font-size: 11px;
+    }
+    .card .name {
+      font-weight: 600; font-size: 12px; margin-top: 6px;
+      word-break: break-word; line-height: 1.3;
+    }
+    .card .meta {
+      font-size: 11px; color: var(--c-muted); margin-top: 2px;
+    }
+    .card .id {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10px; color: var(--c-muted); margin-top: 4px;
+      word-break: break-all; line-height: 1.2;
+    }
+
+    .empty, .loading {
+      padding: 40px 16px; text-align: center; color: var(--c-muted);
+      background: var(--c-bg-alt); border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <input type="search" id="search" placeholder="Search by name or ID…" autofocus>
+    <select id="gender-filter">
+      <option value="">All genders</option>
+      <option value="female">female</option>
+      <option value="male">male</option>
+      <option value="neutral">neutral</option>
+    </select>
+    <span class="status" id="status">Loading…</span>
+  </div>
+
+  <div id="error" style="display:none"></div>
+  <div id="content"><div class="loading">Loading avatars from TikTok…</div></div>
+
+  <script>
+    var STATE = { avatars: [], filtered: [] };
+
+    function _escape(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderStatus(source, count) {
+      var el = document.getElementById('status');
+      el.className = 'status ' + (source || 'empty');
+      if (source === 'live') {
+        el.textContent = '✓ ' + count + ' avatar' + (count === 1 ? '' : 's') + ' from TikTok';
+      } else if (source === 'cache') {
+        el.textContent = '⚠ ' + count + ' from cache (live fetch failed)';
+      } else {
+        el.textContent = 'No avatars available';
+      }
+    }
+
+    function renderError(error) {
+      var el = document.getElementById('error');
+      if (!error) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.className = 'error-block';
+      el.innerHTML =
+        '<div><b>Couldn\'t reach TikTok</b> — showing cached results if any.</div>' +
+        '<pre>' + _escape(error) + '</pre>';
+    }
+
+    function renderGrid(items) {
+      var content = document.getElementById('content');
+      if (!items.length) {
+        content.innerHTML =
+          '<div class="empty">No avatars match this filter. ' +
+          'Clear the search box / change the gender filter.</div>';
+        return;
+      }
+      var html = '<div class="grid">';
+      for (var i = 0; i < items.length; i++) {
+        var a = items[i];
+        html += '<div class="card" onclick="pick(\'' + _escape(a.avatar_id) +
+                '\', this.dataset.name, this.dataset.gender)"' +
+                ' data-name="' + _escape(a.name) + '"' +
+                ' data-gender="' + _escape(a.gender) + '">';
+        if (a.preview_url) {
+          html += '<img src="' + _escape(a.preview_url) + '" alt="' + _escape(a.name) + '"' +
+                  ' loading="lazy"' +
+                  ' onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">' +
+                  '<div class="no-thumb" style="display:none">preview expired</div>';
+        } else {
+          html += '<div class="no-thumb">no preview</div>';
+        }
+        html += '<div class="name">' + _escape(a.name || '(unnamed)') + '</div>';
+        if (a.gender) {
+          html += '<div class="meta">' + _escape(a.gender) + '</div>';
+        }
+        html += '<div class="id">' + _escape(a.avatar_id) + '</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+      content.innerHTML = html;
+    }
+
+    function applyFilter() {
+      var q = (document.getElementById('search').value || '').toLowerCase().trim();
+      var gender = document.getElementById('gender-filter').value;
+      var out = STATE.avatars.filter(function (a) {
+        if (gender && (a.gender || '').toLowerCase() !== gender) return false;
+        if (q) {
+          var hay = ((a.name || '') + ' ' + (a.avatar_id || '')).toLowerCase();
+          if (hay.indexOf(q) === -1) return false;
+        }
+        return true;
+      });
+      STATE.filtered = out;
+      renderGrid(out);
+    }
+
+    function pick(avatarId, displayName, gender) {
+      // Lock the UI while writing back so a double-click can't fire twice.
+      document.body.style.pointerEvents = 'none';
+      document.getElementById('status').textContent = 'Saving…';
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (r && r.ok) {
+            google.script.host.close();
+          } else {
+            alert('Could not write the avatar ID: ' + ((r && r.error) || 'unknown'));
+            document.body.style.pointerEvents = 'auto';
+          }
+        })
+        .withFailureHandler(function (e) {
+          alert('Write failed: ' + ((e && e.message) || e));
+          document.body.style.pointerEvents = 'auto';
+        })
+        .setAvatarIdForPickedRow(avatarId, displayName || '', gender || '');
+    }
+
+    function onCatalog(r) {
+      STATE.avatars = (r && r.avatars) || [];
+      renderStatus(r ? r.source : 'empty', STATE.avatars.length);
+      renderError(r && r.error);
+      applyFilter();
+    }
+
+    document.getElementById('search').addEventListener('input', applyFilter);
+    document.getElementById('gender-filter').addEventListener('change', applyFilter);
+
+    google.script.run
+      .withSuccessHandler(onCatalog)
+      .withFailureHandler(function (e) {
+        renderStatus('empty', 0);
+        renderError(String((e && e.message) || e));
+        document.getElementById('content').innerHTML =
+          '<div class="empty">Couldn\'t load the catalog. See error above.</div>';
+      })
+      .getAvatarCatalog();
+  </script>
+</body>
+</html>

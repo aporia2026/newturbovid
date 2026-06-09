@@ -320,57 +320,12 @@ async def avatars_page(
     """Auto-fetch from TikTok and render the list. Cache on success,
     fall back to cache on failure, surface the error either way so the
     operator can adjust env vars if needed."""
-    from bulkvid.adapters.tiktok_avatar import (
-        TikTokAvatarClient,
-        TikTokAvatarError,
-    )
-    from bulkvid.pipeline.avatar_catalog import (
-        load_catalog,
-        replace_catalog,
-    )
+    from bulkvid.pipeline.avatar_catalog import fetch_or_load_catalog
 
     store = _get_settings_store(request)
-    error: str | None = None
-
-    try:
-        client = TikTokAvatarClient()
-        live_entries = await client.list_avatars()
-        # Cache the live fetch so subsequent loads are instant and a
-        # transient TikTok blip doesn't blank the page.
-        await replace_catalog(
-            store,
-            [
-                {
-                    "avatar_id": e.avatar_id,
-                    "name": e.name,
-                    "gender": e.gender,
-                    "preview_url": e.preview_url,
-                }
-                for e in live_entries
-            ],
-            updated_by=user or "admin",
-        )
-        avatars = [
-            {
-                "avatar_id": e.avatar_id,
-                "name": e.name,
-                "gender": e.gender,
-                "preview_url": e.preview_url,
-            }
-            for e in live_entries
-        ]
-        source = "live" if avatars else "empty"
-    except TikTokAvatarError as e:
-        error = str(e)
-        cached = await load_catalog(store)
-        avatars = _entries_to_dicts(cached)
-        source = "cache" if avatars else "empty"
-    except Exception as e:    # broad: env var missing, network, etc.
-        error = f"{type(e).__name__}: {e!s}"
-        cached = await load_catalog(store)
-        avatars = _entries_to_dicts(cached)
-        source = "cache" if avatars else "empty"
-
+    avatars, source, error = await fetch_or_load_catalog(
+        store, updated_by=user or "admin",
+    )
     return _render_avatars_page(
         request, avatars=avatars, source=source, error=error,
     )
