@@ -287,6 +287,30 @@ _OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE = (
 )
 
 
+# Still-image background + avatar video overlay, in ONE ffmpeg call.
+# Used by the simplified avatar tab (chat 2026-06-09 /
+# ``_plans/2026-06-09-avatar-static-image-pipeline.md``): the avatar
+# now sits over a STATIC image (Manual Image as-is, or a single
+# kie text-to-image), not a Seedance-animated background. The image
+# is held for the entire avatar audio duration via ``-loop 1`` +
+# ``-shortest``. Same scale/crop logic as the existing silent-video
+# template so the background fills the target aspect cleanly; same
+# overlay positioning as ``_OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE`` so
+# the visual result matches the old animated path exactly.
+_STILL_IMAGE_AVATAR_OVERLAY_TEMPLATE = (
+    "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
+    '-filter_complex "'
+    "[0:v]scale=__W__:__H__:force_original_aspect_ratio=increase,"
+    "crop=__W__:__H__[bg];"
+    "[1:v]scale=__OVERLAY_W__:-1[av];"
+    "[bg][av]overlay=__MARGIN_X__:H-h-__MARGIN_Y__[v]"
+    '" '
+    '-map "[v]" -map 1:a '
+    "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
+    "-c:a aac -b:a 192k -shortest {{out_1}}"
+)
+
+
 def render_resize_command(width: int, height: int) -> str:
     return _RESIZE_TEMPLATE.replace("__W__", str(width)).replace("__H__", str(height))
 
@@ -355,6 +379,32 @@ def render_overlay_video_bottom_left_command(
     """
     return (
         _OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE
+        .replace("__OVERLAY_W__", str(overlay_width_px))
+        .replace("__MARGIN_X__", str(margin_x))
+        .replace("__MARGIN_Y__", str(margin_y))
+    )
+
+
+def render_still_image_avatar_overlay_command(
+    *,
+    width: int,
+    height: int,
+    overlay_width_px: int,
+    margin_x: int,
+    margin_y: int,
+) -> str:
+    """Still-image background + avatar video overlay (bottom-left),
+    with the avatar's audio as the only audio track.
+
+    Used by the simplified avatar tab. The background image is held
+    for the avatar audio's full length (``-loop 1`` + ``-shortest``);
+    no Seedance, no concat. Output dimensions are ``width`` x ``height``
+    derived from the row's aspect ratio.
+    """
+    return (
+        _STILL_IMAGE_AVATAR_OVERLAY_TEMPLATE
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
         .replace("__OVERLAY_W__", str(overlay_width_px))
         .replace("__MARGIN_X__", str(margin_x))
         .replace("__MARGIN_Y__", str(margin_y))
@@ -853,6 +903,46 @@ class RendiClient:
                 margin_y=margin_y,
             ),
             {"in_1": background_video_url, "in_2": overlay_video_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def still_image_with_avatar_overlay(
+        self,
+        background_image_url: str,
+        overlay_video_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        aspect_ratio: str,
+        overlay_width_px: int,
+        margin_x: int = 40,
+        margin_y: int = 40,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Render a video with a STILL image background and the TikTok
+        avatar video composited at the bottom-left.
+
+        Used by the avatar tab's simplified pipeline (chat 2026-06-09).
+        The background image is looped for the avatar audio's full
+        duration; output length = avatar duration. Avatar's audio is
+        the only audio track. Scales background to the row's aspect
+        ratio via cover+center-crop; scales the avatar to
+        ``overlay_width_px`` preserving its aspect ratio.
+
+        Replaces the old (concat_clips_with_audio + overlay_video_bottom_left)
+        pair for this tab — one Rendi command instead of two.
+        """
+        width, height = dimensions_for_ratio(aspect_ratio)
+        url, command_id = await self._submit_and_poll(
+            render_still_image_avatar_overlay_command(
+                width=width, height=height,
+                overlay_width_px=overlay_width_px,
+                margin_x=margin_x, margin_y=margin_y,
+            ),
+            {"in_1": background_image_url, "in_2": overlay_video_url},
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,

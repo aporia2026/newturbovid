@@ -38,6 +38,7 @@ from bulkvid.adapters.rendi import (
     render_fit_video_command,
     render_music_mix_command,
     render_resize_command,
+    render_still_image_avatar_overlay_command,
     render_stills_to_video_command,
 )
 
@@ -133,6 +134,44 @@ def test_fit_silent_command_has_no_audio() -> None:
     assert "{{in_2}}" not in cmd        # single input (image only)
     assert "-t 8" in cmd
     assert "1080" in cmd and "1350" in cmd
+
+
+def test_still_image_avatar_overlay_command_shape() -> None:
+    """Regression for the simplified avatar pipeline (chat 2026-06-09).
+
+    The command must:
+      * loop the still image input so it runs for the avatar's full length
+      * scale the background to the row's aspect (cover + center-crop)
+      * scale the avatar overlay to the requested width preserving aspect
+      * pin the overlay at the bottom-left at the requested margins
+      * map the OVERLAY's audio (in_2) — not the background's, the image
+        has no audio
+      * end when the overlay ends (-shortest), so a long looped image
+        doesn't pad the output past the avatar's narration
+      * leave Rendi placeholders ``{{in_1}}`` / ``{{in_2}}`` / ``{{out_1}}``
+        intact for the API substitution
+    """
+    cmd = render_still_image_avatar_overlay_command(
+        width=1080, height=1920,
+        overlay_width_px=324, margin_x=40, margin_y=40,
+    )
+    # Rendi placeholders preserved.
+    assert "{{in_1}}" in cmd and "{{in_2}}" in cmd and "{{out_1}}" in cmd
+    # Background image looped (so it lasts the avatar duration).
+    assert "-loop 1" in cmd
+    # Aspect-fit + cover-crop on the background.
+    assert "scale=1080:1920:force_original_aspect_ratio=increase" in cmd
+    assert "crop=1080:1920" in cmd
+    # Avatar scaled to the configured pixel width.
+    assert "scale=324:-1" in cmd
+    # Pinned at bottom-left with the requested margin.
+    assert "overlay=40:H-h-40" in cmd
+    # Avatar audio drives the output (not background — bg is silent image).
+    assert "-map 1:a" in cmd
+    # End on the shorter of the two inputs (i.e. the avatar video).
+    assert "-shortest" in cmd
+    # Tuned for still image input so libx264 picks the right rate-control.
+    assert "-tune stillimage" in cmd
 
 
 def test_music_mix_template_unchanged() -> None:

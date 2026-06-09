@@ -1,29 +1,41 @@
-"""Avatar row processor — 8 s video with two AI scenes + TikTok avatar narration.
+"""Avatar row processor — static-image background + TikTok avatar overlay.
 
-Pipeline (mirrors cartoon, with the TikTok avatar step replacing Gemini TTS):
+Pipeline (simplified 2026-06-09 per
+``_plans/2026-06-09-avatar-static-image-pipeline.md`` — was previously
+a 2-shot Seedance-animated cartoon with the avatar composited on top):
 
   1. Article fetch (Tavily → ScrapingBee)
-  2. language detect → classify Open Comments
-  3. generate_cartoon_plan with 1 idea × 2 shots — reuses the cartoon
-     planner (it already enforces brand-safety + character consistency).
-  4. In parallel:
-     a. Shot 1 image — image-to-image if ``manual_image_url`` set, else
-        text-to-image from the plan.
-     b. Shot 2 image — image-to-image chained on Shot 1 (consistent
-        character look) regardless of whether Shot 1 used a manual seed.
-     c. TikTok Symphony avatar — POST script + avatar_id, poll until SUCCESS.
-  5. Seedance animates each image to a 4 s clip (parallel).
-  6. Rendi concat the 2 clips with NO audio → 8 s background.
-  7. Rendi composite the avatar video at bottom-left (~30 % width), using
-     the avatar's audio (overlay drives output).
-  8. Persist video; free Rendi storage; optional ZapCap.
+  2. language detect → classify Open Comments → safety resolve
+  3. ``generate_script`` — same article→script flow the simple /
+     simple-x4 tabs use; produces the ~10 s narration the avatar will
+     speak.
+  4. CTA overlay setup (Yes/No) — render the per-language pill PNG
+     when ``cta_enabled``.
+  5. In parallel:
+     a. Background image — Manual Image used **as-is** when set
+        (download + re-upload, NO kie call). Otherwise
+        ``nano_banana_2_text_to_image`` with an article-derived prompt
+        (one image only, no scene plan).
+     b. TikTok Symphony avatar — POST script + avatar_id, poll until
+        SUCCESS.
+  6. Rendi ``still_image_with_avatar_overlay`` — single ffmpeg call:
+     still image looped for the avatar duration, avatar composited
+     bottom-left (~30 % canvas width), avatar's audio is the only
+     audio track. Output length = avatar duration.
+  7. Optional CTA pill overlay on the composed video (non-fatal).
+  8. Persist video; free Rendi storage; optional ZapCap captions.
 
 Graceful degradation:
   * Avatar API failure → row fails (no narration = no avatar tab output).
-  * One shot image fails → hold the previous frame, video still ships.
+  * Background image failure → row fails (no background = no video).
   * CTA pill render/upload failure → ship without CTA (non-fatal).
+  * ZapCap failure → ship without captions
+    (``STATUS_ZAPCAP_FAILED_KEPT_NO_CAPTIONS``).
 
-Plan: ``_plans/2026-06-09-video-with-avatar-tab.md``.
+Cost impact vs the original 2-shot Seedance pipeline:
+  * kie: ~$0.06 (2 shots) → $0 (manual image) or ~$0.03 (1 kie shot)
+  * Seedance: ~$0.30 → $0 (dropped)
+  * Total: ~$0.39 → ~$0.05 per row (~87 % reduction).
 """
 
 from __future__ import annotations
@@ -35,11 +47,7 @@ from typing import Any
 
 import httpx
 
-from bulkvid.adapters.kie import (
-    nano_banana_2_image_to_image,
-    nano_banana_2_text_to_image,
-    seedance_image_to_video,
-)
+from bulkvid.adapters.kie import nano_banana_2_text_to_image
 from bulkvid.adapters.rendi import (
     dimensions_for_ratio,
     normalize_aspect_ratio,
@@ -58,6 +66,7 @@ from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
     STATUS_IMAGE_GEN_FAILED,
     STATUS_INTERNAL_ERROR,
+    STATUS_STORAGE_FAILED,
     STATUS_SUCCESS,
     STATUS_TTS_FAILED,
     STATUS_VIDEO_ASSEMBLY_FAILED,
@@ -66,29 +75,29 @@ from bulkvid.models.row import (
     RowResult,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
 from bulkvid.pipeline.cartoon_cta import render_cartoon_cta_overlay_bytes
-from bulkvid.pipeline.cartoon_prompt import (
-    generate_cartoon_plan,
-    image_prompt_for_shot,
-)
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
+from bulkvid.pipeline.script_gen import generate_script
 
 _log = get_logger("row")
 
 
 # ── Tunables ────────────────────────────────────────────────────────────────
 
-AVATAR_NUM_SHOTS = 2                # 2 background scenes
-SEEDANCE_DURATION_SHORT = 4         # 4 s per Seedance clip → 8 s total
-SEEDANCE_RESOLUTION = "720p"
 IMAGE_RESOLUTION = "1K"
 
 # Avatar overlay geometry — bottom-left, ~30 % canvas width.
 AVATAR_OVERLAY_WIDTH_FRAC = 0.30
 AVATAR_OVERLAY_MARGIN_PX = 40
+
+# Article excerpt size for the background-image prompt. Same budget the
+# cartoon planner uses (3 000 chars); long enough to ground the kie
+# prompt in concrete article content, short enough to stay cheap.
+_BACKGROUND_PROMPT_ARTICLE_CHARS = 3000
 
 
 def _is_valid_http_url(url: str) -> bool:
@@ -121,14 +130,45 @@ def _avatar_filename_slug(avatar_id: str) -> str:
     return cleaned or "unknown"
 
 
+def _background_image_prompt(
+    *,
+    article_excerpt: str,
+    vertical: str,
+    country: str,
+    language: str,
+) -> str:
+    """Prompt for the kie text-to-image background when no Manual Image.
+
+    Steers the model toward a clean magazine-style photo where the
+    BOTTOM-LEFT third of the frame stays visually quiet — the talking-
+    head avatar is composited there. Hard rules forbid text, logos,
+    and faces in the avatar zone so the overlay always reads cleanly.
+    """
+    excerpt = (article_excerpt or "").strip()[:_BACKGROUND_PROMPT_ARTICLE_CHARS]
+    return (
+        f"High-quality marketing photograph for a {vertical} video ad "
+        f"targeting {country} (audience language: {language}).\n\n"
+        f"Article context (for subject matter inspiration):\n{excerpt}\n\n"
+        "Style: clean, professional, magazine-quality real photography "
+        "(no illustration, no 3D-render). Vibrant but restrained colour "
+        "palette. Single clear focal subject.\n\n"
+        "Composition rules (LOAD-BEARING — a talking-head presenter will "
+        "be composited in the bottom-left ~30 % of the frame):\n"
+        "  - The BOTTOM-LEFT third of the frame must be visually quiet: "
+        "soft, low-contrast, no faces, no text, no important detail.\n"
+        "  - Place the main subject in the top-right two-thirds.\n"
+        "  - No text, logos, watermarks, captions, or signage in the image.\n"
+        "  - No people in the bottom-left third.\n"
+    )
+
+
 @dataclass
 class _Costs:
     article: float = 0.0
     language: float = 0.0
     classify: float = 0.0
-    plan: float = 0.0
+    script: float = 0.0
     image_gen: float = 0.0
-    seedance: float = 0.0
     tiktok: float = 0.0     # operator pays TikTok directly; tracked as 0 here
     rendi: float = 0.0
     zapcap: float = 0.0
@@ -137,8 +177,8 @@ class _Costs:
     @property
     def total(self) -> float:
         return round(
-            self.article + self.language + self.classify + self.plan
-            + self.image_gen + self.seedance + self.tiktok + self.rendi
+            self.article + self.language + self.classify + self.script
+            + self.image_gen + self.tiktok + self.rendi
             + self.zapcap + self.storage,
             6,
         )
@@ -167,7 +207,10 @@ async def process_avatar_row(
         "tab": "avatar",
         "avatar_id": row.avatar_id,
         "manual_image_provided": bool(row.manual_image_url),
-        "num_shots": AVATAR_NUM_SHOTS,
+        # Pipeline version stamp — bump if the row processor's shape changes
+        # so a future "wait, when did this start working/breaking?" question
+        # is one grep away.
+        "pipeline_version": "static_image_v2",
     }
     zapcap_failed = False
 
@@ -180,6 +223,7 @@ async def process_avatar_row(
         avatar_id=row.avatar_id,
         manual_image=bool(row.manual_image_url),
         tab="avatar",
+        pipeline_version="static_image_v2",
     )
 
     if not row.avatar_id.strip():
@@ -200,7 +244,7 @@ async def process_avatar_row(
         except Exception as e:
             return _fail(row, STATUS_ARTICLE_FETCH_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 2: language detect → classify → plan ───
+        # ─── Stage 2: language detect → classify → safety ───
         try:
             lang = await detect_language(clients.openai, article_body)
             costs.language += lang.cost_usd
@@ -211,13 +255,21 @@ async def process_avatar_row(
             safety = await resolve_safety(
                 clients.settings_store, row.vertical, row.row_num
             )
+            metadata["language"] = lang.language
+            metadata["open_comments_mode"] = analysis.mode.value
             metadata["safety_matched"] = safety.matched
             metadata["safety_keyword"] = safety.matched_keyword
+        except Exception as e:
+            return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 
-            # Reuse the cartoon planner — one idea, 2 shots. The planner
-            # already enforces brand-safety + character consistency. We use
-            # the voiceover field as the avatar's narration script.
-            plan = await generate_cartoon_plan(
+        # ─── Stage 3: script generation ───
+        # Reuses the simple-tab article→script flow. The resulting text
+        # is what the TikTok avatar will speak; length is the simple-tab
+        # default (~10–12 s of VO, matching the user's "like simple x4"
+        # call). OVERRIDE mode short-circuits with the operator's
+        # verbatim script — zero cost when the row is fully pre-written.
+        try:
+            script_result = await generate_script(
                 clients.openai,
                 article_body=article_body,
                 country=row.country,
@@ -225,26 +277,18 @@ async def process_avatar_row(
                 language=lang.language,
                 script_pattern=row.script_pattern,
                 open_comments=analysis,
-                num_ideas=1,
-                num_shots=AVATAR_NUM_SHOTS,
                 settings_store=clients.settings_store,
+                prompt_setting_key=SETTING_SIMPLE_SCRIPT_PROMPT,
                 safety=safety,
             )
-            costs.plan += plan.cost_usd
-            if not plan.ideas:
-                return _fail(
-                    row, STATUS_INTERNAL_ERROR,
-                    "planner returned 0 ideas — cannot generate scenes or narration",
-                    t0, costs, metadata,
-                )
-            idea = plan.ideas[0]
-            metadata["language"] = lang.language
-            metadata["open_comments_mode"] = analysis.mode.value
-            metadata["script_chars"] = len(idea.voiceover)
+            costs.script += script_result.cost_usd
+            metadata["script_chars"] = len(script_result.script)
+            metadata["script_word_count"] = script_result.word_count
+            metadata["script_used_override"] = script_result.used_override
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 
-        # ─── Stage 3: CTA overlay setup (Yes/No) ───
+        # ─── Stage 4: CTA overlay setup (Yes/No) ───
         cta_overlay_url: str | None = None
         cta_setup_error: str | None = None
         if row.cta_enabled:
@@ -279,59 +323,73 @@ async def process_avatar_row(
         else:
             metadata["cta_enabled"] = False
 
-        # ─── Stage 4: in parallel — image generation + avatar generation ───
-        async def _generate_images() -> list[str]:
-            urls: list[str] = []
-            for s, shot in enumerate(idea.shots):
-                is_first = s == 0
-                prompt = image_prompt_for_shot(shot.scene, is_chained=not is_first)
-                try:
-                    if is_first and row.manual_image_url:
-                        # Smart: use the operator's Manual Image as seed.
-                        url, cost = await nano_banana_2_image_to_image(
-                            clients.kie, row.manual_image_url, prompt, aspect,
-                            resolution=IMAGE_RESOLUTION,
-                        )
-                    elif is_first:
-                        url, cost = await nano_banana_2_text_to_image(
-                            clients.kie, prompt, aspect,
-                            resolution=IMAGE_RESOLUTION,
-                        )
-                    else:
-                        # Shot 2+: image-to-image chained on shot 1 so the
-                        # character / look stays consistent across the cut.
-                        url, cost = await nano_banana_2_image_to_image(
-                            clients.kie, urls[0], prompt, aspect,
-                            resolution=IMAGE_RESOLUTION,
-                        )
-                    costs.image_gen += cost
-                    urls.append(url)
-                except Exception as e:
-                    if not urls:
-                        raise
-                    _log.warning(
-                        "avatar_shot_image_failed_held",
-                        shot=s + 1, error=str(e)[:200],
-                    )
-                    urls.append(urls[-1])    # hold previous frame
-            return urls
+        # ─── Stage 5: in parallel — background image + avatar generation ───
+        async def _resolve_background_image() -> str:
+            """Return the URL of the static background image.
+
+            Manual Image: used **as-is** — downloaded and re-uploaded
+            to our own storage so the URL is stable + Rendi-reachable
+            (operator pastes can be Drive / signed / expiring links).
+            No kie call.
+
+            No Manual Image: one ``nano_banana_2_text_to_image`` call
+            with an article-derived prompt; the prompt enforces a
+            visually quiet bottom-left zone for the avatar overlay.
+            """
+            if row.manual_image_url:
+                # As-is: download + re-upload. No AI rewrite, no scene
+                # description, no aspect-ratio coercion — Rendi's
+                # cover-crop in the overlay command handles framing.
+                raw = await _download(row.manual_image_url, timeout=60.0)
+                up = await clients.storage.upload_bytes(
+                    raw,
+                    key=f"bulkvid/avatar_backgrounds/{slug}_manual.png",
+                    content_type="image/png",
+                )
+                costs.storage += up.cost_usd
+                metadata["background_source"] = "manual"
+                return up.url
+
+            prompt = _background_image_prompt(
+                article_excerpt=article_body,
+                vertical=row.vertical,
+                country=row.country,
+                language=lang.language,
+            )
+            url, cost = await nano_banana_2_text_to_image(
+                clients.kie, prompt, aspect,
+                resolution=IMAGE_RESOLUTION,
+            )
+            costs.image_gen += cost
+            metadata["background_source"] = "kie"
+            metadata["background_prompt_chars"] = len(prompt)
+            return url
 
         async def _generate_avatar() -> tuple[str, float | None]:
             tiktok = TikTokAvatarClient()
             result = await tiktok.create_and_wait(
                 avatar_id=row.avatar_id,
-                script=idea.voiceover,
+                script=script_result.script,
                 video_name=f"bulkvid-{slug}",
             )
             return result.preview_url, result.duration_seconds
 
+        background_task = asyncio.create_task(_resolve_background_image())
+        avatar_task = asyncio.create_task(_generate_avatar())
+
         try:
-            images_task = asyncio.create_task(_generate_images())
-            avatar_task = asyncio.create_task(_generate_avatar())
-            image_urls = await images_task
+            background_image_url = await background_task
         except Exception as e:
             avatar_task.cancel()
-            return _fail(row, STATUS_IMAGE_GEN_FAILED, str(e), t0, costs, metadata)
+            # Manual-image branch raises through _download (network /
+            # storage); kie branch raises through nano_banana_2_*. Both
+            # map to image gen failure for the operator.
+            status = (
+                STATUS_STORAGE_FAILED
+                if row.manual_image_url and "upload" in str(e).lower()
+                else STATUS_IMAGE_GEN_FAILED
+            )
+            return _fail(row, status, str(e), t0, costs, metadata)
 
         try:
             avatar_preview_url, avatar_duration = await avatar_task
@@ -348,76 +406,19 @@ async def process_avatar_row(
 
         metadata["avatar_duration_seconds"] = avatar_duration
 
-        # ─── Stage 5: animate each image to a 4s clip (parallel) ───
-        async def _animate(idx: int, image_url: str) -> tuple[int, str | None]:
-            try:
-                clip_url, cost = await seedance_image_to_video(
-                    clients.kie, image_url, idea.shots[idx].motion, aspect,
-                    duration=SEEDANCE_DURATION_SHORT,
-                    resolution=SEEDANCE_RESOLUTION,
-                )
-                costs.seedance += cost
-                return idx, clip_url
-            except Exception as e:
-                _log.warning(
-                    "avatar_shot_animate_failed",
-                    shot=idx + 1, error=str(e)[:200],
-                )
-                return idx, None
-
-        animated = await asyncio.gather(
-            *[_animate(s, u) for s, u in enumerate(image_urls)]
-        )
-        clip_by_shot = {s: url for s, url in animated}
-        ordered: list[str | None] = [
-            clip_by_shot.get(s) for s in range(len(image_urls))
-        ]
-        last_good: str | None = None
-        for s in range(len(ordered)):
-            if ordered[s]:
-                last_good = ordered[s]
-            elif last_good:
-                ordered[s] = last_good
-        next_good: str | None = None
-        for s in range(len(ordered) - 1, -1, -1):
-            if ordered[s]:
-                next_good = ordered[s]
-            elif next_good:
-                ordered[s] = next_good
-        clip_urls = [c for c in ordered if c]
-        if not clip_urls:
-            return _fail(
-                row, STATUS_VIDEO_ASSEMBLY_FAILED,
-                "no Seedance clips produced for any shot",
-                t0, costs, metadata,
-            )
-
-        # ─── Stage 6: stitch background (silent), then overlay avatar ───
+        # ─── Stage 6: Rendi — still image bg + avatar overlay ───
         cleanup_command_ids: list[str] = []
-        try:
-            stitched = await clients.rendi.concat_clips_with_audio(
-                clip_urls,
-                None,    # silent — avatar drives audio
-                per_clip_seconds=[float(SEEDANCE_DURATION_SHORT)] * AVATAR_NUM_SHOTS,
-                output_filename="bg.mp4",
-                aspect_ratio=aspect,
-                total_video_seconds=float(SEEDANCE_DURATION_SHORT * AVATAR_NUM_SHOTS),
-            )
-            costs.rendi += stitched.cost_usd
-            cleanup_command_ids.append(stitched.command_id)
-        except Exception as e:
-            return _fail(row, STATUS_VIDEO_ASSEMBLY_FAILED, str(e), t0, costs, metadata)
-
         try:
             canvas_w, _ = dimensions_for_ratio(row.aspect_ratio)
             overlay_px = max(120, int(canvas_w * AVATAR_OVERLAY_WIDTH_FRAC))
-            composited = await clients.rendi.overlay_video_bottom_left(
-                background_video_url=stitched.url,
+            composited = await clients.rendi.still_image_with_avatar_overlay(
+                background_image_url=background_image_url,
                 overlay_video_url=avatar_preview_url,
+                output_filename="v1.mp4",
+                aspect_ratio=aspect,
                 overlay_width_px=overlay_px,
                 margin_x=AVATAR_OVERLAY_MARGIN_PX,
                 margin_y=AVATAR_OVERLAY_MARGIN_PX,
-                output_filename="v1.mp4",
             )
             costs.rendi += composited.cost_usd
             cleanup_command_ids.append(composited.command_id)
@@ -478,10 +479,10 @@ async def process_avatar_row(
                     language=lang.language,
                     filename="v1.mp4",
                     render_options=zapcap_opts,
-                    video_duration_seconds=(
-                        avatar_duration
-                        or float(SEEDANCE_DURATION_SHORT * AVATAR_NUM_SHOTS)
-                    ),
+                    # Fall back to a sane default if TikTok didn't return a
+                    # duration — ZapCap will trim to the actual video length
+                    # anyway, this just sizes the caption track planner.
+                    video_duration_seconds=avatar_duration or 15.0,
                 )
                 costs.zapcap += cost
                 cap_bytes = await _download(cap_url, timeout=180.0)
