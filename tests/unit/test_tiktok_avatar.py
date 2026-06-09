@@ -217,6 +217,60 @@ async def test_list_avatars_parses_entries() -> None:
 
 
 @respx.mock
+async def test_advertiser_id_threads_through_to_query_string() -> None:
+    """Regression for the 403 chat 2026-06-09 hit: when
+    ``advertiser_id`` is configured, every call must include it as
+    ``?advertiser_id=...`` — that's what unblocks the Business API
+    endpoints that 403 without it."""
+    create_route = respx.post(_CREATE).mock(
+        return_value=httpx.Response(
+            200, json={"code": 0, "data": {"list": [{"task_id": "t"}]}},
+        )
+    )
+    list_route = respx.get(_LIST).mock(
+        return_value=httpx.Response(200, json={"code": 0, "data": {"list": []}})
+    )
+    c = TikTokAvatarClient(
+        access_token="tok-test",
+        advertiser_id="advtr-9999",
+        create_url=_CREATE,
+        get_url=_GET,
+        list_url=_LIST,
+        poll_interval_seconds=0.0,
+        poll_max_attempts=1,
+    )
+
+    await c.create_task(avatar_id="av", script="x", video_name="v")
+    await c.list_avatars()
+
+    # Both calls must have shipped the advertiser_id in the query string.
+    for route in (create_route, list_route):
+        assert route.called, f"{route} was not called"
+        sent_url = str(route.calls[0].request.url)
+        assert "advertiser_id=advtr-9999" in sent_url, (
+            f"expected advertiser_id in query string, got: {sent_url}"
+        )
+
+
+@respx.mock
+async def test_403_surfaces_response_body_in_error() -> None:
+    """A 403 should report what TikTok actually said (e.g. 'missing
+    advertiser_id'), not just the URL. Default httpx.raise_for_status
+    only includes the URL — useless for diagnosis."""
+    respx.get(_LIST).mock(
+        return_value=httpx.Response(
+            403,
+            json={"code": 40002, "message": "advertiser_id is required"},
+        )
+    )
+    c = _client()
+    with pytest.raises(
+        TikTokAvatarError, match="advertiser_id is required"
+    ):
+        await c.list_avatars()
+
+
+@respx.mock
 async def test_list_avatars_skips_entries_without_id() -> None:
     respx.get(_LIST).mock(
         return_value=httpx.Response(

@@ -16,6 +16,10 @@ Endpoints come from environment variables so they can be swapped without
 a redeploy if TikTok bumps an API version:
 
   * ``TIKTOK_ACCESS_TOKEN``     — operator's Business API token (required)
+  * ``TIKTOK_ADVERTISER_ID``    — Business API advertiser id; passed as a
+                                  query parameter on every call. Most
+                                  Business endpoints reject requests
+                                  without it with a 403 Forbidden.
   * ``TIKTOK_CREATE_URL``       — create endpoint (default below)
   * ``TIKTOK_GET_URL``          — poll endpoint (default below)
   * ``TIKTOK_AVATAR_LIST_URL``  — avatar listing (default below)
@@ -62,6 +66,26 @@ class TikTokAvatarError(RuntimeError):
     """Raised when the Symphony API returns a non-success or times out."""
 
 
+def _raise_for_status_with_body(resp: "httpx.Response", *, where: str) -> None:
+    """Like ``resp.raise_for_status()`` but includes TikTok's actual error
+    body in the raised message.
+
+    Default httpx.HTTPStatusError prints only the URL and status — useless
+    when the body says e.g. ``{"code":40002,"message":"missing advertiser_id"}``.
+    Surfacing the body in the message saves a round-trip through HF logs to
+    figure out which env var to set.
+    """
+    if resp.is_success:
+        return
+    # Keep the body short — TikTok's error messages are small, but a
+    # mis-routed endpoint might return a multi-KB HTML page.
+    body_preview = (resp.text or "")[:500]
+    raise TikTokAvatarError(
+        f"TikTok {where} returned HTTP {resp.status_code} "
+        f"for {resp.url}: {body_preview or '(empty body)'}"
+    )
+
+
 # ── Data ────────────────────────────────────────────────────────────────────
 
 
@@ -93,6 +117,7 @@ class TikTokAvatarClient:
         self,
         access_token: str | None = None,
         *,
+        advertiser_id: str | None = None,
         create_url: str | None = None,
         get_url: str | None = None,
         list_url: str | None = None,
@@ -107,6 +132,15 @@ class TikTokAvatarClient:
                 "cannot generate narration without it."
             )
         self._token = token
+        # advertiser_id is required by most Business API endpoints. When
+        # set, every call appends it as a query parameter. When None,
+        # calls omit it — useful for the rare endpoint that doesn't take
+        # it, or for non-Business deployments.
+        self._advertiser_id = (
+            advertiser_id
+            if advertiser_id is not None
+            else os.environ.get("TIKTOK_ADVERTISER_ID", "")
+        ).strip()
         self._create_url = (
             create_url
             or os.environ.get("TIKTOK_CREATE_URL")
@@ -125,6 +159,18 @@ class TikTokAvatarClient:
         self._poll_interval = poll_interval_seconds
         self._poll_max = poll_max_attempts
         self._http_timeout = http_timeout_seconds
+
+    def _params_with_advertiser(
+        self, extra: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Build the query-string dict, automatically including
+        ``advertiser_id`` when configured."""
+        params: dict[str, str] = {}
+        if self._advertiser_id:
+            params["advertiser_id"] = self._advertiser_id
+        if extra:
+            params.update(extra)
+        return params
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -164,12 +210,16 @@ class TikTokAvatarClient:
             avatar_id=avatar_id,
             script_chars=len(script),
             video_name=video_name,
+            advertiser_id_set=bool(self._advertiser_id),
         )
         async with httpx.AsyncClient(timeout=self._http_timeout) as c:
             resp = await c.post(
-                self._create_url, headers=self._headers, json=payload
+                self._create_url,
+                headers=self._headers,
+                params=self._params_with_advertiser(),
+                json=payload,
             )
-            resp.raise_for_status()
+            _raise_for_status_with_body(resp, where="create")
             body: dict[str, Any] = resp.json()
 
         code = body.get("code")
@@ -193,14 +243,16 @@ class TikTokAvatarClient:
 
     async def wait_for_result(self, task_id: str) -> AvatarResult:
         """Poll the get endpoint until SUCCESS / FAIL / timeout."""
-        params = {"task_ids": json.dumps([task_id])}
+        params = self._params_with_advertiser({
+            "task_ids": json.dumps([task_id]),
+        })
         for attempt in range(1, self._poll_max + 1):
             await asyncio.sleep(self._poll_interval)
             async with httpx.AsyncClient(timeout=self._http_timeout) as c:
                 resp = await c.get(
                     self._get_url, headers=self._headers, params=params
                 )
-                resp.raise_for_status()
+                _raise_for_status_with_body(resp, where=f"get (attempt {attempt})")
                 body: dict[str, Any] = resp.json()
 
             code = body.get("code")
@@ -289,8 +341,12 @@ class TikTokAvatarClient:
         """GET the avatar list endpoint. Returns one entry per available
         avatar with the fields the admin page needs to render previews."""
         async with httpx.AsyncClient(timeout=self._http_timeout) as c:
-            resp = await c.get(self._list_url, headers=self._headers)
-            resp.raise_for_status()
+            resp = await c.get(
+                self._list_url,
+                headers=self._headers,
+                params=self._params_with_advertiser(),
+            )
+            _raise_for_status_with_body(resp, where="avatar list")
             body: dict[str, Any] = resp.json()
 
         code = body.get("code")

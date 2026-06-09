@@ -18,10 +18,13 @@
     <p class="label" style="font-size:12px">
       Common causes:
       <ul style="margin-top:4px">
-        <li><code>TIKTOK_ACCESS_TOKEN</code> env var not set on this host</li>
-        <li>Token expired or revoked</li>
-        <li>TikTok's avatar list endpoint moved
-            (override via <code>TIKTOK_AVATAR_LIST_URL</code> env var)</li>
+        <li><b>HTTP 403</b> usually means TikTok Business API is missing
+            the <code>advertiser_id</code> query parameter. Set
+            <code>TIKTOK_ADVERTISER_ID</code> on the HF Space and restart.</li>
+        <li><b>HTTP 401</b> = the <code>TIKTOK_ACCESS_TOKEN</code> env var
+            is missing, expired, or revoked.</li>
+        <li><b>HTTP 404</b> = TikTok's avatar list endpoint moved
+            (override via <code>TIKTOK_AVATAR_LIST_URL</code> env var).</li>
       </ul>
     </p>
   {% else %}
