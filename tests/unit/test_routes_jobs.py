@@ -689,12 +689,119 @@ def test_poll_empty_state(client: TestClient) -> None:
     # overhaul and is always present (empty when there are no
     # completed rows yet). Plan:
     # _plans/2026-06-04-sidebar-ux-overhaul.md §Phase 3.
+    # ``queue_status`` was added 2026-06-09 for the sidebar's row-level
+    # queue depth banner. Always present even on an empty queue so the
+    # client can render "0 / N in flight" without a null-check.
     assert body == {
         "jobs": [],
         "rows_by_job": {},
         "logs_by_job": {},
         "eta_medians_by_tab": {},
+        "queue_status": {
+            "in_flight": 0,
+            "queued": 0,
+            # default ``BULKVID_MAX_CONCURRENT_ROWS`` from config.py.
+            "max_concurrent": 10,
+            # No queued rows → ETA collapses to 0 (not None) so the
+            # banner can hide the "ETA" line on its own and not have to
+            # conflate "no queue" with "no medians yet".
+            "eta_seconds": 0,
+        },
     }
+
+
+def test_poll_queue_status_counts_inflight_and_queued_for_user(
+    client: TestClient, app: FastAPI,
+) -> None:
+    """Two image-vo jobs submitted; first row claimed (in-flight),
+    second still pending. ``queue_status`` must report 1 in-flight + 1
+    queued for the submitting user."""
+    # Two single-row jobs.
+    r1 = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    assert r1.status_code == 200
+    r2 = client.post(
+        "/jobs",
+        json={**_image_vo_payload(), "worksheet": "Image-VO-2"},
+        headers=_auth("tok-bulk1"),
+    )
+    assert r2.status_code == 200
+
+    # Promote the first job's row to PROCESSING (the worker would do this).
+    claimed = await_(app.state.queue.claim_next_row())
+    assert claimed is not None
+
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    qs = r.json()["queue_status"]
+    assert qs["in_flight"] == 1
+    assert qs["queued"] == 1
+    # No medians yet (no completed rows) → eta_seconds is None, not 0,
+    # so the client knows to hide the ETA line rather than show "0 min".
+    assert qs["eta_seconds"] is None
+
+
+def _image_vo_payload_for_row(row_num: int, *, worksheet: str = "Image-VO") -> dict:
+    """Variant of ``_image_vo_payload`` that lets the caller pick a row /
+    worksheet so cross-user tests don't trip the queue dedup guard
+    (which collapses any (sheet, worksheet, row_num) already pending
+    in an active job — see ``_enqueue_sync``)."""
+    payload = _image_vo_payload()
+    payload["worksheet"] = worksheet
+    payload["rows_image_vo"][0]["row_num"] = row_num
+    return payload
+
+
+def test_poll_queue_status_isolated_per_user(
+    client: TestClient, app: FastAPI,
+) -> None:
+    """Bulk user A's queued rows must NOT count toward bulk user B's
+    ``queue_status``. Each non-admin caller sees only their own depth.
+
+    Distinct ``worksheet`` per user so the queue dedup guard doesn't
+    collapse B's row into A's pending one — same defensive shape as the
+    real Apps Script payload (different sheets per operator)."""
+    client.post(
+        "/jobs",
+        json=_image_vo_payload_for_row(2, worksheet="Bulk1-Sheet"),
+        headers=_auth("tok-bulk1"),
+    )
+    await_(app.state.queue.claim_next_row())
+    client.post(
+        "/jobs",
+        json=_image_vo_payload_for_row(2, worksheet="Bulk2-Sheet"),
+        headers=_auth("tok-bulk2"),
+    )
+
+    r_a = client.get("/jobs/poll", headers=_auth("tok-bulk1")).json()
+    r_b = client.get("/jobs/poll", headers=_auth("tok-bulk2")).json()
+
+    # A sees their own 1 in-flight + 0 queued.
+    assert r_a["queue_status"]["in_flight"] == 1
+    assert r_a["queue_status"]["queued"] == 0
+    # B sees their own 0 in-flight + 1 queued. NOT A's row.
+    assert r_b["queue_status"]["in_flight"] == 0
+    assert r_b["queue_status"]["queued"] == 1
+
+
+def test_poll_queue_status_admin_sees_whole_fleet(
+    client: TestClient, app: FastAPI,
+) -> None:
+    """Admin's ``queue_status`` aggregates rows across ALL users — same
+    fleet view ``list_jobs`` already gives admins."""
+    client.post(
+        "/jobs",
+        json=_image_vo_payload_for_row(2, worksheet="Bulk1-Sheet"),
+        headers=_auth("tok-bulk1"),
+    )
+    client.post(
+        "/jobs",
+        json=_image_vo_payload_for_row(2, worksheet="Bulk2-Sheet"),
+        headers=_auth("tok-bulk2"),
+    )
+
+    r = client.get("/jobs/poll", headers=_auth("tok-admin")).json()
+    assert r["queue_status"]["in_flight"] == 0
+    assert r["queue_status"]["queued"] == 2
 
 
 def test_poll_rows_only_populated_for_running_jobs(

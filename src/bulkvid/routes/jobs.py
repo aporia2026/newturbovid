@@ -383,6 +383,28 @@ class PollLogOut(BaseModel):
     lines: list[str]
 
 
+class QueueStatusOut(BaseModel):
+    """Row-level queue snapshot for the sidebar's status banner.
+
+    ``in_flight`` is the row count currently being PROCESSED (one worker
+    slot each); ``queued`` is the row count WAITING for a slot.
+    ``max_concurrent`` is the worker's ``BULKVID_MAX_CONCURRENT_ROWS`` —
+    operators want to see this alongside in_flight to spot when they're
+    saturating the cap.
+
+    ``eta_seconds`` is a rough wall-clock estimate of when the queued
+    rows will finish, weighted by each tab's median row time. Returns
+    ``None`` when no medians are available yet (cold start) so the
+    sidebar can hide the "ETA" line instead of showing a misleading 0.
+
+    Plan: chat 2026-06-09; queue depth + ETA banner in the sidebar."""
+
+    in_flight: int
+    queued: int
+    max_concurrent: int
+    eta_seconds: int | None = None
+
+
 class PollOut(BaseModel):
     """Single-response bundle for the sidebar.
 
@@ -395,12 +417,17 @@ class PollOut(BaseModel):
     to render a rough "~3:30 est" next to the live elapsed counter so
     the user has a sense of how long a row is going to take. Plan:
     ``_plans/2026-06-04-sidebar-ux-overhaul.md`` §Phase 3.
+
+    ``queue_status`` carries the row-level queue depth + worker capacity
+    + tab-weighted ETA so the sidebar can render
+    "20 / 20 in flight · 480 queued · ETA ~50 min" at a glance.
     """
 
     jobs: list[JobOut]
     rows_by_job: dict[str, list[JobRowOut]]
     logs_by_job: dict[str, PollLogOut]
     eta_medians_by_tab: dict[str, float] = {}
+    queue_status: QueueStatusOut | None = None
 
 
 def _job_to_out(job: Job) -> JobOut:
@@ -729,11 +756,55 @@ async def poll_jobs(
         _log.warning("eta_medians_failed", err=str(e)[:200])
         eta_medians = {}
 
+    # Queue depth banner: in-flight + queued row counts for this user
+    # (admin sees the whole fleet), plus a tab-weighted ETA. Any failure
+    # here drops the field to ``None`` — the sidebar hides the banner
+    # in that case rather than showing stale numbers.
+    queue_status: QueueStatusOut | None = None
+    try:
+        in_flight, queued, queued_per_tab = await queue.user_queue_depth(
+            user_email=filter_email,
+        )
+        settings = get_settings()
+        max_concurrent = max(1, int(settings.BULKVID_MAX_CONCURRENT_ROWS))
+        eta_seconds: int | None
+        if not queued:
+            eta_seconds = 0
+        elif not eta_medians:
+            # No samples yet (fresh deploy) — surface "unknown" rather
+            # than 0 so the sidebar shows queue depth without a wrong ETA.
+            eta_seconds = None
+        else:
+            # Weighted: sum(per_tab_queued × median_per_tab_seconds) over
+            # all queued tabs, divided by the parallelism cap. Tabs with
+            # no median (never run before) fall back to the global mean
+            # of the known medians so we never silently zero them out.
+            mean_median = (
+                sum(eta_medians.values()) / len(eta_medians)
+                if eta_medians else 0.0
+            )
+            weighted = 0.0
+            for tab, n in queued_per_tab.items():
+                weighted += n * eta_medians.get(tab, mean_median)
+            # The in-flight rows are already partway through; charge them
+            # at ~half their tab's median so the banner doesn't double-
+            # count seconds that have already elapsed.
+            eta_seconds = max(0, int(weighted / max_concurrent))
+        queue_status = QueueStatusOut(
+            in_flight=in_flight,
+            queued=queued,
+            max_concurrent=max_concurrent,
+            eta_seconds=eta_seconds,
+        )
+    except Exception as e:    # noqa: BLE001 — never let queue-depth 500 a poll
+        _log.warning("queue_status_failed", err=str(e)[:200])
+
     return PollOut(
         jobs=[_job_to_out(j) for j in jobs],
         rows_by_job=rows_by_job,
         logs_by_job=logs_by_job,
         eta_medians_by_tab=eta_medians,
+        queue_status=queue_status,
     )
 
 

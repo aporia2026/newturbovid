@@ -559,6 +559,89 @@ class JobQueue:
             )
         return out
 
+    def _user_queue_depth_sync(
+        self, *, user_email: str | None,
+    ) -> tuple[int, int, dict[str, int]]:
+        """Count rows currently in-flight + waiting for one user (or all users
+        when ``user_email`` is None — admin view).
+
+        Returns ``(in_flight, queued, queued_per_tab)``:
+          * ``in_flight``: rows whose status is ``ROW_PROCESSING`` and whose
+            parent job is still active. These have a worker slot RIGHT NOW.
+          * ``queued``: rows whose status is ``ROW_PENDING`` waiting for a
+            worker slot. These will run as slots free.
+          * ``queued_per_tab``: ``{tab_type: queued_count}`` over the queued
+            set, so the route can compute a tab-weighted ETA from the median
+            seconds-per-tab table.
+
+        Cheap aggregate — two SELECTs against the indexed status column. Used
+        by the sidebar's queue-status banner (chat 2026-06-09).
+        """
+        # We never log a user_email predicate when ``user_email is None`` so
+        # admins see the entire fleet. Parameter list mirrors the existing
+        # ``_kill_all_sync`` shape.
+        if user_email is None:
+            in_flight_cur = self._conn.execute(
+                "SELECT COUNT(*) FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?)",
+                (ROW_PROCESSING, JOB_QUEUED, JOB_RUNNING),
+            )
+            queued_cur = self._conn.execute(
+                "SELECT COUNT(*) FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?)",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
+            )
+            per_tab_cur = self._conn.execute(
+                "SELECT j.tab_type, COUNT(*) AS n FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "GROUP BY j.tab_type",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
+            )
+        else:
+            in_flight_cur = self._conn.execute(
+                "SELECT COUNT(*) FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "AND j.user_email = ?",
+                (ROW_PROCESSING, JOB_QUEUED, JOB_RUNNING, user_email),
+            )
+            queued_cur = self._conn.execute(
+                "SELECT COUNT(*) FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "AND j.user_email = ?",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING, user_email),
+            )
+            per_tab_cur = self._conn.execute(
+                "SELECT j.tab_type, COUNT(*) AS n FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE rq.status = ? AND j.status IN (?, ?) "
+                "AND j.user_email = ? "
+                "GROUP BY j.tab_type",
+                (ROW_PENDING, JOB_QUEUED, JOB_RUNNING, user_email),
+            )
+
+        # COUNT(*) returns one row with one column — index access works for
+        # both sqlite3.Row and the libsql ``_DictRow`` shim.
+        in_flight_row = in_flight_cur.fetchone()
+        queued_row = queued_cur.fetchone()
+        in_flight = int(in_flight_row[0]) if in_flight_row is not None else 0
+        queued = int(queued_row[0]) if queued_row is not None else 0
+
+        queued_per_tab: dict[str, int] = {}
+        for r in per_tab_cur.fetchall():
+            tab = r["tab_type"] if hasattr(r, "keys") else r[0]
+            n = r["n"] if hasattr(r, "keys") else r[1]
+            try:
+                queued_per_tab[str(tab)] = int(n)
+            except (TypeError, ValueError):
+                continue
+
+        return in_flight, queued, queued_per_tab
+
     def _eta_medians_sync(self, *, sample_size: int = 50) -> dict[str, float]:
         """Median ``finished_at - started_at`` in seconds, grouped by
         ``tab_type``, over the last ``sample_size`` successfully-done
@@ -729,6 +812,16 @@ class JobQueue:
         ``_eta_medians_sync``."""
         return await asyncio.to_thread(
             self._eta_medians_sync, sample_size=sample_size
+        )
+
+    async def user_queue_depth(
+        self, *, user_email: str | None,
+    ) -> tuple[int, int, dict[str, int]]:
+        """Async wrapper for ``_user_queue_depth_sync``. Returns
+        ``(in_flight, queued, queued_per_tab)``. ``user_email=None`` is the
+        admin view (whole fleet)."""
+        return await asyncio.to_thread(
+            self._user_queue_depth_sync, user_email=user_email,
         )
 
     async def kill_job(self, job_id: str) -> bool:

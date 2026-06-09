@@ -105,6 +105,46 @@
     .summary-line { font-size: 12px; color: var(--c-muted); margin: 2px 0 8px 0; }
     .reconnect { color: var(--c-amber); }
 
+    /* Queue-status banner (chat 2026-06-09). Row-level snapshot of
+       in-flight vs queued vs ETA so the bulk team can see "20 / 20 in
+       flight · 480 queued · ETA ~50 min" at a glance instead of asking
+       "is it stuck?" every few minutes. Hidden when queue is empty. */
+    .queue-banner {
+      display: none;    /* shown only when in_flight + queued > 0 */
+      margin: 4px 0 10px 0;
+      padding: 8px 10px;
+      border: 1px solid var(--c-border-soft);
+      border-radius: 6px;
+      background: var(--c-bg-alt);
+      font-size: 12px;
+      color: var(--c-text);
+      line-height: 1.45;
+    }
+    .queue-banner.busy { border-color: var(--c-blue-soft); }
+    .queue-banner .qb-row {
+      display: flex; justify-content: space-between;
+      align-items: baseline; gap: 8px;
+    }
+    .queue-banner .qb-counts {
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .queue-banner .qb-counts .qb-cap {
+      color: var(--c-muted); font-weight: 500;
+    }
+    .queue-banner .qb-eta {
+      color: var(--c-muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .queue-banner .qb-bar {
+      height: 4px; margin-top: 6px;
+      background: var(--c-border-soft); border-radius: 2px; overflow: hidden;
+    }
+    .queue-banner .qb-bar-fill {
+      height: 100%; background: var(--c-blue);
+      transition: width 0.4s ease;
+    }
+
     details { margin-top: 6px; }
     summary { cursor: pointer; color: var(--c-blue); font-size: 12px; user-select: none; }
 
@@ -219,6 +259,16 @@
   <div class="small" id="last-update"></div>
   <div class="summary-line" id="summary"></div>
 
+  <!-- Queue-depth banner. Hidden by default (.queue-banner has
+       display:none); render() shows it only when in_flight + queued > 0. -->
+  <div class="queue-banner" id="queue-banner">
+    <div class="qb-row">
+      <span class="qb-counts" id="qb-counts"></span>
+      <span class="qb-eta" id="qb-eta"></span>
+    </div>
+    <div class="qb-bar"><div class="qb-bar-fill" id="qb-bar-fill" style="width:0%"></div></div>
+  </div>
+
   <h4>Active</h4>
   <div id="active"><div class="empty">Loading…</div></div>
 
@@ -258,6 +308,60 @@
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+
+    /** Format an ETA in seconds as a short human string.
+     *    < 60 s  -> "Xs"
+     *    < 90 m  -> "Xm"
+     *    >= 90 m -> "Xh Ym" (drop minutes when zero)
+     *  Returns '' for null/undefined so the caller can hide the line.
+     *  Plan: chat 2026-06-09 queue-banner ETA display. */
+    function _formatEta(seconds) {
+      if (seconds == null) return '';
+      var n = Math.max(0, Math.round(seconds));
+      if (n < 60) return n + 's';
+      if (n < 90 * 60) return Math.round(n / 60) + 'm';
+      var hours = Math.floor(n / 3600);
+      var mins = Math.round((n - hours * 3600) / 60);
+      return mins ? hours + 'h ' + mins + 'm' : hours + 'h';
+    }
+
+
+    /** Render the row-level queue depth + ETA banner at the top of the
+     *  sidebar. Hidden when the queue is empty (no in-flight, no queued)
+     *  so the operator only sees it when there's something to surface.
+     *  Plan: chat 2026-06-09. */
+    function _renderQueueBanner(status) {
+      var el = document.getElementById('queue-banner');
+      if (!el) return;
+      if (!status || ((status.in_flight || 0) + (status.queued || 0)) === 0) {
+        el.style.display = 'none';
+        return;
+      }
+      el.style.display = 'block';
+      // Bluer border when we're actually saturating the worker — gives
+      // the operator a "yes, things are running at capacity" signal.
+      var saturated = (status.in_flight || 0) >= (status.max_concurrent || 0)
+                      && (status.max_concurrent || 0) > 0;
+      el.classList.toggle('busy', saturated);
+
+      document.getElementById('qb-counts').innerHTML =
+        (status.in_flight || 0) +
+        ' <span class="qb-cap">/ ' + (status.max_concurrent || 0) +
+        ' in flight · ' + (status.queued || 0) + ' queued</span>';
+
+      var eta = _formatEta(status.eta_seconds);
+      document.getElementById('qb-eta').textContent = eta ? ('ETA ~' + eta) : '';
+
+      // Progress bar shows how far along the user is through their batch:
+      // in_flight / (in_flight + queued). 100% when only in_flight remains.
+      var inFlight = status.in_flight || 0;
+      var queued = status.queued || 0;
+      var pct = (inFlight + queued) > 0
+        ? Math.round((inFlight / (inFlight + queued)) * 100)
+        : 0;
+      document.getElementById('qb-bar-fill').style.width = pct + '%';
+    }
+
     function _pct(j) {
       var total = j.row_count || 0;
       var done = (j.completed_rows || 0) + (j.failed_rows || 0);
@@ -286,6 +390,11 @@
       _lastJobs.forEach(function (j) {
         if (j.tab_type) _tabTypeByJob[j.job_id] = j.tab_type;
       });
+      // 2026-06-09 queue depth banner — server-side row-level snapshot.
+      // ``queue_status`` is null on older backends; the renderer hides
+      // the banner in that case so a partial deploy never shows stale
+      // numbers.
+      _renderQueueBanner(response && response.queue_status);
       // Feed the per-row cache directly from the bundled response so render()
       // does not have to issue any follow-up calls.
       var rowsByJob = (response && response.rows_by_job) || {};
