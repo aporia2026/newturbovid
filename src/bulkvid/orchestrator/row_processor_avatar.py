@@ -76,7 +76,11 @@ from bulkvid.models.row import (
 )
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
-from bulkvid.pipeline.cartoon_cta import render_cartoon_cta_overlay_bytes
+from bulkvid.pipeline.cartoon_cta import (
+    PILL_BOTTOM_MARGIN_FRAC,
+    PILL_HEIGHT_FRAC,
+    render_cartoon_cta_overlay_bytes,
+)
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.language import detect_language
 from bulkvid.pipeline.open_comments import classify_open_comments
@@ -96,6 +100,38 @@ IMAGE_RESOLUTION = "1K"
 # existing sheets without the column keep rendering at today's 30 %.
 # Plan: ``_plans/2026-06-09-avatar-overlay-size-shape.md``.
 AVATAR_OVERLAY_MARGIN_PX = 40
+
+# Extra vertical gap between the avatar's bottom edge and the CTA pill's
+# top edge when BOTH are present. Without this, the avatar's bottom band
+# overlaps the pill (chat 2026-06-09 screenshots). Small enough that the
+# avatar still feels grounded near the bottom; large enough that the
+# anti-aliased pill border doesn't kiss the avatar's bounding box.
+AVATAR_OVER_CTA_GAP_PX = 16
+
+
+def _avatar_margin_y_for_canvas(
+    canvas_height: int, *, cta_enabled: bool,
+) -> int:
+    """Bottom-margin for the avatar overlay in canvas pixels.
+
+    With no CTA, returns the static ``AVATAR_OVERLAY_MARGIN_PX``
+    (today's behaviour). With CTA enabled, computes the pill's top
+    edge from the same fractional constants ``cartoon_cta.py`` uses
+    (``PILL_HEIGHT_FRAC`` + ``PILL_BOTTOM_MARGIN_FRAC``) and pushes
+    the avatar's bottom to sit above that edge plus a small gap so
+    the two overlays never visually collide.
+
+    Centralising the formula here means a future bump to the pill's
+    height or bottom-margin fraction is reflected automatically — no
+    manual sync between the CTA renderer and the avatar composite.
+    """
+    if not cta_enabled:
+        return AVATAR_OVERLAY_MARGIN_PX
+    # Mirror cartoon_cta.render_cartoon_cta_overlay_bytes: pill height
+    # is max(40, round(canvas_h × frac)); same floor here.
+    pill_h = max(40, int(round(canvas_height * PILL_HEIGHT_FRAC)))
+    pill_bottom_margin = int(round(canvas_height * PILL_BOTTOM_MARGIN_FRAC))
+    return pill_bottom_margin + pill_h + AVATAR_OVER_CTA_GAP_PX
 _AVATAR_SIZE_TO_FRAC: dict[str, float] = {
     "small": 0.20,
     "medium": 0.30,
@@ -451,10 +487,22 @@ async def process_avatar_row(
         # ─── Stage 6: Rendi — still image bg + avatar overlay ───
         cleanup_command_ids: list[str] = []
         try:
-            canvas_w, _ = dimensions_for_ratio(row.aspect_ratio)
+            canvas_w, canvas_h = dimensions_for_ratio(row.aspect_ratio)
             # 120 px floor so a Small selection on a 1:1 1080-canvas still
             # renders a legible avatar; below that the head reads as a blob.
             overlay_px = max(120, int(canvas_w * size_frac))
+            # When CTA is on, raise the avatar's bottom margin so it sits
+            # above the pill instead of overlapping it (chat 2026-06-09).
+            # The CTA pill is composited AFTER the avatar in Stage 6b, but
+            # because the pill spans almost the full canvas width near the
+            # bottom, the only reliable fix is to keep the avatar's bounding
+            # box clear of the pill's zone. ``cta_overlay_url`` is non-None
+            # only when ``cta_enabled`` was True AND the pill PNG render +
+            # upload both succeeded — so a CTA setup failure correctly
+            # falls back to today's tight bottom margin.
+            avatar_margin_y = _avatar_margin_y_for_canvas(
+                canvas_h, cta_enabled=cta_overlay_url is not None,
+            )
             composited = await clients.rendi.still_image_with_avatar_overlay(
                 background_image_url=background_image_url,
                 overlay_video_url=avatar_preview_url,
@@ -462,13 +510,14 @@ async def process_avatar_row(
                 aspect_ratio=aspect,
                 overlay_width_px=overlay_px,
                 margin_x=AVATAR_OVERLAY_MARGIN_PX,
-                margin_y=AVATAR_OVERLAY_MARGIN_PX,
+                margin_y=avatar_margin_y,
                 shape=resolved_shape,
             )
             costs.rendi += composited.cost_usd
             cleanup_command_ids.append(composited.command_id)
             video_url_for_persist = composited.url
             metadata["avatar_overlay_width_px"] = overlay_px
+            metadata["avatar_overlay_margin_y"] = avatar_margin_y
         except Exception as e:
             return _fail(
                 row, STATUS_VIDEO_ASSEMBLY_FAILED,

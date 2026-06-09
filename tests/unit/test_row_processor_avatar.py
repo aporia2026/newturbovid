@@ -32,7 +32,16 @@ from bulkvid.models.row import (
     AvatarRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
-from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
+from bulkvid.orchestrator.row_processor_avatar import (
+    AVATAR_OVERLAY_MARGIN_PX,
+    AVATAR_OVER_CTA_GAP_PX,
+    _avatar_margin_y_for_canvas,
+    process_avatar_row,
+)
+from bulkvid.pipeline.cartoon_cta import (
+    PILL_BOTTOM_MARGIN_FRAC,
+    PILL_HEIGHT_FRAC,
+)
 
 OPENAI_BASE = "https://api.openai.com/v1"
 RENDI_BASE = "https://api.rendi.dev"
@@ -487,6 +496,105 @@ async def test_avatar_shape_circle_is_recorded_and_used(
     assert "yuva420p" in composite_cmd
     assert "geq=" in composite_cmd
     assert "hypot(X-W/2,Y-H/2)" in composite_cmd
+
+
+# ── CTA / avatar overlap fix (chat 2026-06-09) ───────────────────────────
+
+
+def test_avatar_margin_y_unchanged_when_cta_disabled() -> None:
+    """No CTA on the row -> avatar keeps today's tight bottom margin."""
+    assert _avatar_margin_y_for_canvas(1920, cta_enabled=False) == AVATAR_OVERLAY_MARGIN_PX
+    assert _avatar_margin_y_for_canvas(1080, cta_enabled=False) == AVATAR_OVERLAY_MARGIN_PX
+    assert _avatar_margin_y_for_canvas(1350, cta_enabled=False) == AVATAR_OVERLAY_MARGIN_PX
+
+
+def test_avatar_margin_y_raises_above_cta_pill_when_enabled() -> None:
+    """When CTA is on, the avatar's bottom margin must clear the pill's
+    top edge plus a small gap. Formula:
+    ``round(canvas_h × PILL_BOTTOM_MARGIN_FRAC) + max(40, round(canvas_h × PILL_HEIGHT_FRAC))
+       + AVATAR_OVER_CTA_GAP_PX``.
+
+    Verifies the result is > today's tight margin (proof the avatar
+    actually moved up) and is large enough for the pill to fit below."""
+    # 9:16 portrait — the most common case from the screenshots.
+    margin_9_16 = _avatar_margin_y_for_canvas(1920, cta_enabled=True)
+    expected_9_16 = (
+        int(round(1920 * PILL_BOTTOM_MARGIN_FRAC))
+        + max(40, int(round(1920 * PILL_HEIGHT_FRAC)))
+        + AVATAR_OVER_CTA_GAP_PX
+    )
+    assert margin_9_16 == expected_9_16
+    # Sanity: should be VERY clearly above today's 40 px.
+    assert margin_9_16 > 200, (
+        f"expected margin to be well above 200 px on 1920 canvas, got {margin_9_16}"
+    )
+
+    # 1:1 square — pill is shorter (smaller canvas height) but still must
+    # leave a clear gap.
+    margin_square = _avatar_margin_y_for_canvas(1080, cta_enabled=True)
+    expected_square = (
+        int(round(1080 * PILL_BOTTOM_MARGIN_FRAC))
+        + max(40, int(round(1080 * PILL_HEIGHT_FRAC)))
+        + AVATAR_OVER_CTA_GAP_PX
+    )
+    assert margin_square == expected_square
+
+
+def test_avatar_margin_y_respects_pill_height_floor() -> None:
+    """On a tiny canvas the pill_h formula would round to <40, but the
+    pill renderer clamps at 40 — our margin computation has to match
+    that floor so they don't desync."""
+    # Canvas where canvas_h × 0.08 rounds to <40. Eg. 400 × 0.08 = 32.
+    margin = _avatar_margin_y_for_canvas(400, cta_enabled=True)
+    # pill_h clamped to 40, plus bottom_margin = round(400 × 0.03) = 12,
+    # plus the 16 px gap.
+    assert margin == 12 + 40 + AVATAR_OVER_CTA_GAP_PX
+
+
+@respx.mock
+async def test_avatar_margin_y_lands_in_metadata_when_cta_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a CTA-enabled row records the raised margin in
+    ``metadata.avatar_overlay_margin_y``. Lets operators (and us)
+    confirm the collision fix actually kicked in for a given row."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(
+        _row(cta_enabled=True), _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    # 9:16 1080×1920 canvas → margin should match the CTA-aware formula.
+    expected = (
+        int(round(1920 * PILL_BOTTOM_MARGIN_FRAC))
+        + max(40, int(round(1920 * PILL_HEIGHT_FRAC)))
+        + AVATAR_OVER_CTA_GAP_PX
+    )
+    assert result.metadata["avatar_overlay_margin_y"] == expected
+
+
+@respx.mock
+async def test_avatar_margin_y_stays_tight_when_cta_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No CTA on the row -> the metadata records the original tight
+    margin. Catches a regression where the formula picks up the
+    raised margin unconditionally."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(
+        _row(cta_enabled=False), _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["avatar_overlay_margin_y"] == AVATAR_OVERLAY_MARGIN_PX
 
 
 @respx.mock
