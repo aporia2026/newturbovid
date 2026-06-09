@@ -195,7 +195,20 @@ class SubmitJobIn(BaseModel):
 class SubmitJobOut(BaseModel):
     job_id: str
     status: str
+    # Number of rows actually enqueued for processing. May be LESS than the
+    # submitted ``len(rows)`` if the queue dedup-suppressed some of them
+    # (those row numbers are already running in another active job for the
+    # same sheet+worksheet). Apps Script should warn the user when this is
+    # zero — a 0/0 job is indistinguishable from "succeeded with no output"
+    # otherwise. Plan: ``_plans/2026-06-09-libsql-key-column-bug.md`` §Fix 3.
     row_count: int
+    # Count of rows the server dropped as duplicates of an in-flight job.
+    # ``submitted_count - row_count`` (i.e. always ``>= 0``). Default 0 so
+    # older Apps Script clients that don't read this field keep working.
+    dropped_count: int = 0
+    # The original count from the Apps Script payload, echoed so the client
+    # can show "queued N of M (D skipped as duplicates)" without re-counting.
+    submitted_count: int = 0
 
 
 def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
@@ -570,14 +583,43 @@ async def submit_job(
             503, "queue temporarily busy", headers={"Retry-After": "5"}
         ) from e
 
+    # Resolve the actual kept row count by reading the job back. ``enqueue``
+    # silently drops rows whose ``row_num`` is already pending/processing in
+    # another active job for the same sheet+worksheet (the dedup guard in
+    # ``_enqueue_sync``). The route caller (Apps Script) needs to see the
+    # difference, otherwise a fully-dropped submit looks like "instantly
+    # completed, no video" — exactly the trap from chat 2026-06-09.
+    submitted_count = len(rows)
+    job = await queue.get_job(job_id)
+    kept_count = job.row_count if job is not None else submitted_count
+    dropped_count = max(0, submitted_count - kept_count)
+
+    if dropped_count:
+        _log.warning(
+            "job_submit_dropped_rows",
+            job_id=job_id,
+            user_email=identity.email,
+            tab_type=payload.tab_type,
+            submitted_count=submitted_count,
+            kept_count=kept_count,
+            dropped_count=dropped_count,
+        )
+
     _log.info(
         "job_submit",
         job_id=job_id,
         user_email=identity.email,
         tab_type=payload.tab_type,
-        row_count=len(rows),
+        row_count=kept_count,
+        dropped_count=dropped_count,
     )
-    return SubmitJobOut(job_id=job_id, status="queued", row_count=len(rows))
+    return SubmitJobOut(
+        job_id=job_id,
+        status="queued" if kept_count else "completed",
+        row_count=kept_count,
+        dropped_count=dropped_count,
+        submitted_count=submitted_count,
+    )
 
 
 @router.get("/poll", response_model=PollOut)

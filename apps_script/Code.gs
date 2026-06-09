@@ -641,8 +641,28 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
 
   PropertiesService.getDocumentProperties().setProperty('LAST_JOB_ID', body.job_id);
 
-  var message = 'Job submitted: ' + body.job_id + '\n' +
-                'Rows queued: ' + body.row_count;
+  // Dropped count = rows the server suppressed as duplicates of an in-flight
+  // job. ``body.dropped_count`` is 0 on older backends — the ``|| 0`` keeps
+  // the alert clean either way.
+  var droppedCount = body.dropped_count || 0;
+  var keptCount = body.row_count || 0;
+  var message;
+  if (keptCount === 0 && droppedCount > 0) {
+    // Whole batch was suppressed. Surface this loudly — previously this
+    // looked identical to "job completed with no output" in the sidebar.
+    message =
+      'No rows were queued.\n\n' +
+      'The server skipped all ' + droppedCount + ' rows because they are ' +
+      'already running in another active job for this sheet.\n\n' +
+      'Wait for the existing job to finish (or use "Stop all jobs" from the ' +
+      'sidebar) and resubmit.';
+  } else {
+    message = 'Job submitted: ' + body.job_id + '\n' +
+              'Rows queued: ' + keptCount;
+    if (droppedCount > 0) {
+      message += '\nSkipped (already in another active job): ' + droppedCount;
+    }
+  }
   if (skipped.length > 0) {
     message += '\n\nSkipped (incomplete):\n' + skipped.join('\n');
   }

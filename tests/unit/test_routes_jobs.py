@@ -242,7 +242,50 @@ def test_submit_image_vo_returns_job_id(client: TestClient) -> None:
     body = r.json()
     assert body["status"] == "queued"
     assert body["row_count"] == 1
+    # Fresh submit — nothing was dropped.
+    assert body["dropped_count"] == 0
+    assert body["submitted_count"] == 1
     assert body["job_id"].startswith("job-")
+
+
+def test_submit_with_all_rows_deduped_returns_zero_kept_and_drop_count(
+    client: TestClient,
+) -> None:
+    """Regression for chat 2026-06-09: when the queue dedup silently
+    suppresses every row (all submitted row_nums are already pending or
+    processing in another active job for the same sheet+worksheet),
+    the route used to return ``row_count = len(rows)`` — making the
+    response indistinguishable from a healthy submit. Apps Script then
+    showed "Job submitted: N" while the job was actually 0/0.
+
+    The fix surfaces the actual kept count + a dropped count + the
+    original submitted count so the client can warn the operator.
+    """
+    # First submit lands the row in pending/queued state.
+    first = client.post(
+        "/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1")
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["row_count"] == 1
+    assert first_body["dropped_count"] == 0
+
+    # Resubmit the SAME row_num for the SAME sheet+worksheet. The dedup
+    # guard in ``_enqueue_sync`` drops it; the resulting job has 0 rows.
+    second = client.post(
+        "/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1")
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    # Honest accounting: 0 kept, 1 dropped, 1 submitted, status reflects
+    # that the job is already complete (0/0) rather than queued for work.
+    assert body["row_count"] == 0
+    assert body["dropped_count"] == 1
+    assert body["submitted_count"] == 1
+    assert body["status"] == "completed"
+    # And the job_id is brand-new (the previous one is still active and
+    # owns the row — we don't replay it).
+    assert body["job_id"] != first_body["job_id"]
 
 
 def test_submit_four_images_returns_job_id(client: TestClient) -> None:
