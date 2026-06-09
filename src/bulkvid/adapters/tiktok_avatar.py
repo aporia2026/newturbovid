@@ -48,11 +48,14 @@ _log = get_logger("tiktok_avatar")
 # can override per-environment via env var without touching code.
 
 _DEFAULT_BASE = "https://business-api.tiktok.com/open_api/v1.3"
-_DEFAULT_CREATE_URL = f"{_DEFAULT_BASE}/business/symphony/avatar/"
-_DEFAULT_GET_URL = f"{_DEFAULT_BASE}/business/symphony/avatar/get/"
-# Confirmed working endpoint (operator's Avatar.py, chat 2026-06-09).
-# This endpoint paginates with page + page_size (1..100) and returns
-# avatars under data.list — NOT under data.avatars or similar.
+# All three endpoints live under ``/creative/digital_avatar/`` — same
+# namespace as the operator's confirmed-working ``Avatar.py`` list call.
+# The previous ``/business/symphony/avatar/`` guess returned 404 and
+# killed the avatar row instantly when it tried to create a narration
+# task (chat 2026-06-09). Override per-deploy via env vars if TikTok
+# bumps the API version.
+_DEFAULT_CREATE_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/create/"
+_DEFAULT_GET_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/task/get/"
 _DEFAULT_AVATAR_LIST_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/get/"
 
 # Pagination + retry constants for the list endpoint, copied verbatim
