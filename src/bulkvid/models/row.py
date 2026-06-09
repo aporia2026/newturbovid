@@ -125,24 +125,30 @@ class AvatarRow:
 
 @dataclass
 class TextOnImgRow:
-    """``paste text on img`` tab input row — one video from the user's
-    Manual Image with the operator-typed ``text`` overlaid in the center
-    (heavy white, thick black outline). Same VO pipeline as the simple
-    tab — article fetch → script gen → TTS. Exactly one ``Ready Video``
-    is written back. Plan ``_plans/2026-06-09-paste-text-on-img-tab.md``.
+    """``paste text on img`` tab input row — one IMAGE (not video) from the
+    user's Manual Image with the operator-typed ``text`` overlaid in the
+    center (heavy white, thick black outline). The composed PNG is written
+    back to the ``Ready Image`` column.
+
+    The video pipeline (article fetch → script → TTS → Rendi → ZapCap)
+    was stripped on 2026-06-09 per the user's "should produce an image,
+    not a video" call. ``article_url`` / ``voice_over`` / ``zapcap`` /
+    ``script_pattern`` / ``open_comments`` are retained for wire
+    compatibility with the existing Apps Script payload but are ignored
+    by the processor.
     """
 
     row_num: int
     country: str
     vertical: str
-    article_url: str
+    article_url: str                  # ignored — kept for wire compat
     manual_image_url: str
     text: str                         # the overlay text — central to this tab
-    voice_over: bool                  # default True
-    zapcap: bool                      # default False
+    voice_over: bool                  # ignored — kept for wire compat
+    zapcap: bool                      # ignored — kept for wire compat
     aspect_ratio: str                 # e.g. "9:16"
-    script_pattern: str
-    open_comments: str
+    script_pattern: str               # ignored — kept for wire compat
+    open_comments: str                # ignored — kept for wire compat
 
 
 @dataclass

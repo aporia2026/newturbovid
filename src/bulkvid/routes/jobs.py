@@ -150,8 +150,11 @@ class AvatarRowIn(BaseModel):
 
 class TextOnImgRowIn(BaseModel):
     """Wire shape for the ``paste text on img`` tab — Image-VO inputs plus
-    the operator-typed ``text`` to overlay on the manual image. Plan
-    ``_plans/2026-06-09-paste-text-on-img-tab.md``."""
+    the operator-typed ``text`` to overlay on the manual image. Produces
+    a still PNG (no video). ``article_url`` / ``voice_over`` / ``zapcap`` /
+    ``script_pattern`` / ``open_comments`` are accepted for Apps Script
+    payload compatibility but ignored by the processor (2026-06-09:
+    video pipeline stripped per user direction)."""
 
     row_num: int = Field(ge=1)
     country: str = ""
@@ -263,6 +266,10 @@ def _build_text_on_img_row(r: TextOnImgRowIn) -> TextOnImgRow:
     longer string would auto-shrink to the floor font size and become
     unreadable anyway — 240 chars is ~3 long sentences, comfortably
     above any realistic ad headline.
+
+    article_url / voice_over / zapcap / script_pattern / open_comments
+    are passed through but ignored downstream — the processor produces
+    a still PNG with no script or VO.
     """
     return TextOnImgRow(
         row_num=r.row_num,

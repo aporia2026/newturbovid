@@ -422,7 +422,9 @@ function _validateAvatar(r) {
 
 
 function _validateTextOnImg(r) {
-  if (!r.article_url) return 'article URL missing';
+  // Article URL is no longer needed — the tab produces a still image, not a
+  // video, so there's no script/VO pipeline that would consume the article.
+  // Only the manual image is required. (2026-06-09: video pipeline stripped.)
   if (!r.manual_image_url) return 'manual image URL missing';
   // Empty Text is allowed (the renderer ships the image as-is). Length is
   // bounded by _readTextOnImgRow's .slice(0, 240) above — no upper-bound
