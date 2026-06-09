@@ -28,46 +28,64 @@ async def test_set_works_when_connection_lacks_context_manager(
     store: SettingsStore,
 ) -> None:
     """Regression for chat 2026-06-09: the production libsql remote
-    connection (``_LibsqlConn``) does NOT implement the context-manager
-    protocol, so the previous ``with self._conn:`` block raised
+    connection wrapper (``_LibsqlConn``) does NOT support the
+    context-manager protocol on the type, so ``with self._conn:`` raises
     ``TypeError: '_LibsqlConn' object does not support the context
-    manager protocol``. The picker page tripped on this when it tried
-    to cache the auto-fetched avatar list.
+    manager protocol``. The avatar picker tripped on this when it tried
+    to cache the auto-fetched list.
 
-    Wrap the real sqlite3 connection in a proxy that hides ``__enter__``
-    / ``__exit__``, then confirm ``set`` still writes via the
-    autocommit fallback path."""
+    The proxy below mimics ``_LibsqlConn`` exactly: its CLASS doesn't
+    define ``__enter__`` / ``__exit__``, but its ``__getattr__``
+    forwards EVERYTHING to an inner sqlite3 connection (which DOES
+    have those dunders). This causes ``hasattr(proxy, "__enter__")``
+    to return True even though ``with proxy:`` fails — the same trap
+    the production code fell into. Checking on the type avoids it.
+    """
     real_conn = store._conn
 
-    class _NoContextManagerProxy:
-        """Forwards attribute access EXCEPT for the context-manager
-        dunders. Mimics what httpx's libsql wrapper actually does."""
+    class _LibsqlLikeProxy:
+        """Same shape as the real ``_LibsqlConn``: no ``__enter__`` on
+        the class, but ``__getattr__`` forwards to the inner conn."""
+
         def __init__(self, inner):
             self.__dict__["_inner"] = inner
 
         def __getattr__(self, name):
-            if name in ("__enter__", "__exit__"):
-                raise AttributeError(name)
             return getattr(self._inner, name)
 
         def __setattr__(self, name, value):
             setattr(self._inner, name, value)
 
-    store._conn = _NoContextManagerProxy(real_conn)    # type: ignore[assignment]
+    proxy = _LibsqlLikeProxy(real_conn)
+
+    # Sanity-check the trap: hasattr returns True on the instance (via
+    # __getattr__ forwarding to sqlite3.Connection which has __enter__),
+    # but `with` would fail because type-based lookup bypasses
+    # __getattr__. If this assertion ever changes, the production bug
+    # has resurfaced.
+    assert hasattr(proxy, "__enter__"), (
+        "test proxy isn't mimicking _LibsqlConn correctly — "
+        "instance-level hasattr should still return True"
+    )
+    assert not hasattr(type(proxy), "__enter__"), (
+        "test proxy isn't mimicking _LibsqlConn correctly — "
+        "the class must NOT define __enter__"
+    )
+
+    store._conn = proxy    # type: ignore[assignment]
     try:
-        # Smoke test: set should succeed via the nullcontext fallback.
+        # Smoke test: set must succeed via the autocommit fallback path.
         old = await store.set(
             "kie_model", "first-write", updated_by="regression-test",
         )
         assert old is None    # never written before
-        # Round-trip: the value reads back correctly.
         assert await store.get("kie_model") == "first-write"
-        # Idempotent write: same value returns the old value, no error.
+        # Idempotent re-write: same value returns the old value.
         old = await store.set(
             "kie_model", "first-write", updated_by="regression-test",
         )
         assert old == "first-write"
-        # Updating to a new value also works through the fallback path.
+        # Updating to a new value also works.
         old = await store.set(
             "kie_model", "updated", updated_by="regression-test",
         )

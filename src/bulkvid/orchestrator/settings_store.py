@@ -129,8 +129,20 @@ class SettingsStore:
         now = _now_iso()
         # Pick a transactional context if the connection supports one;
         # otherwise yield nothing (each execute autocommits on libsql).
+        #
+        # CRITICAL: check on the TYPE, not the instance. Python's ``with``
+        # statement does special method lookup — ``type(obj).__enter__``
+        # — which bypasses instance-level ``__getattr__`` proxies. The
+        # ``_LibsqlConn`` wrapper has ``__getattr__`` that forwards
+        # everything to the inner libsql connection (which DOES have
+        # ``__enter__``), so ``hasattr(self._conn, "__enter__")`` returns
+        # True even though ``with self._conn:`` then raises
+        # ``TypeError: ... does not support the context manager protocol``.
+        # Checking on the type avoids the trap.
         from contextlib import nullcontext
-        txn = self._conn if hasattr(self._conn, "__enter__") else nullcontext()
+        cls = type(self._conn)
+        supports_ctx = hasattr(cls, "__enter__") and hasattr(cls, "__exit__")
+        txn = self._conn if supports_ctx else nullcontext()
         with txn:
             cur = self._conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
