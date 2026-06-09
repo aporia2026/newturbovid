@@ -250,14 +250,9 @@ function _yes(value, def) {
 
 /** Find a column by its row-1 header name (case-insensitive, trim-aware).
  *  Returns the 1-based column index, or 0 when the header isn't present.
- *
- *  Used by the avatar tab for the optional Avatar Size / Avatar Shape
- *  columns (chat 2026-06-09 — plan
- *  _plans/2026-06-09-avatar-overlay-size-shape.md). Header-based lookup
- *  lets existing sheets add the new columns at ANY position the operator
- *  prefers, and lets sheets that DON'T have them keep working unchanged
- *  (the row reader sees a 0 and returns the empty string, which the
- *  backend treats as "use the default"). */
+ *  Lightweight helper kept for callers that only need ONE column. The
+ *  row readers below build a full header→col map once per read instead.
+ *  Plan _plans/2026-06-09-avatar-overlay-size-shape.md. */
 function _findHeaderCol(sheet, headerName) {
   const lastCol = sheet.getLastColumn();
   if (lastCol === 0) return 0;
@@ -269,6 +264,48 @@ function _findHeaderCol(sheet, headerName) {
     }
   }
   return 0;
+}
+
+
+/** Build a {normalized-header → 1-based column index} map from row 1.
+ *  First-occurrence wins (so a duplicate header is harmless). Used by
+ *  ``_readAvatarRow`` so the operator can insert columns ANYWHERE without
+ *  breaking the input read.
+ *
+ *  Chat 2026-06-09: an operator added "Avatar Size" + "Avatar Shape"
+ *  between "Avatar ID" and "Voice Over"; every subsequent column
+ *  shifted right by 2 and the positional reads grabbed the wrong cells
+ *  (voice_over read "Small", aspect_ratio read "Yes", etc.). Reading
+ *  by header name makes the input layout robust to column reordering. */
+function _buildHeaderColMap(sheet) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return {};
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const map = {};
+  for (var i = 0; i < headers.length; i++) {
+    const name = String(headers[i] || '').toLowerCase().trim();
+    if (name && !(name in map)) {    // first occurrence wins
+      map[name] = i + 1;
+    }
+  }
+  return map;
+}
+
+
+/** Look up the column for the first matching header name in ``candidates``.
+ *  Returns the 1-based column index, or ``fallback`` (also 1-based) when
+ *  none of the candidates is present.
+ *
+ *  ``candidates`` is an array because some columns have known synonyms —
+ *  e.g. some sheets label the avatar id column "Avatar ID (NEW)" while
+ *  others use just "Avatar ID". We accept either rather than forcing a
+ *  one-time rename. */
+function _colForHeaders(headerMap, candidates, fallback) {
+  for (var i = 0; i < candidates.length; i++) {
+    const name = String(candidates[i] || '').toLowerCase().trim();
+    if (name && (name in headerMap)) return headerMap[name];
+  }
+  return fallback || 0;
 }
 
 
@@ -341,39 +378,60 @@ function _readCartoonRow(sheet, rowNum) {
 
 
 function _readAvatarRow(sheet, rowNum) {
-  // video with avatar: A-D from Image-VO, plus Avatar ID at E. The Avatar
-  // ID is the TikTok Symphony avatar to narrate the video — operator picks
-  // from /admin/avatars and pastes the ID here. CTA columns mirror cartoon.
+  // video with avatar: every input column is resolved by HEADER NAME
+  // first, with the AVATAR_COLS positional value as fallback for sheets
+  // whose row 1 headers don't match the canonical names. Header-first
+  // lookup means inserting / moving / renaming a column doesn't break
+  // the read — the bug from chat 2026-06-09 (operator added Avatar Size
+  // / Avatar Shape between Avatar ID and Voice Over, shifting everything
+  // right by 2; voice_over read "Small", cta_enabled read "09:16", etc.)
+  // is no longer possible.
   const cols = AVATAR_COLS;
-  // Read the full row out to lastColumn so we can pick up optional columns
-  // (Avatar Size / Avatar Shape) that may sit anywhere past lastInputCol.
-  // Operators add these columns when they want non-default behaviour;
-  // sheets without them still work — header lookup returns 0 and the
-  // backend defaults to today's Medium + Rectangle.
+  const headerMap = _buildHeaderColMap(sheet);
   const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
   const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
-  const sizeCol = _findHeaderCol(sheet, 'Avatar Size');
-  const shapeCol = _findHeaderCol(sheet, 'Avatar Shape');
+
+  // Resolve every input column by header. The second arg to
+  // _colForHeaders is the positional fallback (the canonical AVATAR_COLS
+  // index) so a brand-new sheet with no headers still reads correctly.
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage  = _colForHeaders(headerMap, ['Manual Image'], cols.manualImage);
+  // "Avatar ID" and "Avatar ID (NEW)" both refer to the same column.
+  // Accepting both prevents a one-time sheet rename from breaking
+  // submits across sheets that label it differently.
+  const cAvatarId     = _colForHeaders(
+    headerMap, ['Avatar ID', 'Avatar ID (NEW)'], cols.avatarId
+  );
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments'], cols.openComments);
+  // Optional knobs — no positional fallback (these columns may not
+  // exist at all; 0 → empty string → backend uses today's defaults).
+  const cAvatarSize   = _colForHeaders(headerMap, ['Avatar Size'], 0);
+  const cAvatarShape  = _colForHeaders(headerMap, ['Avatar Shape'], 0);
+
   return {
     row_num: rowNum,
-    country: _cell(values, cols.country),
-    vertical: _cell(values, cols.vertical),
-    article_url: _cell(values, cols.article),
-    manual_image_url: _cell(values, cols.manualImage),
-    avatar_id: _cell(values, cols.avatarId).slice(0, 64),
-    voice_over: _yes(_cell(values, cols.voiceOver), true),
-    zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
-    script_pattern: _cell(values, cols.scriptPattern),
-    cta_enabled: _yes(_cell(values, cols.ctaEnabled), false),
-    cta_text: _cell(values, cols.ctaText).slice(0, 80),
-    open_comments: _cell(values, cols.openComments),
-    // Optional dropdown knobs — empty when the header isn't present in
-    // the sheet, when the cell is blank, or when the operator typed
-    // something the backend's enum coercion rejects. Lower-casing
-    // matches what the route layer expects.
-    avatar_size: sizeCol ? _cell(values, sizeCol).toLowerCase() : '',
-    avatar_shape: shapeCol ? _cell(values, shapeCol).toLowerCase() : '',
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_url: _cell(values, cManualImage),
+    avatar_id: _cell(values, cAvatarId).slice(0, 64),
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+    avatar_size: cAvatarSize ? _cell(values, cAvatarSize).toLowerCase() : '',
+    avatar_shape: cAvatarShape ? _cell(values, cAvatarShape).toLowerCase() : '',
   };
 }
 

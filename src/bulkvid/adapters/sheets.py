@@ -731,10 +731,58 @@ class SheetsClient:
 
     # ── Public write API (the coalesced flush callback) ─────────────────────
 
+    # Header names the writer treats as the FIRST Ready Video output column.
+    # Header-first lookup makes the write robust to operators inserting /
+    # moving columns: a sheet whose Ready Video lives at column O still
+    # receives the URL there even though ``AVATAR_COLS.ready_video_start``
+    # says M. Chat 2026-06-09: after the avatar tab grew Avatar Size +
+    # Avatar Shape columns at F/G, the operator's existing sheet shifted
+    # Ready Video from M to O, but the write kept going to M (CTA Text)
+    # because the writer used the positional fallback unconditionally.
+    _READY_VIDEO_HEADER_CANDIDATES: tuple[str, ...] = (
+        "ready video",
+        "ready video 1",
+        "ready_video",
+        "ready_video_1",
+    )
+
+    def _resolve_ready_video_col_sync(
+        self, sheet_id: str, worksheet_name: str, positional_fallback: int,
+    ) -> int:
+        """Return the 0-indexed first-Ready-Video column for the worksheet.
+
+        Looks for a "Ready Video" / "Ready Video 1" header in row 1 (case-
+        and whitespace-insensitive); falls back to ``positional_fallback``
+        when no header matches OR when the read fails. One Google Sheets
+        API call per (sheet, worksheet) batch — negligible vs the cell-write
+        cost.
+        """
+        try:
+            headers = self._read_header_row_sync(sheet_id, worksheet_name)
+        except Exception as e:    # noqa: BLE001 — never fail the write on a header read
+            _log.warning(
+                "ready_video_header_lookup_failed_fallback_positional",
+                sheet_id=sheet_id,
+                worksheet=worksheet_name,
+                error=str(e)[:200],
+                positional_fallback=positional_fallback,
+            )
+            return positional_fallback
+        for idx, raw in enumerate(headers):
+            cleaned = str(raw or "").strip().lower()
+            if cleaned in self._READY_VIDEO_HEADER_CANDIDATES:
+                return idx
+        return positional_fallback
+
     async def batch_write_video_urls(self, writes: list[PendingWrite]) -> int:
         """Group by (sheet, worksheet) and issue one ``batch_update`` per destination.
 
         Returns the total number of cell updates issued.
+
+        The Ready Video target column is resolved by HEADER NAME (with the
+        per-tab positional value as fallback) so a sheet whose operator
+        inserted extra input columns still receives the URL in the column
+        actually labelled "Ready Video". Chat 2026-06-09.
         """
         if not writes:
             return 0
@@ -745,7 +793,7 @@ class SheetsClient:
 
         total_cells = 0
         for (sheet_id, worksheet, tab_type), batch in grouped.items():
-            ready_start = (
+            positional_fallback = (
                 IMAGE_VO_COLS.ready_video_start
                 if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
                 else CARTOON_COLS.ready_video_start
@@ -760,7 +808,7 @@ class SheetsClient:
                 if tab_type == TAB_AVATAR
                 else None
             )
-            if ready_start is None:
+            if positional_fallback is None:
                 _log.error(
                     "skip_unknown_tab_type",
                     tab_type=tab_type,
@@ -768,6 +816,23 @@ class SheetsClient:
                     worksheet=worksheet,
                 )
                 continue
+
+            ready_start = await self._to_thread_with_retry(
+                self._resolve_ready_video_col_sync,
+                sheet_id,
+                worksheet,
+                positional_fallback,
+                op="sheets resolve_ready_video_col",
+            )
+            if ready_start != positional_fallback:
+                _log.info(
+                    "ready_video_col_resolved_by_header",
+                    sheet_id=sheet_id,
+                    worksheet=worksheet,
+                    tab_type=tab_type,
+                    resolved_col_0based=ready_start,
+                    positional_fallback=positional_fallback,
+                )
 
             updates: list[dict[str, Any]] = []
             for w in batch:

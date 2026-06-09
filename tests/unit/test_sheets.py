@@ -25,7 +25,7 @@ import pytest
 
 from bulkvid.adapters.sheets import FOUR_IMAGES_COLS, IMAGE_VO_COLS, SheetsClient
 from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
-from bulkvid.orchestrator.queue import TAB_FOUR_IMAGES, TAB_IMAGE_VO
+from bulkvid.orchestrator.queue import TAB_AVATAR, TAB_FOUR_IMAGES, TAB_IMAGE_VO
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -452,6 +452,77 @@ async def test_groups_by_sheet_and_worksheet_one_batch_each() -> None:
     assert ws_b.batch_update.call_count == 1
     assert len(ws_a.batch_update.call_args.args[0]) == 2
     assert len(ws_b.batch_update.call_args.args[0]) == 1
+
+
+async def test_avatar_writes_to_ready_video_header_column_when_shifted() -> None:
+    """Regression for chat 2026-06-09: the operator added Avatar Size +
+    Avatar Shape columns at F + G, shifting every column right by 2.
+    The hardcoded ``AVATAR_COLS.ready_video_start = 12`` (column M) was
+    no longer where "Ready Video" actually lived (now column O), so the
+    URL landed in CTA Text instead.
+
+    With header-based resolution, the writer looks up the column whose
+    row-1 header reads ``Ready Video`` and writes there — column O on
+    this shifted sheet.
+    """
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+    # Pre-create the worksheet mock so we can set its row_values BEFORE
+    # the batch_write touches it. row 1 has the shifted layout the
+    # operator's actual sheet showed in the screenshot.
+    ws = client.open_by_key("sheet-A").worksheet("avatar tab")
+    ws.row_values = MagicMock(return_value=[
+        "Country", "Vertical", "Article", "Manual Image", "Avatar ID (NEW)",
+        "Avatar Size", "Avatar Shape",
+        "Voice Over", "ZapCap", "Change Size", "Script Pattern",
+        "CTA", "CTA Text", "Open Comments",
+        "Ready Video",
+    ])
+
+    await sc.batch_write_video_urls([
+        _write(
+            sheet_id="sheet-A",
+            worksheet="avatar tab",
+            tab_type=TAB_AVATAR,
+            row_num=2,
+            video_urls=["https://video.test/avatar.mp4"],
+        )
+    ])
+
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # Header says Ready Video sits at column O (15th column, 1-indexed)
+    # — that's where the URL must land, NOT M (the old AVATAR_COLS
+    # positional fallback).
+    assert cells == {"O2": "https://video.test/avatar.mp4"}, (
+        f"expected URL at O2 (Ready Video header position), got {cells!r}"
+    )
+
+
+async def test_avatar_writes_falls_back_to_positional_when_no_header() -> None:
+    """Brand-new sheet with no row-1 headers: the writer must keep using
+    today's positional fallback (column M for the avatar tab) so existing
+    sheets without headers don't regress."""
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+    # row_values returns empty -> header lookup fails -> positional fallback.
+    ws = client.open_by_key("sheet-A").worksheet("avatar tab")
+    ws.row_values = MagicMock(return_value=[])
+
+    await sc.batch_write_video_urls([
+        _write(
+            sheet_id="sheet-A",
+            worksheet="avatar tab",
+            tab_type=TAB_AVATAR,
+            row_num=2,
+            video_urls=["https://video.test/fallback.mp4"],
+        )
+    ])
+
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # AVATAR_COLS.ready_video_start = 12 (0-indexed) → column M.
+    assert cells == {"M2": "https://video.test/fallback.mp4"}
 
 
 async def test_skips_empty_url_slots() -> None:
