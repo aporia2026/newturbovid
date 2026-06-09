@@ -90,9 +90,41 @@ _log = get_logger("row")
 
 IMAGE_RESOLUTION = "1K"
 
-# Avatar overlay geometry — bottom-left, ~30 % canvas width.
-AVATAR_OVERLAY_WIDTH_FRAC = 0.30
+# Avatar overlay geometry — bottom-left.
+# Per-row size (operator-facing dropdown) maps to a canvas-width
+# fraction; the empty / unknown case falls back to ``Medium`` so
+# existing sheets without the column keep rendering at today's 30 %.
+# Plan: ``_plans/2026-06-09-avatar-overlay-size-shape.md``.
 AVATAR_OVERLAY_MARGIN_PX = 40
+_AVATAR_SIZE_TO_FRAC: dict[str, float] = {
+    "small": 0.20,
+    "medium": 0.30,
+    "large": 0.40,
+}
+_AVATAR_DEFAULT_SIZE = "medium"
+# Per-row shape: ``rectangle`` (today's behaviour, the native avatar
+# video aspect) or ``circle`` (centre-crop to a square + alpha mask).
+_AVATAR_ALLOWED_SHAPES: frozenset[str] = frozenset({"rectangle", "circle"})
+_AVATAR_DEFAULT_SHAPE = "rectangle"
+
+
+def _resolve_avatar_size(raw: str) -> tuple[str, float]:
+    """Resolve the operator's Avatar Size cell to (resolved_name, width_fraction).
+
+    Empty / typo / unknown all collapse to the default. The resolved
+    name is what we log + stash in metadata so the audit trail shows
+    what actually rendered, not what the operator typed.
+    """
+    name = (raw or "").strip().lower()
+    if name not in _AVATAR_SIZE_TO_FRAC:
+        name = _AVATAR_DEFAULT_SIZE
+    return name, _AVATAR_SIZE_TO_FRAC[name]
+
+
+def _resolve_avatar_shape(raw: str) -> str:
+    """Resolve the operator's Avatar Shape cell to a known enum value."""
+    name = (raw or "").strip().lower()
+    return name if name in _AVATAR_ALLOWED_SHAPES else _AVATAR_DEFAULT_SHAPE
 
 # Article excerpt size for the background-image prompt. Same budget the
 # cartoon planner uses (3 000 chars); long enough to ground the kie
@@ -196,6 +228,10 @@ async def process_avatar_row(
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
     aspect = normalize_aspect_ratio(row.aspect_ratio)
+    # Resolve operator-facing overlay knobs up front so the row_start log
+    # records what we'll ACTUALLY render (not what was raw in the cell).
+    resolved_size_name, size_frac = _resolve_avatar_size(row.avatar_size)
+    resolved_shape = _resolve_avatar_shape(row.avatar_shape)
     metadata: dict[str, Any] = {
         "row_num": row.row_num,
         "country": row.country,
@@ -207,6 +243,10 @@ async def process_avatar_row(
         "tab": "avatar",
         "avatar_id": row.avatar_id,
         "manual_image_provided": bool(row.manual_image_url),
+        "avatar_size": resolved_size_name,
+        "avatar_size_raw": row.avatar_size,
+        "avatar_shape": resolved_shape,
+        "avatar_shape_raw": row.avatar_shape,
         # Pipeline version stamp — bump if the row processor's shape changes
         # so a future "wait, when did this start working/breaking?" question
         # is one grep away.
@@ -222,6 +262,8 @@ async def process_avatar_row(
         zapcap=row.zapcap,
         avatar_id=row.avatar_id,
         manual_image=bool(row.manual_image_url),
+        avatar_size=resolved_size_name,
+        avatar_shape=resolved_shape,
         tab="avatar",
         pipeline_version="static_image_v2",
     )
@@ -410,7 +452,9 @@ async def process_avatar_row(
         cleanup_command_ids: list[str] = []
         try:
             canvas_w, _ = dimensions_for_ratio(row.aspect_ratio)
-            overlay_px = max(120, int(canvas_w * AVATAR_OVERLAY_WIDTH_FRAC))
+            # 120 px floor so a Small selection on a 1:1 1080-canvas still
+            # renders a legible avatar; below that the head reads as a blob.
+            overlay_px = max(120, int(canvas_w * size_frac))
             composited = await clients.rendi.still_image_with_avatar_overlay(
                 background_image_url=background_image_url,
                 overlay_video_url=avatar_preview_url,
@@ -419,6 +463,7 @@ async def process_avatar_row(
                 overlay_width_px=overlay_px,
                 margin_x=AVATAR_OVERLAY_MARGIN_PX,
                 margin_y=AVATAR_OVERLAY_MARGIN_PX,
+                shape=resolved_shape,
             )
             costs.rendi += composited.cost_usd
             cleanup_command_ids.append(composited.command_id)

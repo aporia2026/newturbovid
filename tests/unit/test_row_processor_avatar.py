@@ -227,6 +227,8 @@ def _row(
     manual_image: str = "https://example.com/seed.png",
     cta_enabled: bool = False,
     avatar_id: str = "7617939650801745940",
+    avatar_size: str = "",
+    avatar_shape: str = "",
 ) -> AvatarRow:
     return AvatarRow(
         row_num=2, country="DE", vertical="Car Deals PR",
@@ -237,6 +239,8 @@ def _row(
         script_pattern="How To",
         cta_enabled=cta_enabled, cta_text="",
         open_comments="",
+        avatar_size=avatar_size,
+        avatar_shape=avatar_shape,
     )
 
 
@@ -364,3 +368,149 @@ async def test_avatar_tiktok_failure_surfaces_tts_failed(
 
     assert result.status == STATUS_TTS_FAILED
     assert "TikTok" in (result.error or "")
+
+
+# ── Per-row overlay knobs (Avatar Size + Avatar Shape) ────────────────────
+
+
+@respx.mock
+async def test_avatar_default_size_and_shape_match_today(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty Avatar Size / Avatar Shape cells fall back to today's
+    Medium + Rectangle. Existing sheets without the new columns keep
+    rendering exactly the same as before."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(_row(), _build_clients(), job_id="jobX")
+
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["avatar_size"] == "medium"
+    assert result.metadata["avatar_shape"] == "rectangle"
+    # 9:16 → canvas width 1080; medium = 30% → 324 px overlay.
+    assert result.metadata["avatar_overlay_width_px"] == 324
+
+
+@respx.mock
+async def test_avatar_size_small_uses_20pct_canvas_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avatar Size = Small → overlay is 20 % of canvas width."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(
+        _row(avatar_size="Small"),    # uppercase to exercise the lowercasing
+        _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["avatar_size"] == "small"
+    # 1080 × 0.20 = 216 px.
+    assert result.metadata["avatar_overlay_width_px"] == 216
+
+
+@respx.mock
+async def test_avatar_size_large_uses_40pct_canvas_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avatar Size = Large → overlay is 40 % of canvas width."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(
+        _row(avatar_size="large"), _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["avatar_size"] == "large"
+    # 1080 × 0.40 = 432 px.
+    assert result.metadata["avatar_overlay_width_px"] == 432
+
+
+@respx.mock
+async def test_avatar_shape_circle_is_recorded_and_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avatar Shape = Circle → the row metadata records ``circle`` and
+    the Rendi ffmpeg command for this row uses the yuva alpha mask.
+
+    We can't easily intercept the Rendi-internal command string at the
+    method boundary in this test (it goes through ``_submit_and_poll``
+    where the command is baked into an HTTP POST body), so we capture
+    the POST body via respx and assert it carries the circle filter."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    # Custom Rendi submit handler that records each ffmpeg_command for
+    # later inspection.
+    captured: list[str] = []
+    counter = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        body = json.loads(request.content)
+        captured.append(body.get("ffmpeg_command", ""))
+        return httpx.Response(200, json={"command_id": f"cmd-{counter['n']}"})
+
+    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
+    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "SUCCESS",
+                  "output_files": {"out_1": {"storage_url": "https://r.dev/o.mp4"}}},
+        )
+    )
+    respx.delete(url__regex=r"https://api\.rendi\.dev/v1/commands/.+/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    result = await process_avatar_row(
+        _row(avatar_shape="Circle"), _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["avatar_shape"] == "circle"
+    # First Rendi command is the still-image+avatar composite; it MUST
+    # contain the circle-shape filter graph (yuva + geq + hypot).
+    assert captured, "expected at least one Rendi submit call"
+    composite_cmd = captured[0]
+    assert "yuva420p" in composite_cmd
+    assert "geq=" in composite_cmd
+    assert "hypot(X-W/2,Y-H/2)" in composite_cmd
+
+
+@respx.mock
+async def test_avatar_invalid_size_or_shape_falls_back_to_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in Avatar Size / Avatar Shape (e.g. ``"medum"`` /
+    ``"round"``) must NOT 500 the row — it must silently fall back to
+    today's defaults. Matches the same forgiving behaviour the route
+    layer enforces."""
+    monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
+    _register_openai_routes()
+    _register_rendi_routes()
+    _register_tiktok_routes()
+    _register_downloads()
+
+    result = await process_avatar_row(
+        _row(avatar_size="huge", avatar_shape="hexagon"),
+        _build_clients(), job_id="jobX",
+    )
+    assert result.status == STATUS_SUCCESS
+    # Resolved values (what actually rendered) — the defaults.
+    assert result.metadata["avatar_size"] == "medium"
+    assert result.metadata["avatar_shape"] == "rectangle"
+    # Raw values (what the operator typed) — preserved for diagnostics.
+    assert result.metadata["avatar_size_raw"] == "huge"
+    assert result.metadata["avatar_shape_raw"] == "hexagon"

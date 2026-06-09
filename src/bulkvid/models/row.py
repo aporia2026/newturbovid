@@ -102,17 +102,26 @@ class SimpleRow:
 
 @dataclass
 class AvatarRow:
-    """``video with avatar`` tab input row — 8 s video with two
-    AI-generated scenes (4 s each) narrated by a TikTok Symphony avatar
-    composited at the bottom-left. Exactly one ``Ready Video`` is
-    written back. Plan ``_plans/2026-06-09-video-with-avatar-tab.md``.
+    """``video with avatar`` tab input row — static background image
+    (Manual Image used as-is, or a single kie text-to-image) with a
+    TikTok Symphony avatar composited at the bottom-left for the full
+    avatar audio duration. Exactly one ``Ready Video`` is written back.
+
+    Pipeline plan: ``_plans/2026-06-09-avatar-static-image-pipeline.md``
+    (replaced the original 2-shot Seedance plan).
+
+    ``avatar_size`` / ``avatar_shape`` are operator-facing knobs added
+    2026-06-09 (plan
+    ``_plans/2026-06-09-avatar-overlay-size-shape.md``). Both default
+    to ``""`` so existing sheets that don't have the new columns keep
+    rendering today's behaviour (Medium / Rectangle).
     """
 
     row_num: int
     country: str
     vertical: str
     article_url: str
-    manual_image_url: str             # blank → text-to-image; else image-to-image seed
+    manual_image_url: str             # blank → text-to-image; else used as-is
     avatar_id: str                    # TikTok Symphony avatar id (per row)
     voice_over: bool                  # default True — the avatar narrates
     zapcap: bool                      # default False
@@ -121,6 +130,9 @@ class AvatarRow:
     cta_enabled: bool                 # Yes/No — yellow pill at bottom if Yes
     cta_text: str                     # blank → per-language fallback
     open_comments: str
+    # New 2026-06-09. Empty string = use today's default behaviour.
+    avatar_size: str = ""             # "" | "small" | "medium" | "large"
+    avatar_shape: str = ""            # "" | "rectangle" | "circle"
 
 
 @dataclass

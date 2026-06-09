@@ -248,6 +248,30 @@ function _yes(value, def) {
 }
 
 
+/** Find a column by its row-1 header name (case-insensitive, trim-aware).
+ *  Returns the 1-based column index, or 0 when the header isn't present.
+ *
+ *  Used by the avatar tab for the optional Avatar Size / Avatar Shape
+ *  columns (chat 2026-06-09 — plan
+ *  _plans/2026-06-09-avatar-overlay-size-shape.md). Header-based lookup
+ *  lets existing sheets add the new columns at ANY position the operator
+ *  prefers, and lets sheets that DON'T have them keep working unchanged
+ *  (the row reader sees a 0 and returns the empty string, which the
+ *  backend treats as "use the default"). */
+function _findHeaderCol(sheet, headerName) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return 0;
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const target = String(headerName).toLowerCase().trim();
+  for (var i = 0; i < headers.length; i++) {
+    if (String(headers[i] || '').toLowerCase().trim() === target) {
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+
 function _readImageVORow(sheet, rowNum) {
   const cols = IMAGE_VO_COLS;
   const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
@@ -321,7 +345,15 @@ function _readAvatarRow(sheet, rowNum) {
   // ID is the TikTok Symphony avatar to narrate the video — operator picks
   // from /admin/avatars and pastes the ID here. CTA columns mirror cartoon.
   const cols = AVATAR_COLS;
-  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  // Read the full row out to lastColumn so we can pick up optional columns
+  // (Avatar Size / Avatar Shape) that may sit anywhere past lastInputCol.
+  // Operators add these columns when they want non-default behaviour;
+  // sheets without them still work — header lookup returns 0 and the
+  // backend defaults to today's Medium + Rectangle.
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+  const sizeCol = _findHeaderCol(sheet, 'Avatar Size');
+  const shapeCol = _findHeaderCol(sheet, 'Avatar Shape');
   return {
     row_num: rowNum,
     country: _cell(values, cols.country),
@@ -336,6 +368,12 @@ function _readAvatarRow(sheet, rowNum) {
     cta_enabled: _yes(_cell(values, cols.ctaEnabled), false),
     cta_text: _cell(values, cols.ctaText).slice(0, 80),
     open_comments: _cell(values, cols.openComments),
+    // Optional dropdown knobs — empty when the header isn't present in
+    // the sheet, when the cell is blank, or when the operator typed
+    // something the backend's enum coercion rejects. Lower-casing
+    // matches what the route layer expects.
+    avatar_size: sizeCol ? _cell(values, sizeCol).toLowerCase() : '',
+    avatar_shape: shapeCol ? _cell(values, shapeCol).toLowerCase() : '',
   };
 }
 

@@ -297,18 +297,58 @@ _OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE = (
 # template so the background fills the target aspect cleanly; same
 # overlay positioning as ``_OVERLAY_VIDEO_BOTTOM_LEFT_TEMPLATE`` so
 # the visual result matches the old animated path exactly.
-_STILL_IMAGE_AVATAR_OVERLAY_TEMPLATE = (
-    "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
-    '-filter_complex "'
-    "[0:v]scale=__W__:__H__:force_original_aspect_ratio=increase,"
-    "crop=__W__:__H__[bg];"
-    "[1:v]scale=__OVERLAY_W__:-1[av];"
-    "[bg][av]overlay=__MARGIN_X__:H-h-__MARGIN_Y__[v]"
-    '" '
-    '-map "[v]" -map 1:a '
-    "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
-    "-c:a aac -b:a 192k -shortest {{out_1}}"
+#
+# Two avatar-shape variants live below — the rectangle path is the
+# default and matches the original 2026-06-09 behaviour; the circle
+# path adds a centre-square crop + a yuva alpha mask (``geq``) so the
+# visible overlay region is a hard-edged circle. Per-row size lives
+# in ``__OVERLAY_W__`` (pixel width — caller does the canvas-fraction
+# math). Plan: ``_plans/2026-06-09-avatar-overlay-size-shape.md``.
+
+# Avatar prep — rectangle (default): just scale to the requested
+# pixel width preserving aspect ratio. Same as before.
+_AVATAR_PREP_RECT = "[1:v]scale=__OVERLAY_W__:-1[av]"
+
+# Avatar prep — circle: centre-crop to a square (``min(iw,ih)``),
+# scale to the target overlay width (square output), convert to
+# yuva420p (gains an alpha channel), and ``geq`` the alpha as
+# ``255 inside the disc of radius W/2, 0 outside``. The result is a
+# circular overlay with transparent corners; ffmpeg's ``overlay``
+# filter respects the alpha during composite, so corner pixels don't
+# paint onto the background.
+_AVATAR_PREP_CIRCLE = (
+    "[1:v]crop='min(iw,ih)':'min(iw,ih)',"
+    "scale=__OVERLAY_W__:__OVERLAY_W__,"
+    "format=yuva420p,"
+    "geq="
+    "r='r(X,Y)':"
+    "g='g(X,Y)':"
+    "b='b(X,Y)':"
+    "a='if(lte(hypot(X-W/2,Y-H/2),W/2),255,0)'"
+    "[av]"
 )
+
+
+def _build_still_image_avatar_overlay_template(*, shape: str) -> str:
+    """Assemble the full Rendi ffmpeg command for the avatar composite.
+
+    ``shape`` is ``"rectangle"`` (default) or ``"circle"`` — anything else
+    falls back to rectangle so a malformed cell never blows up the
+    ffmpeg parse.
+    """
+    prep = _AVATAR_PREP_CIRCLE if shape == "circle" else _AVATAR_PREP_RECT
+    return (
+        "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
+        '-filter_complex "'
+        "[0:v]scale=__W__:__H__:force_original_aspect_ratio=increase,"
+        "crop=__W__:__H__[bg];"
+        f"{prep};"
+        "[bg][av]overlay=__MARGIN_X__:H-h-__MARGIN_Y__[v]"
+        '" '
+        '-map "[v]" -map 1:a '
+        "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
+        "-c:a aac -b:a 192k -shortest {{out_1}}"
+    )
 
 
 def render_resize_command(width: int, height: int) -> str:
@@ -392,6 +432,7 @@ def render_still_image_avatar_overlay_command(
     overlay_width_px: int,
     margin_x: int,
     margin_y: int,
+    shape: str = "rectangle",
 ) -> str:
     """Still-image background + avatar video overlay (bottom-left),
     with the avatar's audio as the only audio track.
@@ -400,9 +441,16 @@ def render_still_image_avatar_overlay_command(
     for the avatar audio's full length (``-loop 1`` + ``-shortest``);
     no Seedance, no concat. Output dimensions are ``width`` x ``height``
     derived from the row's aspect ratio.
+
+    ``shape``: ``"rectangle"`` (default — today's behaviour) or
+    ``"circle"``. The circle variant centre-crops the avatar to a
+    square and applies a yuva ``geq`` alpha mask so the visible
+    overlay region is a hard-edged disc. Plan
+    ``_plans/2026-06-09-avatar-overlay-size-shape.md``.
     """
+    template = _build_still_image_avatar_overlay_template(shape=shape)
     return (
-        _STILL_IMAGE_AVATAR_OVERLAY_TEMPLATE
+        template
         .replace("__W__", str(width))
         .replace("__H__", str(height))
         .replace("__OVERLAY_W__", str(overlay_width_px))
@@ -919,6 +967,7 @@ class RendiClient:
         overlay_width_px: int,
         margin_x: int = 40,
         margin_y: int = 40,
+        shape: str = "rectangle",
         max_attempts: int = 120,
         delay_seconds: float = 5.0,
     ) -> RendiOutput:
@@ -932,6 +981,11 @@ class RendiClient:
         ratio via cover+center-crop; scales the avatar to
         ``overlay_width_px`` preserving its aspect ratio.
 
+        ``shape``: ``"rectangle"`` (default) keeps the avatar's native
+        video aspect; ``"circle"`` centre-crops to a square and masks
+        the corners with a yuva alpha so only a disc is visible.
+        Per-row knob from the sheet's ``Avatar Shape`` column.
+
         Replaces the old (concat_clips_with_audio + overlay_video_bottom_left)
         pair for this tab — one Rendi command instead of two.
         """
@@ -941,6 +995,7 @@ class RendiClient:
                 width=width, height=height,
                 overlay_width_px=overlay_width_px,
                 margin_x=margin_x, margin_y=margin_y,
+                shape=shape,
             ),
             {"in_1": background_image_url, "in_2": overlay_video_url},
             {"out_1": output_filename},

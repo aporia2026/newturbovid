@@ -131,7 +131,13 @@ class SimpleX4RowIn(BaseModel):
 class AvatarRowIn(BaseModel):
     """Wire shape for the ``video with avatar`` tab — Image-VO inputs
     plus a per-row ``avatar_id`` (TikTok Symphony) and CTA columns
-    mirroring cartoon. Plan ``_plans/2026-06-09-video-with-avatar-tab.md``."""
+    mirroring cartoon. Plan ``_plans/2026-06-09-video-with-avatar-tab.md``.
+
+    ``avatar_size`` / ``avatar_shape`` were added 2026-06-09
+    (``_plans/2026-06-09-avatar-overlay-size-shape.md``). Both default
+    to empty so older Apps Script clients that don't send them get
+    today's behaviour automatically; invalid values fall through to
+    the same defaults rather than 400-ing the whole batch."""
 
     row_num: int = Field(ge=1)
     country: str = ""
@@ -146,6 +152,9 @@ class AvatarRowIn(BaseModel):
     cta_enabled: bool = False
     cta_text: str = ""
     open_comments: str = ""
+    # New 2026-06-09 — operator-facing overlay knobs.
+    avatar_size: str = ""        # "" | "small" | "medium" | "large"
+    avatar_shape: str = ""       # "" | "rectangle" | "circle"
 
 
 class TextOnImgRowIn(BaseModel):
@@ -247,6 +256,23 @@ def _build_simple_x4_row(r: SimpleX4RowIn) -> SimpleX4Row:
     )
 
 
+_AVATAR_SIZE_ALLOWED = frozenset({"", "small", "medium", "large"})
+_AVATAR_SHAPE_ALLOWED = frozenset({"", "rectangle", "circle"})
+
+
+def _coerce_enum(value: str | None, *, allowed: frozenset[str]) -> str:
+    """Lowercase + trim ``value``; return it when in ``allowed``, else ``""``.
+
+    Used for the avatar tab's optional dropdown columns: a typo or an
+    older Apps Script that sends "Med" / "round" should fall back to the
+    default (empty string → today's behaviour) rather than 400 the
+    whole batch. The processor's enum resolution is also defensive, so
+    this is belt-and-suspenders.
+    """
+    cleaned = (value or "").strip().lower()
+    return cleaned if cleaned in allowed else ""
+
+
 def _build_avatar_row(r: AvatarRowIn) -> AvatarRow:
     """Coerce an AvatarRowIn into an AvatarRow.
 
@@ -254,6 +280,9 @@ def _build_avatar_row(r: AvatarRowIn) -> AvatarRow:
       * ``avatar_id`` trimmed; row is rejected if blank (the row
         processor also guards this — defense in depth).
       * ``cta_text`` truncated at 80 chars (matches cartoon's bound).
+      * ``avatar_size`` / ``avatar_shape`` coerced to one of the
+        allowed enum values; unknown values become ``""`` (default)
+        so the processor's per-row defaults take over.
     """
     return AvatarRow(
         row_num=r.row_num,
@@ -269,6 +298,8 @@ def _build_avatar_row(r: AvatarRowIn) -> AvatarRow:
         cta_enabled=r.cta_enabled,
         cta_text=(r.cta_text or "")[:80],
         open_comments=r.open_comments,
+        avatar_size=_coerce_enum(r.avatar_size, allowed=_AVATAR_SIZE_ALLOWED),
+        avatar_shape=_coerce_enum(r.avatar_shape, allowed=_AVATAR_SHAPE_ALLOWED),
     )
 
 

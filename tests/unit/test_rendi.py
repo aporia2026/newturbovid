@@ -136,6 +136,56 @@ def test_fit_silent_command_has_no_audio() -> None:
     assert "1080" in cmd and "1350" in cmd
 
 
+def test_still_image_avatar_overlay_command_circle_shape() -> None:
+    """Regression for the per-row Avatar Shape column (chat 2026-06-09).
+
+    The circle variant must produce a different filter chain than the
+    rectangle default: centre-crop to a square, scale to a square at
+    the overlay width, convert to yuva (gains an alpha channel), then
+    ``geq`` an alpha mask that's 255 inside the disc and 0 outside.
+
+    The rest of the command (background scale/crop, overlay position,
+    audio map, ``-shortest``, libx264 stillimage tuning) is identical
+    to the rectangle path — only the avatar-prep section differs.
+    """
+    rect_cmd = render_still_image_avatar_overlay_command(
+        width=1080, height=1920,
+        overlay_width_px=324, margin_x=40, margin_y=40,
+        shape="rectangle",
+    )
+    circle_cmd = render_still_image_avatar_overlay_command(
+        width=1080, height=1920,
+        overlay_width_px=324, margin_x=40, margin_y=40,
+        shape="circle",
+    )
+
+    # Both share the same background prep + audio mapping + codec config.
+    for cmd in (rect_cmd, circle_cmd):
+        assert "{{in_1}}" in cmd and "{{in_2}}" in cmd and "{{out_1}}" in cmd
+        assert "-loop 1" in cmd
+        assert "scale=1080:1920:force_original_aspect_ratio=increase" in cmd
+        assert "crop=1080:1920" in cmd
+        assert "overlay=40:H-h-40" in cmd
+        assert "-map 1:a" in cmd
+        assert "-shortest" in cmd
+        assert "-tune stillimage" in cmd
+
+    # Rectangle = simple scale only, no alpha shenanigans.
+    assert "scale=324:-1" in rect_cmd
+    assert "geq" not in rect_cmd
+    assert "yuva420p" not in rect_cmd
+    assert "format=yuva" not in rect_cmd
+
+    # Circle = square crop + square scale + yuva format + geq alpha mask
+    # cutting a centred disc of radius W/2.
+    assert "min(iw,ih)" in circle_cmd
+    assert "scale=324:324" in circle_cmd
+    assert "yuva420p" in circle_cmd
+    assert "geq=" in circle_cmd
+    assert "hypot(X-W/2,Y-H/2)" in circle_cmd
+    assert "a='if(lte(hypot(X-W/2,Y-H/2),W/2),255,0)'" in circle_cmd
+
+
 def test_still_image_avatar_overlay_command_shape() -> None:
     """Regression for the simplified avatar pipeline (chat 2026-06-09).
 
