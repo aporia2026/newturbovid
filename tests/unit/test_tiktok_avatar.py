@@ -181,7 +181,11 @@ async def test_wait_for_result_times_out() -> None:
 
 
 @respx.mock
-async def test_list_avatars_parses_entries() -> None:
+async def test_list_avatars_parses_actual_tiktok_response_shape() -> None:
+    """Matches the shape returned by ``/creative/digital_avatar/get/``
+    (operator's confirmed-working Avatar.py): ``avatar_name`` not
+    ``name``, ``avatar_thumbnail`` not ``preview_url``, gender lives in
+    ``tag_groups``."""
     respx.get(_LIST).mock(
         return_value=httpx.Response(
             200,
@@ -191,17 +195,27 @@ async def test_list_avatars_parses_entries() -> None:
                     "list": [
                         {
                             "avatar_id": "av-1",
-                            "name": "Anna",
-                            "gender": "FEMALE",
-                            "preview_url": "https://tt.test/anna.png",
+                            "avatar_name": "Anna",
+                            "avatar_thumbnail": "https://tt.test/anna.png",
+                            "avatar_preview_url": "https://tt.test/anna.mp4",
+                            "tag_groups": [
+                                {"tag_type": "gender", "tags": ["female"]},
+                                {"tag_type": "age", "tags": ["young"]},
+                            ],
                         },
                         {
                             "avatar_id": "av-2",
-                            "name": "Ben",
-                            "gender": "MALE",
-                            "preview_url": "https://tt.test/ben.png",
+                            "avatar_name": "Ben",
+                            "avatar_thumbnail": "https://tt.test/ben.png",
+                            "tag_groups": [
+                                {"tag_type": "gender", "tags": ["MALE"]},
+                            ],
                         },
-                    ]
+                    ],
+                    "page_info": {
+                        "page": 1, "page_size": 100,
+                        "total_number": 2, "total_page": 1,
+                    },
                 },
             },
         )
@@ -211,17 +225,104 @@ async def test_list_avatars_parses_entries() -> None:
     assert len(entries) == 2
     assert entries[0].avatar_id == "av-1"
     assert entries[0].name == "Anna"
-    assert entries[0].gender == "female"    # lowercased
+    assert entries[0].gender == "female"
+    # thumbnail wins over preview_url (preview_url is a video URL,
+    # thumbnail is the still — better for <img> tags).
     assert entries[0].preview_url == "https://tt.test/anna.png"
     assert entries[1].avatar_id == "av-2"
+    assert entries[1].gender == "male"      # lowercased
 
 
 @respx.mock
-async def test_advertiser_id_threads_through_to_query_string() -> None:
-    """Regression for the 403 chat 2026-06-09 hit: when
-    ``advertiser_id`` is configured, every call must include it as
-    ``?advertiser_id=...`` — that's what unblocks the Business API
-    endpoints that 403 without it."""
+async def test_list_avatars_paginates_until_short_page() -> None:
+    """When TikTok returns a full 100-item page, keep paginating; when
+    the next page comes back short, stop. Mirrors Avatar.py's
+    stop-on-short-page logic."""
+    page1 = [
+        {"avatar_id": f"av-{i}", "avatar_name": f"A{i}", "tag_groups": []}
+        for i in range(100)
+    ]
+    page2 = [
+        {"avatar_id": f"av-{100 + i}", "avatar_name": f"A{100 + i}", "tag_groups": []}
+        for i in range(5)    # short page → stop
+    ]
+    route = respx.get(_LIST).mock(
+        side_effect=[
+            httpx.Response(200, json={"code": 0, "data": {"list": page1}}),
+            httpx.Response(200, json={"code": 0, "data": {"list": page2}}),
+        ]
+    )
+    c = _client()
+    entries = await c.list_avatars()
+    assert len(entries) == 105
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_list_avatars_dedupes_repeating_ids_across_pages() -> None:
+    """Defensive: TikTok very occasionally repeats an entry across
+    page boundaries. We track ``seen_ids`` so the catalog stays clean."""
+    page1 = [
+        {"avatar_id": f"av-{i}", "avatar_name": "x", "tag_groups": []}
+        for i in range(100)
+    ]
+    page2 = [
+        {"avatar_id": "av-0", "avatar_name": "dup", "tag_groups": []},  # dup → skipped
+        {"avatar_id": "av-100", "avatar_name": "new", "tag_groups": []},
+    ]
+    respx.get(_LIST).mock(
+        side_effect=[
+            httpx.Response(200, json={"code": 0, "data": {"list": page1}}),
+            httpx.Response(200, json={"code": 0, "data": {"list": page2}}),
+        ]
+    )
+    c = _client()
+    entries = await c.list_avatars()
+    assert len(entries) == 101    # 100 + 1 new, dup dropped
+    assert {e.avatar_id for e in entries} == {f"av-{i}" for i in range(101)}
+
+
+@respx.mock
+async def test_list_avatars_retries_transient_code_51010() -> None:
+    """TikTok's ``code=51010`` ("internal service timed out") gets
+    retried per Avatar.py's pattern rather than failing the whole list."""
+    route = respx.get(_LIST).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={"code": 51010, "message": "internal service timed out"},
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "list": [{"avatar_id": "av-1", "tag_groups": []}]
+                    },
+                },
+            ),
+        ]
+    )
+    c = _client()
+    # Patch sleep so the test doesn't actually wait the backoff.
+    import bulkvid.adapters.tiktok_avatar as mod
+    real_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = lambda _s: real_sleep(0)
+    try:
+        entries = await c.list_avatars()
+    finally:
+        mod.asyncio.sleep = real_sleep
+    assert [e.avatar_id for e in entries] == ["av-1"]
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_advertiser_id_threads_through_to_create_but_not_list() -> None:
+    """When ``advertiser_id`` is configured, the create endpoint
+    includes it (Business API typically requires it). The list endpoint
+    must NOT include it — operator's Avatar.py confirms the
+    ``/creative/digital_avatar/get/`` path works without advertiser_id
+    and TikTok would 403 with one on some accounts."""
     create_route = respx.post(_CREATE).mock(
         return_value=httpx.Response(
             200, json={"code": 0, "data": {"list": [{"task_id": "t"}]}},
@@ -243,13 +344,17 @@ async def test_advertiser_id_threads_through_to_query_string() -> None:
     await c.create_task(avatar_id="av", script="x", video_name="v")
     await c.list_avatars()
 
-    # Both calls must have shipped the advertiser_id in the query string.
-    for route in (create_route, list_route):
-        assert route.called, f"{route} was not called"
-        sent_url = str(route.calls[0].request.url)
-        assert "advertiser_id=advtr-9999" in sent_url, (
-            f"expected advertiser_id in query string, got: {sent_url}"
-        )
+    assert create_route.called
+    create_url = str(create_route.calls[0].request.url)
+    assert "advertiser_id=advtr-9999" in create_url, (
+        f"create call missing advertiser_id: {create_url}"
+    )
+
+    assert list_route.called
+    list_url = str(list_route.calls[0].request.url)
+    assert "advertiser_id" not in list_url, (
+        f"list call must NOT include advertiser_id: {list_url}"
+    )
 
 
 @respx.mock

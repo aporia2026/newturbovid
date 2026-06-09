@@ -50,7 +50,19 @@ _log = get_logger("tiktok_avatar")
 _DEFAULT_BASE = "https://business-api.tiktok.com/open_api/v1.3"
 _DEFAULT_CREATE_URL = f"{_DEFAULT_BASE}/business/symphony/avatar/"
 _DEFAULT_GET_URL = f"{_DEFAULT_BASE}/business/symphony/avatar/get/"
-_DEFAULT_AVATAR_LIST_URL = f"{_DEFAULT_BASE}/business/symphony/avatar/list/"
+# Confirmed working endpoint (operator's Avatar.py, chat 2026-06-09).
+# This endpoint paginates with page + page_size (1..100) and returns
+# avatars under data.list — NOT under data.avatars or similar.
+_DEFAULT_AVATAR_LIST_URL = f"{_DEFAULT_BASE}/creative/digital_avatar/get/"
+
+# Pagination + retry constants for the list endpoint, copied verbatim
+# from the operator's working Avatar.py.
+_LIST_PAGE_SIZE = 100
+_LIST_MAX_PAGES = 100
+# TikTok occasionally returns code=51010 ("internal service timed out").
+# It's transient; retry instead of failing the whole list.
+_LIST_TRANSIENT_API_CODES: frozenset[int] = frozenset({51010})
+_LIST_API_MAX_RETRIES = 4
 
 # Polling cadence. Avatar generation typically lands in 30–90 s; we poll
 # every 5 s so a fast render reports within 5 s of completion, and 120
@@ -96,7 +108,47 @@ class AvatarListEntry:
     avatar_id: str
     name: str
     gender: str          # "female" | "male" | "" if unknown
-    preview_url: str     # thumbnail URL (TikTok-hosted)
+    preview_url: str     # thumbnail URL (TikTok-hosted, expires ~6h)
+
+
+def _extract_tag(tag_groups: list[Any], tag_type: str) -> str:
+    """Pull the first tag value for ``tag_type`` out of the
+    ``tag_groups`` array. Returns "" if not found. Mirrors
+    Avatar.py's ``flatten_avatar`` logic."""
+    if not isinstance(tag_groups, list):
+        return ""
+    for g in tag_groups:
+        if not isinstance(g, dict):
+            continue
+        ttype = str(g.get("tag_type") or "").strip().lower()
+        if ttype != tag_type:
+            continue
+        tags = g.get("tags") or []
+        if isinstance(tags, list) and tags:
+            return str(tags[0]).strip()
+    return ""
+
+
+def _parse_list_entry(it: dict[str, Any]) -> AvatarListEntry | None:
+    """Parse one item from ``data.list``. Returns ``None`` for entries
+    missing an avatar_id (those can't be used anyway)."""
+    avatar_id = str(it.get("avatar_id") or "").strip()
+    if not avatar_id:
+        return None
+    return AvatarListEntry(
+        avatar_id=avatar_id,
+        name=str(it.get("avatar_name") or "").strip(),
+        gender=_extract_tag(it.get("tag_groups") or [], "gender").lower(),
+        # avatar_thumbnail is the small square preview; avatar_preview_url
+        # is the video preview. Prefer the thumbnail for the admin grid
+        # because <img> renders it inline. Fall back to preview_url if
+        # the thumbnail isn't provided.
+        preview_url=str(
+            it.get("avatar_thumbnail")
+            or it.get("avatar_preview_url")
+            or ""
+        ).strip(),
+    )
 
 
 @dataclass(frozen=True)
@@ -357,43 +409,100 @@ class TikTokAvatarClient:
     # ── Avatar listing (admin page) ─────────────────────────────────────
 
     async def list_avatars(self) -> list[AvatarListEntry]:
-        """GET the avatar list endpoint. Returns one entry per available
-        avatar with the fields the admin page needs to render previews."""
-        async with httpx.AsyncClient(timeout=self._http_timeout) as c:
-            resp = await c.get(
-                self._list_url,
-                headers=self._headers,
-                params=self._params_with_advertiser(),
-            )
-            _raise_for_status_with_body(resp, where="avatar list")
-            body: dict[str, Any] = resp.json()
+        """GET the avatar list endpoint, paginating until every avatar
+        is fetched. Returns one entry per available avatar.
 
-        code = body.get("code")
-        if code != 0:
-            message = body.get("message") or "no message"
-            raise TikTokAvatarError(
-                f"TikTok avatar list returned code={code}: {message}"
-            )
+        Mirrors the operator's confirmed-working ``Avatar.py`` script
+        (chat 2026-06-09):
 
-        items = body.get("data", {}).get("list") or []
+          * Endpoint: ``/creative/digital_avatar/get/`` (not
+            ``/business/symphony/avatar/list/`` — that's a 403).
+          * Query params: only ``page`` + ``page_size`` (1..100). No
+            ``advertiser_id`` — confirmed unneeded.
+          * Response: each item has ``avatar_id`` + ``avatar_name`` +
+            ``avatar_thumbnail`` + ``avatar_preview_url`` + ``tag_groups``.
+            Gender lives in the ``tag_groups`` array under
+            ``tag_type == "gender"``.
+
+        Preview thumbnails expire ~6 hours after fetch — that's why the
+        admin page re-fetches on every load (the cache is only the
+        fallback for a failed fetch).
+        """
         out: list[AvatarListEntry] = []
-        for it in items:
-            avatar_id = str(it.get("avatar_id") or it.get("id") or "").strip()
-            if not avatar_id:
-                continue
-            out.append(
-                AvatarListEntry(
-                    avatar_id=avatar_id,
-                    name=str(
-                        it.get("name") or it.get("display_name") or ""
-                    ).strip(),
-                    gender=str(it.get("gender") or "").strip().lower(),
-                    preview_url=str(
-                        it.get("preview_url")
-                        or it.get("avatar_url")
-                        or it.get("image_url")
-                        or ""
-                    ).strip(),
-                )
-            )
+        seen_ids: set[str] = set()
+        page = 1
+        total_page_hint: int | None = None
+
+        while page <= _LIST_MAX_PAGES:
+            body = await self._list_one_page(page)
+            data = body.get("data") or {}
+            items = data.get("list") or []
+            page_info = data.get("page_info") or {}
+
+            for it in items:
+                entry = _parse_list_entry(it)
+                if entry is None or entry.avatar_id in seen_ids:
+                    continue
+                seen_ids.add(entry.avatar_id)
+                out.append(entry)
+
+            # Update total-page hint from the response when available.
+            tp = page_info.get("total_page")
+            if isinstance(tp, int) and tp > 0:
+                total_page_hint = tp
+
+            # Stop conditions: empty page, short page, or known last page.
+            if not items:
+                break
+            if len(items) < _LIST_PAGE_SIZE:
+                break
+            if total_page_hint is not None and page >= total_page_hint:
+                break
+
+            page += 1
+
+        _log.info(
+            "tiktok_avatar_list_ok",
+            count=len(out),
+            pages=page,
+            total_page=total_page_hint,
+        )
         return out
+
+    async def _list_one_page(self, page: int) -> dict[str, Any]:
+        """Fetch one page of the avatar list, retrying transient TikTok
+        API codes (51010 = internal service timed out, per Avatar.py)."""
+        params = {"page": page, "page_size": _LIST_PAGE_SIZE}
+        for attempt in range(1, _LIST_API_MAX_RETRIES + 1):
+            async with httpx.AsyncClient(timeout=self._http_timeout) as c:
+                resp = await c.get(
+                    self._list_url, headers=self._headers, params=params,
+                )
+                _raise_for_status_with_body(
+                    resp, where=f"avatar list page {page}",
+                )
+                body: dict[str, Any] = resp.json()
+
+            code = body.get("code")
+            if code == 0:
+                return body
+
+            message = body.get("message") or "no message"
+            if code in _LIST_TRANSIENT_API_CODES and attempt < _LIST_API_MAX_RETRIES:
+                _log.warning(
+                    "tiktok_avatar_list_transient_retry",
+                    code=code,
+                    message=message,
+                    page=page,
+                    attempt=attempt,
+                )
+                await asyncio.sleep(min(8.0, 1.6 ** attempt))
+                continue
+            raise TikTokAvatarError(
+                f"TikTok avatar list returned code={code} on page {page}: "
+                f"{message}"
+            )
+
+        raise TikTokAvatarError(
+            f"TikTok avatar list exhausted retries on page {page}"
+        )
