@@ -30,7 +30,7 @@ Plan: [_plans/2026-06-02-aporia-bulk-video-tool.md](../_plans/2026-06-02-aporia-
 ## First run — configure backend URL
 
 1. **Aporia Bulk Video → Configure backend URL**
-2. Enter the FastAPI backend URL (e.g. `https://aporiavideo.pythonanywhere.com`)
+2. Enter the FastAPI backend URL (e.g. `https://yoavaporia-aporia-bulkvid.hf.space`)
 3. Click **OK**
 
 The URL is persisted via `PropertiesService.getScriptProperties()` so each
