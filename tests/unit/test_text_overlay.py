@@ -10,7 +10,7 @@ import pytest
 from PIL import Image
 
 from bulkvid.adapters.rendi import DEFAULT_DIMENSIONS_BY_RATIO
-from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
+from bulkvid.pipeline.text_overlay import _fit_mode, overlay_text_on_image_bytes
 
 
 def _src_png(width: int = 1600, height: int = 900, color=(120, 180, 220)) -> bytes:
@@ -78,6 +78,50 @@ def test_overlay_at_916_target_always_lands_at_1080x1920(
         assert img.size == (1080, 1920), (
             f"src {src_size} → output {img.size}, expected (1080, 1920)"
         )
+    finally:
+        img.close()
+
+
+# ── Adaptive fit decision ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("src", "target", "expected"),
+    [
+        # Near-target: thin crop beats blurred bars (chat 2026-06-10).
+        ((1350, 1080), (1440, 1080), "cover"),    # 5:4 src → 4:3 canvas, ~6% loss
+        ((1200, 914), (1440, 1080), "cover"),     # the screenshot case, ~2% loss
+        ((1080, 1920), (1080, 1920), "cover"),    # exact match, 0% loss
+        ((1000, 1600), (1080, 1920), "cover"),    # 10:16 src → 9:16, ~10% loss
+        # Big mismatch: cropping would gut the image — keep the blur fit.
+        ((1920, 1080), (1080, 1920), "blur"),     # landscape → 9:16, ~68% loss
+        ((1080, 1920), (1920, 1080), "blur"),     # portrait → 16:9
+        ((1080, 1350), (1440, 1080), "blur"),     # 4:5 src → 4:3, ~40% loss
+    ],
+)
+def test_fit_mode_crops_only_when_loss_is_small(
+    src: tuple[int, int], target: tuple[int, int], expected: str
+) -> None:
+    assert _fit_mode(src[0], src[1], target[0], target[1]) == expected
+
+
+def test_near_target_source_fills_canvas_edge_to_edge() -> None:
+    """A source close to the target aspect must cover the WHOLE canvas —
+    the corner pixels read the source color, not a blurred bar."""
+    out = overlay_text_on_image_bytes(
+        _src_png(width=1200, height=914, color=(220, 30, 30)),    # ~4:3.05
+        "",
+        aspect_ratio="4:3",
+    )
+    img = _decode(out)
+    try:
+        assert img.size == (1440, 1080)
+        for x, y in [(2, 2), (img.width - 3, 2), (2, img.height - 3),
+                     (img.width - 3, img.height - 3)]:
+            r, g, b = img.getpixel((x, y))
+            assert r > 180 and g < 80 and b < 80, (
+                f"corner {(x, y)} not source-red: {(r, g, b)} — bars present?"
+            )
     finally:
         img.close()
 

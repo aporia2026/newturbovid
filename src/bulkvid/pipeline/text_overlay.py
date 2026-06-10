@@ -22,9 +22,13 @@ History:
     fit afterwards — preserved the source but the visual text size
     varied wildly between rows (landscape sources got tiny text after
     being letterboxed; portrait sources got big text). Chat 2026-06-09.
-  * v3 (current) does the blurred-background fit in Python at target
-    dimensions and renders text on the final canvas. Source preserved
-    AND text size consistent.
+  * v3 does the blurred-background fit in Python at target dimensions
+    and renders text on the final canvas. Source preserved AND text
+    size consistent.
+  * v4 (current) fits adaptively: near-target sources are cover-cropped
+    to fill the canvas edge-to-edge (no blurred bars), mismatched ones
+    keep the v3 blur fit. Chat 2026-06-10 — operator flagged the bars
+    on a near-4:3 source rendered at 4:3.
 
 Plan: ``_plans/2026-06-09-paste-text-on-img-tab.md``.
 """
@@ -120,21 +124,52 @@ def _fit_overlay_font(
     return font, _wrap_text_to_width(draw, text, font, max_width)
 
 
+# Adaptive fit threshold: when filling the canvas (cover-crop) would lose
+# at most this fraction of one source dimension, crop — a thin trimmed edge
+# beats visible blurred bars (chat 2026-06-10: "adjust to the sizes, but
+# only if it makes sense, not on every 9:16"). Beyond it, keep the
+# blurred-background fit so a landscape source forced into 9:16 isn't
+# destroyed by a 60%+ crop. Applies to text_on_img ONLY — the simple /
+# 4images video tabs keep their never-crop fit because their manual images
+# are finished ad creatives with text baked in.
+_MAX_COVER_CROP_LOSS: Final[float] = 0.20
+
+
+def _fit_mode(src_w: int, src_h: int, target_w: int, target_h: int) -> str:
+    """Decide how ``src`` should fill the target canvas.
+
+    ``'cover'`` when the aspect mismatch is small enough that cropping to
+    fill loses at most ``_MAX_COVER_CROP_LOSS`` of one dimension;
+    ``'blur'`` when the mismatch is bigger and cropping would gut the
+    composition.
+    """
+    ratio = (src_w / src_h) / (target_w / target_h)
+    loss = 1.0 - min(ratio, 1.0 / ratio)
+    return "cover" if loss <= _MAX_COVER_CROP_LOSS else "blur"
+
+
 def _blurred_bg_fit(
     src: Image.Image, target_w: int, target_h: int
 ) -> Image.Image:
-    """Composite ``src`` into a ``target_w × target_h`` canvas with a
-    blurred, cover-cropped copy of ``src`` filling the background. Mirrors
-    Rendi's image_to_video_fit composition so the operator's source is
-    preserved (no crop) AND the output canvas is exactly the row's
-    target aspect ratio.
+    """Fit ``src`` into a ``target_w × target_h`` canvas, adaptively.
 
-    For a near-target-aspect source the foreground fills the canvas and
-    the blurred bg is invisible (no visible bars). For a mismatched
-    source (e.g. landscape into 9:16) the foreground sits centered with
-    blurred bars top/bottom.
+    Near-target sources (per ``_fit_mode``) are cover-cropped to fill the
+    whole canvas — no bars at all, at the cost of a thin trimmed edge.
+    Mismatched sources (e.g. landscape into 9:16) keep the v3 behavior:
+    the source is preserved uncropped, centered over a blurred,
+    cover-cropped copy of itself, with blurred bars on the short sides.
     """
     src_w, src_h = src.size
+
+    mode = _fit_mode(src_w, src_h, target_w, target_h)
+    _log.info(
+        "image_fit",
+        mode=mode,
+        src_size=f"{src_w}x{src_h}",
+        target_size=f"{target_w}x{target_h}",
+    )
+    if mode == "cover":
+        return _fit_image_cover(src, target_w, target_h)
 
     # Background: cover-crop to fill canvas, then heavy blur. The radius
     # scales with target size so 720p and 1080p both look smooth.
