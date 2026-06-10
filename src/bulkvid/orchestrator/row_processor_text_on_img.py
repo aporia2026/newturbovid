@@ -86,11 +86,13 @@ def _size_slug(aspect_ratio: str) -> str:
 def _image_object_key(row: TextOnImgRow, *, now: datetime | None = None) -> str:
     """Build a readable, sortable storage key for the composed PNG.
 
-    Shape: ``bulkvid/text_on_img/{COUNTRY}_{vertical}_{date}_{size}_r{row}_{6hex}.png``.
+    Shape: ``bulkvid/text_on_img/{COUNTRY}_{vertical}_text_{date}_{size}_r{row}_{6hex}.png``.
     Each segment is bounded:
       * country: 2-4 char ISO-style code, uppercase
       * vertical: slugified, capped at 40 chars (operators occasionally
         paste long taglines into the column)
+      * text: literal marker so a downloaded file is recognizable as a
+        text-overlay image (operators mix these with plain creatives)
       * date: UTC ``YYYY-MM-DD`` so dates sort lexicographically
       * size: aspect ratio with ``:`` replaced by ``x``
       * row: sheet row number — gives inter-row uniqueness within a batch
@@ -104,7 +106,7 @@ def _image_object_key(row: TextOnImgRow, *, now: datetime | None = None) -> str:
     date_part = n.strftime("%Y-%m-%d")
     size = _size_slug(row.aspect_ratio)
     short = uuid.uuid4().hex[:6]
-    fname = f"{country}_{vertical}_{date_part}_{size}_r{row.row_num}_{short}.png"
+    fname = f"{country}_{vertical}_text_{date_part}_{size}_r{row.row_num}_{short}.png"
     return f"bulkvid/text_on_img/{fname}"
 
 

@@ -236,7 +236,7 @@ from bulkvid.orchestrator.row_processor_text_on_img import _image_object_key
 
 
 def test_image_object_key_full_shape() -> None:
-    """Full shape: bulkvid/text_on_img/COUNTRY_vertical_YYYY-MM-DD_WxH_rN_HEX.png."""
+    """Full shape: bulkvid/text_on_img/COUNTRY_vertical_text_YYYY-MM-DD_WxH_rN_HEX.png."""
     row = TextOnImgRow(
         row_num=7,
         country="de",                         # lowercased input -> uppercased in name
@@ -252,7 +252,7 @@ def test_image_object_key_full_shape() -> None:
 
     assert key.startswith("bulkvid/text_on_img/")
     assert re.fullmatch(
-        r"bulkvid/text_on_img/DE_car-deals-pr_2026-06-09_9x16_r7_[0-9a-f]{6}\.png",
+        r"bulkvid/text_on_img/DE_car-deals-pr_text_2026-06-09_9x16_r7_[0-9a-f]{6}\.png",
         key,
     ), key
 
@@ -273,7 +273,7 @@ def test_image_object_key_empty_fields_fall_back_gracefully() -> None:
     fname = key.rsplit("/", 1)[-1]
 
     assert "__" not in fname     # no empty segments
-    assert fname.startswith("NA_general_2026-01-01_1x1_r3_")
+    assert fname.startswith("NA_general_text_2026-01-01_1x1_r3_")
     assert fname.endswith(".png")
 
 
