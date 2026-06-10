@@ -56,6 +56,15 @@ const SUBMIT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
 const PREWARM_ENABLED = true;
 const PREWARM_COOLDOWN_MS = 60 * 1000;
 
+// Aspect ratios offered in the Change Size dropdown — must stay in sync with
+// VALID_RATIO_STRINGS in src/bulkvid/adapters/rendi.py. Ordered by how often
+// the bulk team uses them; 4:3 added per chat 2026-06-10. The validation is
+// non-strict because the backend ALSO accepts free-typed WxH pixel values
+// (e.g. 1080x1350).
+const SIZE_DROPDOWN_OPTIONS = [
+  '9:16', '4:5', '1:1', '16:9', '4:3', '3:4', '5:4', '2:3', '3:2', '21:9',
+];
+
 /** Column maps — MUST match src/bulkvid/adapters/sheets.py (1-indexed for Sheets). */
 const IMAGE_VO_COLS = {
   country: 1, vertical: 2, article: 3, manualImage: 4,
@@ -145,6 +154,7 @@ function onOpen() {
     .addItem('Pick avatar for current row…', 'pickAvatarForCurrentRow')
     .addSeparator()
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
+    .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
 }
@@ -931,6 +941,63 @@ function migrateSimpleX4Columns() {
     'Migration done',
     'Steps applied to "' + sheet.getName() + '":\n\n• ' + steps.join('\n• ') +
     '\n\nThe simple x4 tab is now ready. Submit a row to test.',
+    ui.ButtonSet.OK
+  );
+}
+
+
+// ─── Size dropdowns ─────────────────────────────────────────────────────────
+
+/** One-shot: (re)apply the Change Size dropdown on EVERY tab that has a
+ *  "Change Size" (or "Aspect Ratio") column. Idempotent — re-running just
+ *  rewrites the same validation, so it doubles as the upgrade path whenever
+ *  SIZE_DROPDOWN_OPTIONS grows (4:3 added per chat 2026-06-10).
+ *
+ *  Non-strict on purpose: the backend also accepts typed WxH pixel values,
+ *  and a strict rule would wipe any cell holding one. */
+function applySizeDropdowns() {
+  const ui = SpreadsheetApp.getUi();
+  const validation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(SIZE_DROPDOWN_OPTIONS, true)
+    .setAllowInvalid(true)
+    .setHelpText('Pick a ratio, or type WxH pixels (e.g. 1080x1350).')
+    .build();
+
+  const updated = [];
+  SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
+    // Headers sit on row 1 everywhere except migrated simple_x4 tabs,
+    // where row 1 is the template-preview band and row 2 holds them.
+    var headerRow = 0;
+    var col = 0;
+    [1, 2].some(function (probe) {
+      if (sheet.getLastRow() < probe || sheet.getLastColumn() === 0) return false;
+      const headers = sheet.getRange(probe, 1, 1, sheet.getLastColumn()).getValues()[0];
+      for (var i = 0; i < headers.length; i++) {
+        const h = String(headers[i] || '').toLowerCase().trim();
+        if (h === 'change size' || h === 'aspect ratio') {
+          headerRow = probe;
+          col = i + 1;
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!col) return;    // tab has no size column — skip
+
+    const firstData = headerRow + 1;
+    const maxRow = sheet.getMaxRows();
+    if (maxRow < firstData) return;
+    sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
+      .setDataValidation(validation);
+    updated.push(sheet.getName());
+  });
+
+  ui.alert(
+    'Size dropdowns updated',
+    updated.length
+      ? 'Options (' + SIZE_DROPDOWN_OPTIONS.join(', ') + ') applied to:\n\n• '
+        + updated.join('\n• ')
+      : 'No tabs with a "Change Size" column found.',
     ui.ButtonSet.OK
   );
 }
