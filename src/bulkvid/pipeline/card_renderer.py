@@ -34,11 +34,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, features
 
 from bulkvid.logging import get_logger
 
 _log = get_logger("card_render")
+
+# Complex-script shaping (Thai mark stacking, RTL reordering, Arabic joining)
+# needs Pillow's raqm engine. The wheels bundle it, but it only activates when
+# system libfribidi is present — the Dockerfile installs libfribidi0 for this.
+# Logged once at import so a deploy missing it shows up in the HF logs instead
+# of silently shipping reversed Hebrew / unshaped Thai.
+_log.info("text_shaping_engine", raqm_available=features.check("raqm"))
 
 
 # ── Public types ─────────────────────────────────────────────────────────────
@@ -190,45 +197,126 @@ _T3_FONT_ARABIC: Final[Path] = (
     Path(__file__).resolve().parent.parent / "assets" / "fonts" / "Cairo-Variable.ttf"
 )
 
-# Weight pin per font (None = single-weight font, skip variation).
-_T3_FONT_WEIGHTS: Final[dict[str, float | None]] = {
-    str(_T3_FONT_LATIN):    None,      # Anton ships in one weight
-    str(_T3_FONT_CYRILLIC): 700.0,     # Oswald Bold (it caps at ExtraBold/700)
-    str(_T3_FONT_HEBREW):   900.0,     # Heebo Black
-    str(_T3_FONT_ARABIC):   900.0,     # Cairo Black
+
+# ── Script fonts (Thai / Japanese / Chinese) ────────────────────────────────
+#
+# Inter covers Latin (+Ext), Cyrillic, Greek and Vietnamese — and nothing
+# else. The sheet also carries TH, JP, HK (Traditional Chinese) and IL rows;
+# drawing those through Inter produced the "no glyph" tofu boxes reported in
+# chat 2026-06-10. Three Noto fonts (SIL OFL, same license as the rest of the
+# bundle) close the gap; Hebrew and Arabic reuse the Heebo/Cairo files that
+# already ship for Template 3.
+#
+# Han characters are shared between Japanese and Chinese (Unicode Han
+# unification), so the detector below treats kana anywhere in the string as
+# "Japanese" and Han with no kana as "Chinese" (Traditional/HK glyph shapes —
+# that's the market in the sheet). Korean and Simplified Chinese have no rows
+# today and no font here; adding one = bundle the font + one range + one
+# dict entry. Plan: _plans/2026-06-10-multiscript-text-rendering.md.
+_FONT_THAI: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansThai-Variable.ttf"
+)
+_FONT_JP: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansJP-Variable.ttf"
+)
+_FONT_HK: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansHK-Variable.ttf"
+)
+
+
+def _non_latin_script_for(text: str) -> str | None:
+    """Detect the script of ``text`` when it needs a non-Inter font.
+
+    Returns ``'hebrew' | 'arabic' | 'cyrillic' | 'thai' | 'jp' | 'zh'`` or
+    None for everything Latin-ish. RTL scripts, Cyrillic, Thai and kana
+    return on first hit — they are unambiguous. Han only sets a flag while
+    scanning: kana anywhere wins (Japanese headlines always carry some),
+    otherwise Han alone reads as Chinese.
+
+    Codepoint ranges:
+      * Hebrew:   U+0590..05FF, presentation forms U+FB1D..FB4F
+      * Arabic:   U+0600..06FF, supplement U+0750..077F
+      * Cyrillic: U+0400..04FF, supplement U+0500..052F
+      * Thai:     U+0E00..0E7F
+      * Kana:     U+3040..30FF, phonetic ext U+31F0..31FF,
+                  halfwidth katakana U+FF66..FF9D
+      * Han:      U+3400..4DBF (Ext A), U+4E00..9FFF, compat U+F900..FAFF
+    """
+    has_han = False
+    for ch in text or "":
+        cp = ord(ch)
+        if 0x0590 <= cp <= 0x05FF or 0xFB1D <= cp <= 0xFB4F:
+            return "hebrew"
+        if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
+            return "arabic"
+        if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
+            return "cyrillic"
+        if 0x0E00 <= cp <= 0x0E7F:
+            return "thai"
+        if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF or 0xFF66 <= cp <= 0xFF9D:
+            return "jp"
+        if 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF:
+            has_han = True
+    return "zh" if has_han else None
+
+
+# Generic Bold routing table: script → (font path, variation axes pinned in
+# the order each font declares them — verified per file on 2026-06-10:
+# Heebo [wght] · Cairo [wght, slnt] · Noto Thai [wght, wdth] · Noto JP [wght]
+# · Noto HK [wght]). Cyrillic is absent on purpose: Inter covers it.
+_SCRIPT_FONTS_BOLD: Final[dict[str, tuple[Path, tuple[float, ...]]]] = {
+    "hebrew": (_T3_FONT_HEBREW, (700.0,)),
+    "arabic": (_T3_FONT_ARABIC, (700.0, 0.0)),
+    "thai":   (_FONT_THAI,      (700.0, 100.0)),
+    "jp":     (_FONT_JP,        (700.0,)),
+    "zh":     (_FONT_HK,        (700.0,)),
+}
+
+# T3 display routing: same detection, heavier weights to match the Black
+# look of the template. Latin (incl. Vietnamese) falls through to Anton.
+_T3_FONTS_BY_SCRIPT: Final[dict[str, Path]] = {
+    "hebrew":   _T3_FONT_HEBREW,
+    "arabic":   _T3_FONT_ARABIC,
+    "cyrillic": _T3_FONT_CYRILLIC,
+    "thai":     _FONT_THAI,
+    "jp":       _FONT_JP,
+    "zh":       _FONT_HK,
+}
+
+# Variation axes pin per T3 font, in each font's declared axis order (None =
+# static single-weight font, skip variation). Cairo declares [wght, slnt] —
+# the old single-value pin raised inside set_variation_by_axes and silently
+# left it at Regular; the full tuple fixes that.
+_T3_FONT_AXES: Final[dict[str, tuple[float, ...] | None]] = {
+    str(_T3_FONT_LATIN):    None,             # Anton ships in one weight
+    str(_T3_FONT_CYRILLIC): (700.0,),         # Oswald Bold (axis caps at 700)
+    str(_T3_FONT_HEBREW):   (900.0,),         # Heebo Black
+    str(_T3_FONT_ARABIC):   (900.0, 0.0),     # Cairo Black, no slant
+    str(_FONT_THAI):        (900.0, 100.0),   # Noto Thai Black, normal width
+    str(_FONT_JP):          (900.0,),         # Noto JP Black
+    str(_FONT_HK):          (900.0,),         # Noto HK Black
 }
 
 
 def _pick_template_3_font_path(text: str) -> str:
     """Pick the T3 font whose glyph set matches the text's script.
 
-    Scans ``text`` char-by-char for the first character belonging to a
-    non-Latin script we have a dedicated font for; falls through to Anton
-    (Latin) when the text is purely Latin/Vietnamese or empty.
-
-    Codepoint ranges:
-      * Hebrew:   U+0590..U+05FF (and Hebrew Presentation Forms FB1D..FB4F)
-      * Arabic:   U+0600..U+06FF (Arabic), U+0750..U+077F (Arabic Suppl.)
-      * Cyrillic: U+0400..U+04FF (Cyrillic), U+0500..U+052F (Cyrillic Suppl.)
+    Routes through ``_non_latin_script_for``; Latin (incl. Vietnamese),
+    Greek and empty text fall through to Anton.
     """
-    for ch in text or "":
-        cp = ord(ch)
-        if 0x0590 <= cp <= 0x05FF or 0xFB1D <= cp <= 0xFB4F:
-            return str(_T3_FONT_HEBREW)
-        if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F:
-            return str(_T3_FONT_ARABIC)
-        if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
-            return str(_T3_FONT_CYRILLIC)
+    script = _non_latin_script_for(text)
+    if script is not None:
+        return str(_T3_FONTS_BY_SCRIPT[script])
     return str(_T3_FONT_LATIN)
 
 
 def _load_template_3_font(text: str, size: int) -> ImageFont.ImageFont:
     """Load the T3 display font matching ``text``'s script at ``size`` px.
 
-    For variable fonts (Oswald, Heebo, Cairo) we pin the weight axis to the
-    pre-selected Black-ish weight; for Anton (single weight) we skip the
-    variation call. On any failure falls through to PIL's bitmap font so a
-    bad font file never crashes the renderer.
+    For variable fonts we pin the axes to the pre-selected Black-ish weight;
+    for Anton (single weight) we skip the variation call. On any failure
+    falls through to PIL's bitmap font so a bad font file never crashes the
+    renderer.
     """
     path = _pick_template_3_font_path(text)
     try:
@@ -236,10 +324,10 @@ def _load_template_3_font(text: str, size: int) -> ImageFont.ImageFont:
     except OSError as e:
         _log.warning("card_t3_font_load_failed", path=path, error=str(e))
         return ImageFont.load_default()
-    weight = _T3_FONT_WEIGHTS.get(path)
-    if weight is not None:
+    axes = _T3_FONT_AXES.get(path)
+    if axes is not None:
         try:
-            font.set_variation_by_axes([weight])
+            font.set_variation_by_axes(list(axes))
         except (OSError, AttributeError):
             pass    # static font or older Pillow — already at the bundled weight
     return font
@@ -264,15 +352,38 @@ def _find_font_path(override: str | None = None) -> str | None:
     return None
 
 
-def _load_font(size: int, override: str | None = None) -> ImageFont.ImageFont:
-    """Load the bundled font at ``size`` px in Bold (wght=700).
+def _load_font(
+    size: int, override: str | None = None, *, text: str = ""
+) -> ImageFont.ImageFont:
+    """Load the Bold body font for ``text`` at ``size`` px.
 
-    The Inter variable font ships with the opsz+wght axes; we pin opsz=14
-    (display-shape glyphs) and wght=700 (Bold) so every render call
-    produces consistent display-bold text. Falls back to default-weight
-    glyphs on non-variable fonts (no exception) and to PIL's bitmap font
-    on missing files.
+    ``text`` (the string about to be drawn) drives per-script routing:
+    Thai / Japanese / Chinese / Hebrew / Arabic land on a bundled Noto /
+    Heebo / Cairo font pinned to Bold, because Inter has no glyphs for any
+    of them (chat 2026-06-10 tofu reports). Everything else stays on the
+    bundled Inter exactly as before: opsz=14 (display-shape glyphs) +
+    wght=700 (Bold). An explicit ``override`` path wins over routing.
+    Falls back to default-weight glyphs on non-variable fonts (no
+    exception) and to PIL's bitmap font on missing files.
     """
+    script = None if override else _non_latin_script_for(text)
+    routed = _SCRIPT_FONTS_BOLD.get(script) if script else None
+    if routed is not None:
+        routed_path, axes = routed
+        try:
+            font = ImageFont.truetype(str(routed_path), size=size)
+        except OSError as e:
+            # Fall through to the Inter path below — tofu beats a crash.
+            _log.warning(
+                "script_font_load_failed", path=str(routed_path), error=str(e)
+            )
+        else:
+            try:
+                font.set_variation_by_axes(list(axes))
+            except (OSError, AttributeError):
+                pass
+            return font
+
     path = _find_font_path(override)
     if path is None:
         _log.warning("card_font_fallback_default", size=size)
@@ -320,22 +431,65 @@ def _fit_image_cover(src: Image.Image, target_w: int, target_h: int) -> Image.Im
             resized.close()
 
 
+def _text_width(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont
+) -> int:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0]
+
+
+def _break_long_word(
+    draw: ImageDraw.ImageDraw,
+    word: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    """Character-level greedy break for a word wider than ``max_width``.
+
+    Thai, Japanese and Chinese write without spaces, so a whole sentence
+    arrives as one "word" — without this it either shrinks to the floor
+    font size or overflows the canvas. Each returned chunk fills its line,
+    so the wrap loop never pairs two chunks of the same word with a fake
+    space between them. (Proper Thai word segmentation needs a dictionary;
+    char-level breaks are the accepted tradeoff — see the 2026-06-10 plan.)
+    """
+    chunks: list[str] = []
+    current = ""
+    for ch in word:
+        if current and _text_width(draw, current + ch, font) > max_width:
+            chunks.append(current)
+            current = ch
+        else:
+            current += ch
+    if current:
+        chunks.append(current)
+    return chunks or [word]
+
+
 def _wrap_text_to_width(
     draw: ImageDraw.ImageDraw,
     text: str,
     font: ImageFont.ImageFont,
     max_width: int,
 ) -> list[str]:
-    """Greedy word-wrap so each line fits within ``max_width`` px."""
-    words = (text or "").split()
+    """Greedy word-wrap so each line fits within ``max_width`` px.
+
+    Words that alone exceed ``max_width`` (spaceless scripts, pasted URLs)
+    are pre-split at character level so they wrap instead of overflowing.
+    """
+    words: list[str] = []
+    for word in (text or "").split():
+        if _text_width(draw, word, font) <= max_width:
+            words.append(word)
+        else:
+            words.extend(_break_long_word(draw, word, font, max_width))
     if not words:
         return []
     lines: list[str] = []
     current: list[str] = []
     for word in words:
         candidate = " ".join(current + [word])
-        bbox = draw.textbbox((0, 0), candidate, font=font)
-        if bbox[2] - bbox[0] <= max_width or not current:
+        if _text_width(draw, candidate, font) <= max_width or not current:
             current.append(word)
         else:
             lines.append(" ".join(current))
@@ -364,9 +518,12 @@ def _fit_pill_font(
 
     ``font_loader`` is an optional callable ``(size) -> ImageFont`` used by
     Template 3's script-aware loader. When None we fall back to the
-    bundled Inter loader (T1 / T2 / CTA pill default path).
+    default loader, which routes by ``text``'s script (T1 / T2 / CTA pill
+    default path).
     """
-    loader = font_loader or (lambda s: _load_font(s, override=font_override))
+    loader = font_loader or (
+        lambda s: _load_font(s, override=font_override, text=text)
+    )
     size = initial_size
     while size >= min_size:
         font = loader(size)
@@ -398,9 +555,12 @@ def _fit_title_font(
 
     ``font_loader`` lets a template plug in a non-default font (e.g.
     Template 3 uses ``_load_template_3_font`` to pick Anton / Oswald /
-    Heebo / Cairo per script).
+    Heebo / Cairo per script). The default loader routes by ``text``'s
+    script.
     """
-    loader = font_loader or (lambda s: _load_font(s, override=font_override))
+    loader = font_loader or (
+        lambda s: _load_font(s, override=font_override, text=text)
+    )
     size = initial_size
     while size >= min_size:
         font = loader(size)
@@ -663,7 +823,7 @@ def _render_template_2(
     pill_full_width = int(width * 0.94)
     # Placeholder height — recomputed once we have the real pill font.
     placeholder_pill_font = _load_font(
-        max(14, int(strip_h * 0.18)), override=font_override
+        max(14, int(strip_h * 0.18)), override=font_override, text=cta or ""
     )
     placeholder_bbox = draw.textbbox((0, 0), cta or "X", font=placeholder_pill_font)
     placeholder_text_h = placeholder_bbox[3] - placeholder_bbox[1]

@@ -16,6 +16,10 @@ FROM python:3.12-slim
 # System deps:
 #   supervisor — runs uvicorn + worker side by side.
 #   ca-certificates + curl — TLS to vendor APIs, downloads in build only.
+#   libfribidi0 — activates Pillow's bundled raqm engine (complex-text
+#     shaping: Thai mark stacking, Hebrew/Arabic direction, Arabic
+#     joining). Without it draw.text renders RTL scripts reversed. See
+#     _plans/2026-06-10-multiscript-text-rendering.md.
 #   build-essential — only kept around long enough to build libsql's
 #     pyo3 native extension if the wheel index doesn't have a match for
 #     the slim image's libc; removed after pip install to keep the image
@@ -25,6 +29,7 @@ RUN apt-get update \
         supervisor \
         ca-certificates \
         curl \
+        libfribidi0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

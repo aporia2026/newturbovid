@@ -94,7 +94,7 @@ def _fit_overlay_font(
     """
     size = initial_size
     while size >= min_size:
-        font = _load_font(size, override=None)
+        font = _load_font(size, override=None, text=text)
         lines = _wrap_text_to_width(draw, text, font, max_width)
         if not lines:
             return font, []
@@ -116,7 +116,7 @@ def _fit_overlay_font(
                 return font, lines
         size -= max(2, size // 20)
     # Floor: accept overflow at min_size rather than degrade further.
-    font = _load_font(min_size, override=None)
+    font = _load_font(min_size, override=None, text=text)
     return font, _wrap_text_to_width(draw, text, font, max_width)
 
 
