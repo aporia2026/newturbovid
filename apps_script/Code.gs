@@ -583,15 +583,23 @@ function _unprocessedRowNumbers(sheet, readyVideoCol1, tabType) {
   const firstData = _firstDataRowForTab(tabType);
   const lastRow = sheet.getLastRow();
   if (lastRow < firstData) return [];
-  // Read the ready-video-1 column for all data rows.
-  const values = sheet
-    .getRange(firstData, readyVideoCol1, lastRow - firstData + 1, 1)
-    .getValues();
+  const numRows = lastRow - firstData + 1;
+  // Ready-video-1 column plus input columns A-D (Country / Vertical /
+  // Article / Manual Image or How Many on every layout), batch-read once.
+  // A row only counts as unprocessed WORK when A-D hold something real —
+  // sheets are pre-formatted hundreds of rows deep with default dropdowns
+  // (Voice Over "No", Change Size "4:3"), and counting those produced a
+  // scary "Submit 500 unprocessed rows?" over ~zero actual rows
+  // (chat 2026-06-10).
+  const ready = sheet.getRange(firstData, readyVideoCol1, numRows, 1).getValues();
+  const inputs = sheet.getRange(firstData, 1, numRows, 4).getValues();
   const rowNums = [];
-  for (var i = 0; i < values.length; i++) {
-    if (!String(values[i][0] || '').trim()) {
-      rowNums.push(i + firstData);    // sheet row
-    }
+  for (var i = 0; i < ready.length; i++) {
+    if (String(ready[i][0] || '').trim()) continue;    // already has output
+    const hasInput = inputs[i].some(function (v) {
+      return String(v == null ? '' : v).trim() !== '';
+    });
+    if (hasInput) rowNums.push(i + firstData);    // sheet row
   }
   return rowNums;
 }
@@ -1157,11 +1165,15 @@ function _submitJobWithRetry_(payload) {
       // Friendly retry/cancel dialog. The SAME key is reused on Retry, so a
       // submit that actually succeeded but whose response the backend dropped
       // is idempotent — no duplicate job. Cancel leaves the key in place so
-      // the user's next manual click resumes.
+      // the user's next manual click resumes. The last error is included
+      // verbatim so a screenshot of this dialog is diagnosable — "HTTP 500:
+      // …" means the backend failed, an exception message means the request
+      // never got through (chat 2026-06-10, the omer@ incident).
       const ans = ui.alert(
         'Backend is busy',
         'The backend is temporarily overloaded and the submit could not get '
         + 'through after ' + SUBMIT_MAX_ATTEMPTS + ' attempts.\n\n'
+        + 'Last error: ' + String((e && e.message) || e).substring(0, 300) + '\n\n'
         + 'Click YES to retry, or NO to try again later from the menu.',
         ui.ButtonSet.YES_NO
       );
