@@ -41,18 +41,18 @@ const CARD_TEMPLATE_PREVIEW_URLS = {
   '3': 'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/apps_script/template_previews/template_3_labeled.png',
 };
 
-// Submit-POST retry policy. PythonAnywhere occasionally returns HTTP 500 when
-// its uWSGI dispatcher cannot find a free worker quickly (cold-start, recycle,
-// concurrent polls saturating the small pool). The Apps Script retries the
-// submit with the same idempotency key — server returns the original job_id,
-// no duplicate. 6 attempts × backoff = ~31s total, comfortably wider than a
-// PA worker recycle window. See _plans/2026-06-04-submit-500-defensive-fix.md.
+// Submit-POST retry policy. The backend occasionally returns HTTP 5xx while a
+// container is cold-starting or restarting (HF Spaces sleep after inactivity).
+// The Apps Script retries the submit with the same idempotency key — server
+// returns the original job_id, no duplicate. 6 attempts × backoff = ~31s
+// total, comfortably wider than a cold-start window.
+// See _plans/2026-06-04-submit-500-defensive-fix.md.
 const SUBMIT_MAX_ATTEMPTS = 6;
 const SUBMIT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000];
 
-// Optional pre-warm: fire GET /health a moment before the submit so a cold PA
-// worker has a chance to lazy-init. Submit fires regardless of pre-warm
-// outcome — pre-warm is purely a nudge.
+// Optional pre-warm: fire GET /health a moment before the submit so a cold
+// backend container has a chance to lazy-init. Submit fires regardless of
+// pre-warm outcome — pre-warm is purely a nudge.
 const PREWARM_ENABLED = true;
 const PREWARM_COOLDOWN_MS = 60 * 1000;
 
@@ -170,7 +170,7 @@ function configureBackendUrl() {
   const response = ui.prompt(
     'Backend URL',
     'Enter the backend URL (current: ' + current + '):\n' +
-    'e.g. https://yourname.pythonanywhere.com',
+    'e.g. https://<owner>-aporia-bulkvid.hf.space',
     ui.ButtonSet.OK_CANCEL
   );
   if (response.getSelectedButton() !== ui.Button.OK) return;
@@ -952,8 +952,11 @@ function showJobsSidebar() {
  *
  *  ``retryOpts`` (optional) overrides the default 3-attempt × [0.6s, 1.2s]
  *  policy. Used by the submit POST to widen the window to ~31s
- *  (SUBMIT_MAX_ATTEMPTS × SUBMIT_BACKOFF_MS) because PA's frontend can take
- *  longer than 1.8s to recover a recycling uWSGI worker. */
+ *  (SUBMIT_MAX_ATTEMPTS × SUBMIT_BACKOFF_MS) because a sleeping HF Space can
+ *  take longer than 1.8s to cold-start.
+ *
+ *  Errors from 4xx responses carry ``permanent: true`` so callers can tell
+ *  "fix the cause" apart from "try again later". */
 function _fetchJson(path, options, retryOpts) {
   const backendUrl = _getBackendUrl();
   const opts = options || {};
@@ -976,11 +979,18 @@ function _fetchJson(path, options, retryOpts) {
         return text ? JSON.parse(text) : null;
       }
       if (code >= 400 && code < 500) {
-        throw new Error('HTTP ' + code + ': ' + text.substring(0, 200));
+        // Real error (auth / validation / not-found) — retrying cannot help.
+        // Tag it so the catch below rethrows instead of swallowing it into
+        // the retry loop.
+        if (onAttempt) onAttempt(attempt, 'fatal', code);
+        const err = new Error('HTTP ' + code + ': ' + text.substring(0, 200));
+        err.permanent = true;
+        throw err;
       }
       lastErr = 'HTTP ' + code + ': ' + text.substring(0, 200);
       if (onAttempt) onAttempt(attempt, 'retry', code);
     } catch (e) {
+      if (e && e.permanent) throw e;
       lastErr = String((e && e.message) || e);
       if (onAttempt) onAttempt(attempt, 'error', 0);
     }
@@ -995,10 +1005,10 @@ function _fetchJson(path, options, retryOpts) {
 }
 
 
-/** Light "pre-warm" hint — fires a GET /health so PA's uWSGI has a chance to
- *  wake up a cold worker before we send the real submit POST. Submit fires
- *  regardless of whether this succeeds. Cooldown'd via DocumentProperties so
- *  rapid clicks don't pre-warm every time. */
+/** Light "pre-warm" hint — fires a GET /health so a sleeping backend
+ *  container has a chance to wake up before we send the real submit POST.
+ *  Submit fires regardless of whether this succeeds. Cooldown'd via
+ *  DocumentProperties so rapid clicks don't pre-warm every time. */
 function _prewarmBackend_() {
   if (!PREWARM_ENABLED) return;
   const props = PropertiesService.getDocumentProperties();
@@ -1061,14 +1071,29 @@ function _submitJobWithRetry_(payload) {
       return body;
     } catch (e) {
       console.info('[bulkvid submit] final-fail', { err: String((e && e.message) || e) });
-      // Friendly retry/cancel dialog. The SAME key is reused on Retry, so a
-      // submit that actually succeeded but whose response PA dropped is
-      // idempotent — no duplicate job. Cancel leaves the key in place so the
-      // user's next manual click resumes.
       const ui = SpreadsheetApp.getUi();
+      if (e && e.permanent) {
+        // 4xx — auth or validation. Retrying the same payload cannot succeed,
+        // so surface the real reason instead of the busy dialog. The pending
+        // key stays stashed; once the cause is fixed, the next click resumes
+        // the same idempotent submit.
+        ui.alert(
+          'Submit rejected',
+          String((e && e.message) || e) + '\n\n'
+          + 'This is not a backend overload. If the message shows 401 or 403, '
+          + 'your Google account is not authorized on the backend — ask the '
+          + 'admin to add your email to the allowlist.',
+          ui.ButtonSet.OK
+        );
+        return null;
+      }
+      // Friendly retry/cancel dialog. The SAME key is reused on Retry, so a
+      // submit that actually succeeded but whose response the backend dropped
+      // is idempotent — no duplicate job. Cancel leaves the key in place so
+      // the user's next manual click resumes.
       const ans = ui.alert(
         'Backend is busy',
-        'PythonAnywhere is temporarily overloaded and the submit could not get '
+        'The backend is temporarily overloaded and the submit could not get '
         + 'through after ' + SUBMIT_MAX_ATTEMPTS + ' attempts.\n\n'
         + 'Click YES to retry, or NO to try again later from the menu.',
         ui.ButtonSet.YES_NO
