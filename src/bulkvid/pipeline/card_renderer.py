@@ -198,21 +198,17 @@ _T3_FONT_ARABIC: Final[Path] = (
 )
 
 
-# ── Script fonts (Thai / Japanese / Chinese) ────────────────────────────────
+# ── Script fonts (Thai / CJK / Devanagari) ──────────────────────────────────
 #
 # Inter covers Latin (+Ext), Cyrillic, Greek and Vietnamese — and nothing
-# else. The sheet also carries TH, JP, HK (Traditional Chinese) and IL rows;
-# drawing those through Inter produced the "no glyph" tofu boxes reported in
-# chat 2026-06-10. Three Noto fonts (SIL OFL, same license as the rest of the
-# bundle) close the gap; Hebrew and Arabic reuse the Heebo/Cairo files that
-# already ship for Template 3.
-#
-# Han characters are shared between Japanese and Chinese (Unicode Han
-# unification), so the detector below treats kana anywhere in the string as
-# "Japanese" and Han with no kana as "Chinese" (Traditional/HK glyph shapes —
-# that's the market in the sheet). Korean and Simplified Chinese have no rows
-# today and no font here; adding one = bundle the font + one range + one
-# dict entry. Plan: _plans/2026-06-10-multiscript-text-rendering.md.
+# else. The sheet carries TH, JP, HK, KR and IL rows (tofu screenshots, chat
+# 2026-06-10); the Noto fonts below (SIL OFL, same license as the rest of
+# the bundle) cover every script an ad market could realistically add:
+# Thai, Japanese, Traditional + Simplified Chinese, Korean and Devanagari
+# (Hindi). Hebrew and Arabic reuse the Heebo/Cairo files that already ship
+# for Template 3. Anything still uncovered is caught loudly at render time
+# by ``_warn_if_missing_glyphs`` instead of shipping silent tofu.
+# Plan: _plans/2026-06-10-multiscript-text-rendering.md.
 _FONT_THAI: Final[Path] = (
     Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansThai-Variable.ttf"
 )
@@ -222,25 +218,51 @@ _FONT_JP: Final[Path] = (
 _FONT_HK: Final[Path] = (
     Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansHK-Variable.ttf"
 )
+_FONT_KR: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansKR-Variable.ttf"
+)
+_FONT_SC: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansSC-Variable.ttf"
+)
+_FONT_DEVANAGARI: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansDevanagari-Variable.ttf"
+)
+
+# Distinctive high-frequency characters whose Simplified and Traditional
+# forms differ. Han codepoints are otherwise shared (Han unification), so
+# when a string has Han but no kana/hangul we count marker hits from each
+# set to pick SC vs HK glyph shapes. Ambiguous all-shared strings default
+# to Traditional — the Chinese market in the sheet today is Hong Kong.
+_SIMPLIFIED_MARKERS: Final[frozenset[str]] = frozenset(
+    "们这说对时会学国发见关问长门马车东买动业体让点战书读写电话语红钱价优广厂网头实现进选资讯"
+)
+_TRADITIONAL_MARKERS: Final[frozenset[str]] = frozenset(
+    "們這說對時會學國發見關問長門馬車東買動業體讓點戰書讀寫電話語紅錢價優廣廠網頭實現進選資訊"
+)
 
 
 def _non_latin_script_for(text: str) -> str | None:
     """Detect the script of ``text`` when it needs a non-Inter font.
 
-    Returns ``'hebrew' | 'arabic' | 'cyrillic' | 'thai' | 'jp' | 'zh'`` or
-    None for everything Latin-ish. RTL scripts, Cyrillic, Thai and kana
+    Returns ``'hebrew' | 'arabic' | 'cyrillic' | 'thai' | 'jp' | 'ko' |
+    'devanagari' | 'zh-hant' | 'zh-hans'`` or None for everything
+    Latin-ish. RTL scripts, Cyrillic, Thai, Devanagari, kana and hangul
     return on first hit — they are unambiguous. Han only sets a flag while
     scanning: kana anywhere wins (Japanese headlines always carry some),
-    otherwise Han alone reads as Chinese.
+    hangul wins for Korean-with-Hanja, and Han alone is disambiguated
+    Simplified vs Traditional via the marker sets above.
 
     Codepoint ranges:
-      * Hebrew:   U+0590..05FF, presentation forms U+FB1D..FB4F
-      * Arabic:   U+0600..06FF, supplement U+0750..077F
-      * Cyrillic: U+0400..04FF, supplement U+0500..052F
-      * Thai:     U+0E00..0E7F
-      * Kana:     U+3040..30FF, phonetic ext U+31F0..31FF,
-                  halfwidth katakana U+FF66..FF9D
-      * Han:      U+3400..4DBF (Ext A), U+4E00..9FFF, compat U+F900..FAFF
+      * Hebrew:     U+0590..05FF, presentation forms U+FB1D..FB4F
+      * Arabic:     U+0600..06FF, supplement U+0750..077F
+      * Cyrillic:   U+0400..04FF, supplement U+0500..052F
+      * Thai:       U+0E00..0E7F
+      * Devanagari: U+0900..097F
+      * Kana:       U+3040..30FF, phonetic ext U+31F0..31FF,
+                    halfwidth katakana U+FF66..FF9D
+      * Hangul:     U+1100..11FF, compat jamo U+3130..318F,
+                    syllables U+AC00..D7A3
+      * Han:        U+3400..4DBF (Ext A), U+4E00..9FFF, compat U+F900..FAFF
     """
     has_han = False
     for ch in text or "":
@@ -251,36 +273,50 @@ def _non_latin_script_for(text: str) -> str | None:
             return "arabic"
         if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
             return "cyrillic"
+        if 0x0900 <= cp <= 0x097F:
+            return "devanagari"
         if 0x0E00 <= cp <= 0x0E7F:
             return "thai"
         if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF or 0xFF66 <= cp <= 0xFF9D:
             return "jp"
+        if 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F or 0xAC00 <= cp <= 0xD7A3:
+            return "ko"
         if 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF:
             has_han = True
-    return "zh" if has_han else None
+    if has_han:
+        simp = sum(1 for ch in text if ch in _SIMPLIFIED_MARKERS)
+        trad = sum(1 for ch in text if ch in _TRADITIONAL_MARKERS)
+        return "zh-hans" if simp > trad else "zh-hant"
+    return None
 
 
 # Generic Bold routing table: script → (font path, variation axes pinned in
 # the order each font declares them — verified per file on 2026-06-10:
-# Heebo [wght] · Cairo [wght, slnt] · Noto Thai [wght, wdth] · Noto JP [wght]
-# · Noto HK [wght]). Cyrillic is absent on purpose: Inter covers it.
+# Heebo [wght] · Cairo [wght, slnt] · Noto Thai/Devanagari [wght, wdth] ·
+# Noto JP/HK/KR/SC [wght]). Cyrillic is absent on purpose: Inter covers it.
 _SCRIPT_FONTS_BOLD: Final[dict[str, tuple[Path, tuple[float, ...]]]] = {
-    "hebrew": (_T3_FONT_HEBREW, (700.0,)),
-    "arabic": (_T3_FONT_ARABIC, (700.0, 0.0)),
-    "thai":   (_FONT_THAI,      (700.0, 100.0)),
-    "jp":     (_FONT_JP,        (700.0,)),
-    "zh":     (_FONT_HK,        (700.0,)),
+    "hebrew":     (_T3_FONT_HEBREW,  (700.0,)),
+    "arabic":     (_T3_FONT_ARABIC,  (700.0, 0.0)),
+    "thai":       (_FONT_THAI,       (700.0, 100.0)),
+    "devanagari": (_FONT_DEVANAGARI, (700.0, 100.0)),
+    "jp":         (_FONT_JP,         (700.0,)),
+    "ko":         (_FONT_KR,         (700.0,)),
+    "zh-hant":    (_FONT_HK,         (700.0,)),
+    "zh-hans":    (_FONT_SC,         (700.0,)),
 }
 
 # T3 display routing: same detection, heavier weights to match the Black
 # look of the template. Latin (incl. Vietnamese) falls through to Anton.
 _T3_FONTS_BY_SCRIPT: Final[dict[str, Path]] = {
-    "hebrew":   _T3_FONT_HEBREW,
-    "arabic":   _T3_FONT_ARABIC,
-    "cyrillic": _T3_FONT_CYRILLIC,
-    "thai":     _FONT_THAI,
-    "jp":       _FONT_JP,
-    "zh":       _FONT_HK,
+    "hebrew":     _T3_FONT_HEBREW,
+    "arabic":     _T3_FONT_ARABIC,
+    "cyrillic":   _T3_FONT_CYRILLIC,
+    "thai":       _FONT_THAI,
+    "devanagari": _FONT_DEVANAGARI,
+    "jp":         _FONT_JP,
+    "ko":         _FONT_KR,
+    "zh-hant":    _FONT_HK,
+    "zh-hans":    _FONT_SC,
 }
 
 # Variation axes pin per T3 font, in each font's declared axis order (None =
@@ -288,14 +324,80 @@ _T3_FONTS_BY_SCRIPT: Final[dict[str, Path]] = {
 # the old single-value pin raised inside set_variation_by_axes and silently
 # left it at Regular; the full tuple fixes that.
 _T3_FONT_AXES: Final[dict[str, tuple[float, ...] | None]] = {
-    str(_T3_FONT_LATIN):    None,             # Anton ships in one weight
-    str(_T3_FONT_CYRILLIC): (700.0,),         # Oswald Bold (axis caps at 700)
-    str(_T3_FONT_HEBREW):   (900.0,),         # Heebo Black
-    str(_T3_FONT_ARABIC):   (900.0, 0.0),     # Cairo Black, no slant
-    str(_FONT_THAI):        (900.0, 100.0),   # Noto Thai Black, normal width
-    str(_FONT_JP):          (900.0,),         # Noto JP Black
-    str(_FONT_HK):          (900.0,),         # Noto HK Black
+    str(_T3_FONT_LATIN):    None,              # Anton ships in one weight
+    str(_T3_FONT_CYRILLIC): (700.0,),          # Oswald Bold (axis caps at 700)
+    str(_T3_FONT_HEBREW):   (900.0,),          # Heebo Black
+    str(_T3_FONT_ARABIC):   (900.0, 0.0),      # Cairo Black, no slant
+    str(_FONT_THAI):        (900.0, 100.0),    # Noto Thai Black, normal width
+    str(_FONT_DEVANAGARI):  (900.0, 100.0),    # Noto Devanagari Black
+    str(_FONT_JP):          (900.0,),          # Noto JP Black
+    str(_FONT_KR):          (900.0,),          # Noto KR Black
+    str(_FONT_HK):          (900.0,),          # Noto HK Black
+    str(_FONT_SC):          (900.0,),          # Noto SC Black
 }
+
+
+# ── Glyph-coverage safety net ───────────────────────────────────────────────
+
+
+# (font path, text hash) pairs already checked, so the cheap-but-not-free
+# pixel comparison runs once per unique (font, text) — not once per
+# size-fit iteration. Cleared when it grows past a sane bound.
+_GLYPH_CHECKED: set[tuple[str, int]] = set()
+
+
+def _render_char_sample(font: ImageFont.ImageFont, s: str) -> bytes:
+    img = Image.new("L", (160, 80), 0)
+    ImageDraw.Draw(img).text((8, 8), s, font=font, fill=255)
+    data = img.tobytes()
+    img.close()
+    return data
+
+
+def _warn_if_missing_glyphs(font: ImageFont.ImageFont, text: str) -> list[int]:
+    """Log loudly when ``font`` lacks a glyph for any char in ``text``.
+
+    The safety net behind the script router: a script with no route (or a
+    coverage hole in a routed font) shows up in the HF logs as a named
+    ``font_missing_glyphs`` warning instead of silent tofu on a shipped
+    creative. A char counts as missing when it renders identically to the
+    font's .notdef box (U+0378 is permanently unassigned, so it always
+    renders .notdef). Returns the missing codepoints (for tests).
+    """
+    path = getattr(font, "path", "")
+    if not path or not text:
+        return []
+    key = (path, hash(text))
+    if key in _GLYPH_CHECKED:
+        return []
+    if len(_GLYPH_CHECKED) > 512:
+        _GLYPH_CHECKED.clear()
+    _GLYPH_CHECKED.add(key)
+
+    # Unique non-ASCII chars, capped to bound the pixel-compare cost.
+    candidates: list[str] = []
+    for ch in text:
+        if ord(ch) > 0x7F and not ch.isspace() and ch not in candidates:
+            candidates.append(ch)
+        if len(candidates) >= 24:
+            break
+    if not candidates:
+        return []
+
+    notdef = _render_char_sample(font, "͸")
+    missing = [
+        ord(ch) for ch in candidates
+        if _render_char_sample(font, ch) == notdef
+    ]
+    if missing:
+        _log.warning(
+            "font_missing_glyphs",
+            font=os.path.basename(path),
+            codepoints=["U+%04X" % cp for cp in missing[:8]],
+            missing_count=len(missing),
+            sample=text[:40],
+        )
+    return missing
 
 
 def _pick_template_3_font_path(text: str) -> str:
@@ -330,6 +432,7 @@ def _load_template_3_font(text: str, size: int) -> ImageFont.ImageFont:
             font.set_variation_by_axes(list(axes))
         except (OSError, AttributeError):
             pass    # static font or older Pillow — already at the bundled weight
+    _warn_if_missing_glyphs(font, text)
     return font
 
 
@@ -358,13 +461,14 @@ def _load_font(
     """Load the Bold body font for ``text`` at ``size`` px.
 
     ``text`` (the string about to be drawn) drives per-script routing:
-    Thai / Japanese / Chinese / Hebrew / Arabic land on a bundled Noto /
-    Heebo / Cairo font pinned to Bold, because Inter has no glyphs for any
-    of them (chat 2026-06-10 tofu reports). Everything else stays on the
-    bundled Inter exactly as before: opsz=14 (display-shape glyphs) +
-    wght=700 (Bold). An explicit ``override`` path wins over routing.
-    Falls back to default-weight glyphs on non-variable fonts (no
-    exception) and to PIL's bitmap font on missing files.
+    Thai / Japanese / Korean / Chinese (Traditional + Simplified) /
+    Devanagari / Hebrew / Arabic land on a bundled Noto / Heebo / Cairo
+    font pinned to Bold, because Inter has no glyphs for any of them
+    (chat 2026-06-10 tofu reports). Everything else stays on the bundled
+    Inter exactly as before: opsz=14 (display-shape glyphs) + wght=700
+    (Bold). An explicit ``override`` path wins over routing. Falls back
+    to default-weight glyphs on non-variable fonts (no exception) and to
+    PIL's bitmap font on missing files.
     """
     script = None if override else _non_latin_script_for(text)
     routed = _SCRIPT_FONTS_BOLD.get(script) if script else None
@@ -382,6 +486,7 @@ def _load_font(
                 font.set_variation_by_axes(list(axes))
             except (OSError, AttributeError):
                 pass
+            _warn_if_missing_glyphs(font, text)
             return font
 
     path = _find_font_path(override)
@@ -401,6 +506,7 @@ def _load_font(
         font.set_variation_by_axes(list(_BUNDLED_FONT_AXES))
     except (OSError, AttributeError):
         pass
+    _warn_if_missing_glyphs(font, text)
     return font
 
 

@@ -74,14 +74,32 @@ pattern (option B below).
   Two more deps to do at runtime what fribidi does better; only wins if
   we could not touch the image, but we own the Dockerfile.
 
+## Round 2 (same day): full coverage + safety net
+
+A Korean tofu screenshot arrived hours after round 1 shipped — the
+"only scripts visible in the sheet" scoping was wrong for an ads
+operation that adds markets without warning. Round 2 adds:
+
+* **Noto Sans KR** (Korean; hangul anywhere wins over Han, so
+  Korean-with-Hanja routes correctly), **Noto Sans SC** (Simplified
+  Chinese) and **Noto Sans Devanagari** (Hindi).
+* ``zh`` split into ``zh-hant`` / ``zh-hans`` via distinctive-character
+  marker sets (们/們, 这/這, ...). Ambiguous all-shared strings default
+  to Traditional — the sheet's Chinese market is Hong Kong.
+* ``_warn_if_missing_glyphs``: every loaded font is checked against the
+  text it is about to draw (once per unique font+text, pixel-compare vs
+  the .notdef box). A coverage hole now logs a ``font_missing_glyphs``
+  warning with the codepoints — silent tofu is structurally gone.
+
 ## Known limits (stated, not silent)
 
-* Korean and Simplified Chinese still have no font. No KR/CN rows
-  exist in the sheet today (HK = Traditional is covered). Adding
-  either = bundle a Noto font + one range + one dict entry.
 * Japanese-only Han with zero kana (rare in headlines) routes to the
-  HK font: right characters, occasionally Chinese-style glyph variants.
-  Acceptable; kana check covers real Japanese copy.
+  Chinese fonts: right characters, occasionally Chinese-style glyph
+  variants. Acceptable; kana check covers real Japanese copy.
+* Scripts beyond the bundled ten (e.g. Tamil, Burmese, Khmer) have no
+  font yet — they trip the ``font_missing_glyphs`` warning instead of
+  shipping silently. Adding one = bundle a Noto font + one range + one
+  dict entry.
 * Thai char-level wrap can break mid-word (proper Thai segmentation
   needs a dictionary, e.g. pythainlp). Acceptable for ad creatives;
   revisit only if the operator complains about awkward breaks.
