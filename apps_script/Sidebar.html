@@ -606,9 +606,12 @@
 
         var right;
         if (st === 'done') {
+          // text_on_img rows ship a still PNG, not a video (the only
+          // image-producing tab) — label the link accordingly.
+          var linkNoun = r._tab === 'text_on_img' ? 'image' : 'video';
           right = (r.video_urls && r.video_urls.length)
             ? r.video_urls.map(function (u, i) {
-                return '<a href="' + u + '" target="_blank">video' +
+                return '<a href="' + u + '" target="_blank">' + linkNoun +
                        (r.video_urls.length > 1 ? (i + 1) : '') + '</a>';
               }).join(' ')
             : 'done';
