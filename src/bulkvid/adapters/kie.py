@@ -139,6 +139,11 @@ class KiePool:
             cooldown_seconds=cooldown_seconds,
         )
 
+    @property
+    def key_count(self) -> int:
+        """Number of keys in the pool (cooled or not). Stable for the pool's lifetime."""
+        return len(self._states)
+
     async def acquire(self) -> str:
         """Return the next available key. Blocks (with backoff) if all are in cooldown."""
         backoff = 0.1
@@ -204,9 +209,52 @@ class KieClient:
     async def __aexit__(self, *_: Any) -> None:
         await self.aclose()
 
+    # Hard cap on the in-`create_task` retry loop. kie.ai signals rate-limit
+    # in two ways (HTTP 429 OR body code 429); on either, the offending key is
+    # placed on cooldown and we re-acquire the next available key. Cap at 3 so
+    # a pool with many keys can't burn the whole batch of attempts on a single
+    # row before the outer fallback chain (gpt-image-2, AtlasCloud) kicks in.
+    # Plan: ``_plans/2026-06-11-kie-body-code-429.md``.
+    _MAX_RATE_LIMIT_RETRIES = 3
+
     async def create_task(self, model: str, input_params: dict[str, Any]) -> str:
-        """Submit a task. Returns a pinned task_id (must be passed to ``poll_task``)."""
-        key = await self._pool.acquire()
+        """Submit a task. Returns a pinned task_id (must be passed to ``poll_task``).
+
+        On rate-limit (HTTP 429 OR body ``{"code": 429, ...}`` over HTTP 200),
+        cools the key down and retries with the next available pool key, up to
+        ``min(pool.key_count, _MAX_RATE_LIMIT_RETRIES)`` attempts. After the
+        cap, the last ``KieRateLimitError`` propagates so the caller's fallback
+        chain can run. See ``_plans/2026-06-11-kie-body-code-429.md``.
+        """
+        max_attempts = min(self._pool.key_count, self._MAX_RATE_LIMIT_RETRIES)
+        last_err: KieRateLimitError | None = None
+        for attempt in range(max_attempts):
+            key = await self._pool.acquire()
+            try:
+                return await self._submit_once(model, input_params, key)
+            except KieRateLimitError as e:
+                last_err = e
+                if attempt < max_attempts - 1:
+                    _log.info(
+                        "kie_submit_retry_after_429",
+                        model=model,
+                        key_suffix=_key_suffix(key),
+                        attempt=attempt + 1,
+                        max_attempts=max_attempts,
+                    )
+        assert last_err is not None    # max_attempts >= 1 because pool has >=1 key
+        raise last_err
+
+    async def _submit_once(
+        self, model: str, input_params: dict[str, Any], key: str
+    ) -> str:
+        """Single-attempt submission with one specific key. Returns a pinned task_id.
+
+        Raises ``KieRateLimitError`` on HTTP 429 OR body-code 429 (after
+        cooling the key); ``KieAuthError`` on 401; ``KieError`` on anything
+        else non-200. Extracted from ``create_task`` so the rate-limit retry
+        loop above can iterate cleanly.
+        """
         url = f"{self._base_url}/api/v1/jobs/createTask"
         headers = {
             "Authorization": f"Bearer {key}",
@@ -230,7 +278,24 @@ class KieClient:
                 f"kie.ai submit HTTP {resp.status_code}: {resp.text[:200]}"
             )
         body = resp.json()
-        if body.get("code") != 200:
+        body_code = body.get("code")
+        # kie.ai signals per-key rate-limit by returning HTTP 200 with body
+        # ``{"code": 429, "msg": ...}`` (verified 2026-06-11 on prod batch).
+        # Treat it identically to an HTTP-status 429 so the cooldown + retry
+        # logic kicks in instead of slamming the same tripped key.
+        if body_code == 429:
+            await self._pool.mark_rate_limited(key)
+            msg = str(body.get("msg") or "rate limit exceeded")[:200]
+            _log.warning(
+                "kie_submit_body_code_429",
+                model=model,
+                key_suffix=_key_suffix(key),
+                body_msg=msg,
+            )
+            raise KieRateLimitError(
+                f"kie.ai body 429 for key {_key_suffix(key)}: {msg}"
+            )
+        if body_code != 200:
             raise KieError(f"kie.ai submit body code != 200: {body}")
         data = body.get("data") or {}
         task_id = data.get("taskId")

@@ -136,17 +136,102 @@ async def test_create_task_401_raises_auth_error() -> None:
 
 @respx.mock
 async def test_create_task_429_marks_cooldown_and_raises() -> None:
+    # 1-key pool keeps the retry loop from also cooling a second key —
+    # this test focuses on the cooldown-on-HTTP-429 invariant. Multi-key
+    # retry behavior is covered by the dedicated tests below.
     respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
         return_value=httpx.Response(429, text="rate limited")
+    )
+    pool = KiePool(keys=[KEY_A], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieRateLimitError):
+            await client.create_task(MODEL_NANO_BANANA_EDIT, {"prompt": "x"})
+
+    # KEY_A was the only key in the pool; it must be on cooldown now.
+    assert pool._states[0].cooldown_until > 0
+
+
+@respx.mock
+async def test_create_task_body_code_429_marks_cooldown_and_raises() -> None:
+    """kie.ai signals per-key rate-limit via HTTP 200 + body code 429.
+
+    Treat it identically to HTTP 429: cooldown the key + raise
+    ``KieRateLimitError``. Without this, the same tripped key gets re-acquired
+    by the gpt-image-2 fallback (and by every other parallel row) until the
+    whole image fallback chain collapses (observed 2026-06-11). Plan:
+    ``_plans/2026-06-11-kie-body-code-429.md``.
+    """
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
+        return_value=httpx.Response(
+            200,
+            json={"code": 429, "msg": "rate limit exceeded"},
+        )
+    )
+    pool = KiePool(keys=[KEY_A], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieRateLimitError) as exc_info:
+            await client.create_task(MODEL_NANO_BANANA_EDIT, {"prompt": "x"})
+
+    # The kie ``msg`` field is surfaced for debugging, not swallowed.
+    assert "rate limit exceeded" in str(exc_info.value)
+    assert pool._states[0].cooldown_until > 0
+
+
+@respx.mock
+async def test_create_task_429_retries_other_keys_then_succeeds() -> None:
+    """First key trips 429 → cooldown + retry next key → success.
+
+    Ensures the in-`create_task` retry loop falls forward inside the same call
+    instead of bubbling immediately. Result: the row gets its task_id, the
+    tripped key is on cooldown, the healthy key stays available.
+    """
+    call_count = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(
+                200, json={"code": 429, "msg": "rate limit exceeded"}
+            )
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "task-ok"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    pool = KiePool(keys=[KEY_A, KEY_B], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        pinned = await client.create_task(MODEL_NANO_BANANA_EDIT, {"prompt": "x"})
+
+    real, suffix = _unpin_task_id(pinned)
+    assert real == "task-ok"
+    # Second attempt won with KEY_B; KEY_A is on cooldown.
+    assert suffix == KEY_B[-12:]
+    assert pool._states[0].cooldown_until > 0    # KEY_A
+    assert pool._states[1].cooldown_until == 0.0    # KEY_B
+
+
+@respx.mock
+async def test_create_task_429_all_keys_exhausted_raises() -> None:
+    """When every key in the pool trips 429, the last error propagates so the
+    outer fallback chain (gpt-image-2 → AtlasCloud) can take over."""
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
+        return_value=httpx.Response(
+            200, json={"code": 429, "msg": "rate limit exceeded"}
+        )
     )
     pool = KiePool(keys=[KEY_A, KEY_B], cooldown_seconds=300.0)
     async with KieClient(pool=pool, base_url=KIE_BASE) as client:
         with pytest.raises(KieRateLimitError):
             await client.create_task(MODEL_NANO_BANANA_EDIT, {"prompt": "x"})
 
-    # KEY_A was acquired first (round-robin head); it should now be in cooldown.
-    # Next acquire returns KEY_B (KEY_A skipped).
-    assert await pool.acquire() == KEY_B
+    # Both keys cooled — the retry loop tried each before giving up.
+    assert pool._states[0].cooldown_until > 0
+    assert pool._states[1].cooldown_until > 0
+
+
+def test_pool_exposes_key_count() -> None:
+    """Stable property the retry loop in ``create_task`` reads to cap attempts."""
+    assert KiePool(keys=[KEY_A]).key_count == 1
+    assert KiePool(keys=[KEY_A, KEY_B]).key_count == 2
+    assert KiePool(keys=[KEY_A, KEY_B, KEY_C]).key_count == 3
 
 
 @respx.mock
