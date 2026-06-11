@@ -23,9 +23,8 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-import httpx
-
 from bulkvid.adapters.rendi import normalize_aspect_ratio
+from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
@@ -50,13 +49,6 @@ _log = get_logger("row")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -249,7 +241,7 @@ async def process_4images_vo2_row(
         # ─── Stage 6 (parallel): persist videos to storage ───
 
         async def _persist(idx: int, rendi_url: str) -> str:
-            data = await _download(rendi_url, timeout=180.0)
+            data = await download_image(rendi_url, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
                 key=f"bulkvid/videos/{slug}/v{idx + 1}.mp4",
@@ -274,7 +266,7 @@ async def process_4images_vo2_row(
 
         if row.zapcap and clients.zapcap is not None:
             async def _caption(idx: int, video_url: str) -> str:
-                video_bytes = await _download(video_url, timeout=180.0)
+                video_bytes = await download_image(video_url, timeout=180.0)
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=lang.language,
@@ -284,7 +276,7 @@ async def process_4images_vo2_row(
                     ),
                 )
                 costs.zapcap += cost
-                cap_bytes = await _download(cap_url, timeout=180.0)
+                cap_bytes = await download_image(cap_url, timeout=180.0)
                 up = await clients.storage.upload_bytes(
                     cap_bytes,
                     key=f"bulkvid/videos_captioned/{slug}/v{idx + 1}.mp4",

@@ -26,9 +26,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from bulkvid.adapters.rendi import normalize_aspect_ratio
+from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
@@ -50,13 +49,6 @@ from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
 
 _log = get_logger("row")
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -217,7 +209,7 @@ async def process_simple_row(
         # ─── Stage 6: persist video to storage ───
 
         try:
-            data = await _download(video.url, timeout=180.0)
+            data = await download_image(video.url, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
                 key=f"bulkvid/videos/{slug}/v1.mp4",
@@ -235,7 +227,7 @@ async def process_simple_row(
 
         if row.zapcap and clients.zapcap is not None:
             try:
-                video_bytes = await _download(final_url, timeout=180.0)
+                video_bytes = await download_image(final_url, timeout=180.0)
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=lang.language,
@@ -245,7 +237,7 @@ async def process_simple_row(
                     ),
                 )
                 costs.zapcap += cost
-                cap_bytes = await _download(cap_url, timeout=180.0)
+                cap_bytes = await download_image(cap_url, timeout=180.0)
                 cap_up = await clients.storage.upload_bytes(
                     cap_bytes,
                     key=f"bulkvid/videos_captioned/{slug}/v1.mp4",

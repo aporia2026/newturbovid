@@ -29,8 +29,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from bulkvid.adapters.kie import (
     nano_banana_2_image_to_image,
     nano_banana_2_text_to_image,
@@ -46,6 +44,7 @@ from bulkvid.adapters.zapcap import (
     ZapCapStyleOptions,
     ZapCapSubsOptions,
 )
+from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
@@ -166,13 +165,6 @@ def compute_atempo(
     # because the value carries meaningful "how badly does this overshoot"
     # information for the log line.
     return max_atempo, raw_seconds / max_atempo
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -597,7 +589,7 @@ async def process_cartoon_row(
                         )
 
                 # 4e. Persist to our storage, then free the Rendi copies.
-                data = await _download(video_url_for_persist, timeout=180.0)
+                data = await download_image(video_url_for_persist, timeout=180.0)
                 up = await clients.storage.upload_bytes(
                     data,
                     key=f"bulkvid/videos/{slug}/v{idx + 1}.mp4",
@@ -627,7 +619,7 @@ async def process_cartoon_row(
                             video_duration_seconds=target_video_seconds,
                         )
                         costs.zapcap += cost
-                        cap_bytes = await _download(cap_url, timeout=180.0)
+                        cap_bytes = await download_image(cap_url, timeout=180.0)
                         cap_up = await clients.storage.upload_bytes(
                             cap_bytes,
                             key=f"bulkvid/videos_captioned/{slug}/v{idx + 1}.mp4",

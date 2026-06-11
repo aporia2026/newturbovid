@@ -45,8 +45,6 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from bulkvid.adapters.kie import nano_banana_2_text_to_image
 from bulkvid.adapters.rendi import (
     dimensions_for_ratio,
@@ -61,6 +59,7 @@ from bulkvid.adapters.zapcap import (
     ZapCapStyleOptions,
     ZapCapSubsOptions,
 )
+from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_ARTICLE_FETCH_FAILED,
@@ -170,13 +169,6 @@ _BACKGROUND_PROMPT_ARTICLE_CHARS = 3000
 
 def _is_valid_http_url(url: str) -> bool:
     return isinstance(url, str) and url.strip().startswith(("http://", "https://"))
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -418,7 +410,7 @@ async def process_avatar_row(
                 # As-is: download + re-upload. No AI rewrite, no scene
                 # description, no aspect-ratio coercion — Rendi's
                 # cover-crop in the overlay command handles framing.
-                raw = await _download(row.manual_image_url, timeout=60.0)
+                raw = await download_image(row.manual_image_url, timeout=60.0)
                 up = await clients.storage.upload_bytes(
                     raw,
                     key=f"bulkvid/avatar_backgrounds/{slug}_manual.png",
@@ -545,7 +537,7 @@ async def process_avatar_row(
 
         # ─── Stage 7: persist video to storage ───
         try:
-            data = await _download(video_url_for_persist, timeout=180.0)
+            data = await download_image(video_url_for_persist, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
                 key=f"bulkvid/videos/{slug}/avatar_{_avatar_filename_slug(row.avatar_id)}.mp4",
@@ -579,7 +571,7 @@ async def process_avatar_row(
                     video_duration_seconds=avatar_duration or 15.0,
                 )
                 costs.zapcap += cost
-                cap_bytes = await _download(cap_url, timeout=180.0)
+                cap_bytes = await download_image(cap_url, timeout=180.0)
                 cap_up = await clients.storage.upload_bytes(
                     cap_bytes,
                     key=f"bulkvid/videos_captioned/{slug}/avatar_{_avatar_filename_slug(row.avatar_id)}.mp4",

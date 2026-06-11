@@ -29,7 +29,6 @@ import io
 import time
 from dataclasses import dataclass
 
-import httpx
 from PIL import Image
 
 from bulkvid.adapters.kie import recraft_crisp_upscale
@@ -39,6 +38,7 @@ from bulkvid.adapters.zapcap import (
     ZapCapStyleOptions,
     ZapCapSubsOptions,
 )
+from bulkvid.http_download import download_image
 from bulkvid.image_ops import (
     DEFAULT_EDGE_CROP_PIXELS,
     optimize_image_for_size,
@@ -87,13 +87,6 @@ _log = get_logger("row")
 
 
 # ── Helpers (mirror image_vo's helpers) ──────────────────────────────────────
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -309,7 +302,7 @@ async def process_simple_x4_row(
 
         async def _prep_source_image() -> tuple[str, str] | Exception:
             try:
-                raw = await _download(row.manual_image_url, timeout=60.0)
+                raw = await download_image(row.manual_image_url, timeout=60.0)
             except Exception as e:
                 return e
             try:
@@ -435,7 +428,7 @@ async def process_simple_x4_row(
                     )
                     costs.upscale += c4
 
-                    upscaled_bytes = await _download(upscaled_url, timeout=120.0)
+                    upscaled_bytes = await download_image(upscaled_url, timeout=120.0)
                     quads = split_collage_2x2(
                         upscaled_bytes, edge_crop_pixels=edge_crop_pixels
                     )
@@ -655,7 +648,7 @@ async def process_simple_x4_row(
         # ─── Stage 11 (parallel): persist videos to OUR storage ───────────
 
         async def _persist_video(idx: int, rendi_url: str) -> str:
-            data = await _download(rendi_url, timeout=180.0)
+            data = await download_image(rendi_url, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
                 key=f"bulkvid/videos/{slug}/v{idx + 1}.mp4",
@@ -696,7 +689,7 @@ async def process_simple_x4_row(
             )
 
             async def _caption(idx: int, video_url: str) -> str:
-                video_bytes = await _download(video_url, timeout=180.0)
+                video_bytes = await download_image(video_url, timeout=180.0)
                 # Per-quadrant render options: tame the caption on templated
                 # cells (so it stops covering my bottom strip), leave default
                 # caption style on blank-template cells (legacy look).
@@ -711,7 +704,7 @@ async def process_simple_x4_row(
                     video_duration_seconds=vo_duration,
                 )
                 costs.zapcap += cost
-                cap_bytes = await _download(cap_url, timeout=180.0)
+                cap_bytes = await download_image(cap_url, timeout=180.0)
                 up = await clients.storage.upload_bytes(
                     cap_bytes,
                     key=f"bulkvid/videos_captioned/{slug}/v{idx + 1}.mp4",

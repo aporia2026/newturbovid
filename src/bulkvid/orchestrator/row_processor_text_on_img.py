@@ -34,9 +34,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
-
 from bulkvid.adapters.rendi import normalize_aspect_ratio
+from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
     STATUS_IMAGE_DOWNLOAD_FAILED,
@@ -50,13 +49,6 @@ from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
 
 _log = get_logger("row")
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug_segment(value: str, *, fallback: str = "na") -> str:
@@ -163,7 +155,7 @@ async def process_text_on_img_row(
     try:
         # ─── Stage 1: download manual image ───
         try:
-            source_image_bytes = await _download(row.manual_image_url, timeout=60.0)
+            source_image_bytes = await download_image(row.manual_image_url, timeout=60.0)
         except Exception as e:
             # httpx errors sometimes stringify to "" (e.g. ConnectError on
             # a TLS handshake failure). Include the exception class AND the

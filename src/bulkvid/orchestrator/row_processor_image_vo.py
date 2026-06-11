@@ -29,11 +29,11 @@ import io
 import time
 from dataclasses import dataclass
 
-import httpx
 from PIL import Image
 
 from bulkvid.adapters.kie import recraft_crisp_upscale
 from bulkvid.adapters.rendi import normalize_aspect_ratio
+from bulkvid.http_download import download_image
 from bulkvid.image_ops import (
     DEFAULT_EDGE_CROP_PIXELS,
     optimize_image_for_size,
@@ -66,14 +66,6 @@ _log = get_logger("row")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-async def _download(url: str, *, timeout: float = 60.0) -> bytes:
-    """Generic async HTTP GET -> bytes. Raises on non-2xx."""
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        resp = await c.get(url, follow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -185,7 +177,7 @@ async def process_image_vo_row(
         async def _prep_source_image() -> tuple[str, str] | Exception:
             """Download manual image, upload to storage, return (url, b64)."""
             try:
-                raw = await _download(row.manual_image_url, timeout=60.0)
+                raw = await download_image(row.manual_image_url, timeout=60.0)
             except Exception as e:
                 return e
             try:
@@ -251,7 +243,7 @@ async def process_image_vo_row(
                 upscaled_url, c4 = await recraft_crisp_upscale(clients.kie, collage_url)
                 costs.upscale += c4
 
-                upscaled_bytes = await _download(upscaled_url, timeout=120.0)
+                upscaled_bytes = await download_image(upscaled_url, timeout=120.0)
                 quadrants = split_collage_2x2(upscaled_bytes, edge_crop_pixels=edge_crop_pixels)
                 if len(quadrants) != 4:
                     raise RuntimeError(f"split_collage_2x2 returned {len(quadrants)} quadrants")
@@ -385,7 +377,7 @@ async def process_image_vo_row(
         # ─── Stage 11 (parallel): persist videos to OUR storage ───
 
         async def _persist_video(idx: int, rendi_url: str) -> str:
-            data = await _download(rendi_url, timeout=180.0)
+            data = await download_image(rendi_url, timeout=180.0)
             up = await clients.storage.upload_bytes(
                 data,
                 key=f"bulkvid/videos/{slug}/v{idx + 1}.mp4",
@@ -416,7 +408,7 @@ async def process_image_vo_row(
             vo_duration = float(metadata.get("vo_duration_seconds") or 10.0)
 
             async def _caption(idx: int, video_url: str) -> str:
-                video_bytes = await _download(video_url, timeout=180.0)
+                video_bytes = await download_image(video_url, timeout=180.0)
                 cap_url, cost = await clients.zapcap.caption_video(
                     video_bytes=video_bytes,
                     language=language,
@@ -424,7 +416,7 @@ async def process_image_vo_row(
                     video_duration_seconds=vo_duration,
                 )
                 costs.zapcap += cost
-                cap_bytes = await _download(cap_url, timeout=180.0)
+                cap_bytes = await download_image(cap_url, timeout=180.0)
                 up = await clients.storage.upload_bytes(
                     cap_bytes,
                     key=f"bulkvid/videos_captioned/{slug}/v{idx + 1}.mp4",
