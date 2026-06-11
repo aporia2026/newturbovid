@@ -177,6 +177,89 @@ async def test_wait_for_result_times_out() -> None:
         await c.wait_for_result("task-abc")
 
 
+@respx.mock
+async def test_wait_for_result_retries_on_rate_limit_code_then_succeeds() -> None:
+    """code=40100 ("Too many requests") is per-account rate-limit and
+    transient. The poll loop should log + continue rather than kill the
+    row — the next iteration polls again after poll_interval. Reported
+    2026-06-11: row 3 failed on attempt 12 with this exact code, when
+    the next attempt would have succeeded.
+    Plan: ``_plans/2026-06-11-tiktok-avatar-rate-limit-retry.md``.
+    """
+    route = respx.get(_GET).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={"code": 40100, "message": "Too many requests. Please retry in some time."},
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {
+                                "status": "SUCCESS",
+                                "preview_url": "https://tt.test/vid.mp4",
+                            }
+                        ]
+                    },
+                },
+            ),
+        ]
+    )
+    c = _client()
+    result = await c.wait_for_result("task-abc")
+    assert result.preview_url == "https://tt.test/vid.mp4"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_wait_for_result_retries_on_internal_timeout_51010_then_succeeds() -> None:
+    """code=51010 ("internal service timed out") is also transient — the
+    list endpoint already treats it as such; the poll endpoint follows
+    the same pattern for symmetry."""
+    route = respx.get(_GET).mock(
+        side_effect=[
+            httpx.Response(200, json={"code": 51010, "message": "internal timeout"}),
+            httpx.Response(
+                200,
+                json={
+                    "code": 0,
+                    "data": {
+                        "list": [
+                            {
+                                "status": "SUCCESS",
+                                "preview_url": "https://tt.test/vid.mp4",
+                            }
+                        ]
+                    },
+                },
+            ),
+        ]
+    )
+    c = _client()
+    result = await c.wait_for_result("task-abc")
+    assert result.preview_url == "https://tt.test/vid.mp4"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_wait_for_result_terminal_code_still_raises() -> None:
+    """Non-transient codes (auth failures, bad request, etc.) MUST still
+    kill the row immediately — otherwise the operator never hears about
+    a configuration error and the row times out 10 minutes later with a
+    misleading message."""
+    respx.get(_GET).mock(
+        return_value=httpx.Response(
+            200, json={"code": 40000, "message": "bad request"}
+        )
+    )
+    c = _client()
+    with pytest.raises(TikTokAvatarError, match="code=40000"):
+        await c.wait_for_result("task-abc")
+
+
 # ── list_avatars ────────────────────────────────────────────────────────────
 
 

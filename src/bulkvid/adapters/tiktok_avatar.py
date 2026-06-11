@@ -77,6 +77,20 @@ _LIST_API_MAX_RETRIES = 4
 _DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 _DEFAULT_POLL_MAX_ATTEMPTS = 120
 
+# Transient TikTok API codes on the POLL endpoint. Mirrors the LIST endpoint's
+# transient-retry pattern (above). When the poll lands on one of these, log
+# and continue the loop — the next iteration's poll_interval sleep already
+# provides spacing for TikTok's per-minute window to roll over. Anything
+# outside this set is treated as terminal and raised.
+#
+#   * 40100 — "Too many requests" (per-account rate limit; observed
+#             2026-06-11 on row 3, attempt 12).
+#   * 51010 — "internal service timed out" (same code the LIST endpoint
+#             already retries; harmless to include for poll symmetry).
+#
+# Plan: ``_plans/2026-06-11-tiktok-avatar-rate-limit-retry.md``.
+_POLL_TRANSIENT_API_CODES: frozenset[int] = frozenset({40100, 51010})
+
 
 # ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -334,6 +348,21 @@ class TikTokAvatarClient:
                 body: dict[str, Any] = resp.json()
 
             code = body.get("code")
+            if code in _POLL_TRANSIENT_API_CODES:
+                # Per-account rate-limit / internal-timeout — TikTok's
+                # window rolls over in seconds. Skip this attempt; the
+                # next iteration sleeps poll_interval and re-polls. The
+                # overall timeout (poll_max × poll_interval) still bounds
+                # how long we wait if the limit is sustained.
+                message = body.get("message") or "no message"
+                _log.warning(
+                    "tiktok_avatar_poll_transient_retry",
+                    code=code,
+                    message=message,
+                    attempt=attempt,
+                    task_id=task_id,
+                )
+                continue
             if code != 0:
                 message = body.get("message") or "no message"
                 raise TikTokAvatarError(
