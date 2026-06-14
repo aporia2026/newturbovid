@@ -18,6 +18,7 @@ import asyncio
 import io
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,19 @@ GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS = 1.0
 # windowed quota and bounces again. 65s gives a single ~1-minute window
 # enough room to roll over plus a small jitter margin.
 GEMINI_TTS_RETRY_MAX_SECONDS = 65.0
+
+# Per-minute rate cap for ``generate_content`` calls. The Vertex quota
+# ``aiplatform.googleapis.com/generate_content_requests_per_minute`` trips
+# 429 RESOURCE_EXHAUSTED above this; the concurrency semaphore alone can't
+# enforce it because 4 in-flight × ~4s each = ~60 RPM peak, way over the
+# 15-RPM project quota observed in production (chat 2026-06-14). Counted at
+# the ``_call`` boundary so EACH retry consumes a slot — without that, a
+# burst of 15 synth calls × 3 retries = 45 hits within one window.
+GEMINI_TTS_DEFAULT_MAX_PER_MINUTE = 15
+
+# Threshold above which we emit a rate-gate wait log. Below this the gate
+# isn't biting; above it, RPM IS the bottleneck and we want the signal.
+GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS = 1.0
 
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
@@ -248,6 +262,60 @@ def pcm_duration_seconds(
     return len(pcm) / bytes_per_second
 
 
+# ── Per-minute rate limiter ──────────────────────────────────────────────────
+
+
+class _RpmLimiter:
+    """Sliding-window rate gate. Caps acquires to ``max_per_minute`` per window.
+
+    Keeps a deque of acquire timestamps; on each ``acquire`` it expires anything
+    older than the window, and if the in-window count is already at the cap it
+    sleeps until the oldest entry ages out. ``asyncio.Lock`` serialises the
+    bookkeeping so concurrent callers can't double-count under the same window.
+
+    Sleep happens OUTSIDE the lock, so a waiting task doesn't block fresh
+    callers from seeing the deque shrink. ``window_seconds`` is overridable
+    so tests can drive the limiter with a sub-second window.
+    """
+
+    DEFAULT_WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        max_per_minute: int,
+        window_seconds: float = DEFAULT_WINDOW_SECONDS,
+    ) -> None:
+        if max_per_minute < 1:
+            raise ValueError("_RpmLimiter max_per_minute must be >= 1")
+        if window_seconds <= 0:
+            raise ValueError("_RpmLimiter window_seconds must be > 0")
+        self._max = max_per_minute
+        self._window_seconds = window_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> float:
+        """Block until a slot is available. Returns total seconds waited."""
+        waited = 0.0
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                # Expire entries that have aged out of the window.
+                cutoff = now - self._window_seconds
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self._max:
+                    self._timestamps.append(now)
+                    return waited
+                wait_s = self._window_seconds - (now - self._timestamps[0])
+            # Sleep outside the lock so other tasks can re-check as soon as
+            # entries age out. A small +0.01 nudge avoids a wake-up that
+            # finds the window still full by a microsecond.
+            if wait_s > 0:
+                await asyncio.sleep(wait_s + 0.01)
+                waited += wait_s + 0.01
+
+
 # ── Client ───────────────────────────────────────────────────────────────────
 
 
@@ -267,26 +335,36 @@ class GeminiTTSClient:
         model: str = DEFAULT_MODEL,
         credentials_info: dict[str, Any] | None = None,
         max_concurrent: int = GEMINI_TTS_DEFAULT_MAX_CONCURRENT,
+        max_per_minute: int = GEMINI_TTS_DEFAULT_MAX_PER_MINUTE,
         client: Any | None = None,
     ) -> None:
         if not project:
             raise ValueError("GeminiTTSClient requires a Vertex AI project")
         if max_concurrent < 1:
             raise ValueError("GeminiTTSClient max_concurrent must be >= 1")
+        if max_per_minute < 1:
+            raise ValueError("GeminiTTSClient max_per_minute must be >= 1")
         self._project = project
         self._location = location
         self._model = model
         self._credentials_info = credentials_info
         self._client = client  # injected (tests) or built lazily
-        # Per-provider semaphore — built lazily on first acquire so import-time
+        # Per-provider gates — both built lazily on first acquire so import-time
         # construction outside an event loop is safe.
         self._max_concurrent = max_concurrent
         self._sem: asyncio.Semaphore | None = None
+        self._max_per_minute = max_per_minute
+        self._rpm: _RpmLimiter | None = None
 
     def _get_sem(self) -> asyncio.Semaphore:
         if self._sem is None:
             self._sem = asyncio.Semaphore(self._max_concurrent)
         return self._sem
+
+    def _get_rpm(self) -> _RpmLimiter:
+        if self._rpm is None:
+            self._rpm = _RpmLimiter(self._max_per_minute)
+        return self._rpm
 
     def _ensure_client(self) -> Any:
         if self._client is None:
@@ -358,7 +436,16 @@ class GeminiTTSClient:
             has_style=bool(style_prompt),
         )
 
+        rpm = self._get_rpm()
+
         async def _call() -> Any:
+            # RPM gate is INSIDE the retry boundary so each attempt counts
+            # against the per-minute quota — without that, a burst of 15
+            # synths × 3 retries each would punch ~45 calls into the same
+            # 60s window, defeating the cap.
+            rpm_wait = await rpm.acquire()
+            if rpm_wait >= GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS:
+                _log.info("gemini_tts_rpm_wait", queued_for_s=round(rpm_wait, 2))
             try:
                 return await client.aio.models.generate_content(
                     model=self._model,
@@ -460,4 +547,5 @@ def build_client_from_settings(settings: Settings | None = None) -> GeminiTTSCli
         location=s.VERTEX_AI_LOCATION,
         credentials_info=build_vertex_credentials_info(s),
         max_concurrent=s.BULKVID_GEMINI_TTS_MAX_CONCURRENT,
+        max_per_minute=s.BULKVID_GEMINI_TTS_MAX_PER_MINUTE,
     )

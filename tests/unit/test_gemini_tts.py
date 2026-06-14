@@ -40,7 +40,9 @@ from bulkvid.adapters.gemini_tts import (
     DEFAULT_VOICE,
     GEMINI_TTS_CHANNELS,
     GEMINI_TTS_DEFAULT_MAX_CONCURRENT,
+    GEMINI_TTS_DEFAULT_MAX_PER_MINUTE,
     GEMINI_TTS_RETRY_MAX_SECONDS,
+    GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS,
     GEMINI_TTS_SAMPLE_RATE_HZ,
     GEMINI_TTS_SAMPLE_WIDTH_BYTES,
     GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS,
@@ -50,6 +52,7 @@ from bulkvid.adapters.gemini_tts import (
     GeminiTTSRateLimitError,
     GeminiTTSServerError,
     GeminiTTSTimeoutError,
+    _RpmLimiter,
     accent_directive,
     pcm_duration_seconds,
     pick_voice,
@@ -468,3 +471,176 @@ async def test_synthesize_passes_lifted_max_seconds_to_with_retry(
         "clamps Retry-After below the per-minute quota window — second attempt "
         "hits the same window and bounces."
     )
+
+
+# ── Per-minute RPM limiter ──────────────────────────────────────────────────
+#
+# Vertex enforces ``generate_content_requests_per_minute`` at the project
+# level; on the amit-tts project that ceiling is 15 RPM and exceeding it
+# returns 429 RESOURCE_EXHAUSTED (chat 2026-06-14). The concurrency
+# semaphore alone can't prevent it — 4 in-flight × ~4s each = ~60 RPM
+# peak. These tests lock in:
+#   1. ``_RpmLimiter`` blocks the (N+1)th acquire until the oldest entry
+#      ages out of the window.
+#   2. ``GeminiTTSClient`` plumbs ``max_per_minute`` through to a real
+#      ``_RpmLimiter`` and acquires on every call.
+#   3. The constructor rejects nonsense values.
+#   4. RPM gate sits INSIDE the retry boundary so each retry attempt
+#      consumes a slot (a 15-call burst × 3 retries each is otherwise
+#      ~45 hits inside one window — defeats the whole cap).
+
+
+def test_rpm_limiter_rejects_zero() -> None:
+    with pytest.raises(ValueError):
+        _RpmLimiter(max_per_minute=0)
+
+
+def test_rpm_limiter_rejects_nonpositive_window() -> None:
+    with pytest.raises(ValueError):
+        _RpmLimiter(max_per_minute=15, window_seconds=0)
+
+
+async def test_rpm_limiter_lets_first_n_through_immediately() -> None:
+    # With cap=3, the first three acquires should each report zero wait.
+    lim = _RpmLimiter(max_per_minute=3, window_seconds=60.0)
+    for _ in range(3):
+        waited = await lim.acquire()
+        assert waited == 0.0
+
+
+async def test_rpm_limiter_blocks_overflow_until_window_rolls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 4th acquire under cap=3 must NOT return until the oldest entry
+    # ages out of the (tiny) window. Restore the real ``asyncio.sleep``
+    # so the limiter's wait advances real time instead of spinning under
+    # the autouse no-op-sleep fixture.
+    monkeypatch.setattr(_retry.asyncio, "sleep", _real_sleep)
+
+    window = 0.3
+    lim = _RpmLimiter(max_per_minute=3, window_seconds=window)
+    for _ in range(3):
+        await lim.acquire()
+
+    t0 = asyncio.get_event_loop().time()
+    waited = await lim.acquire()
+    elapsed = asyncio.get_event_loop().time() - t0
+
+    # We slept until the oldest entry aged out — must be at least ~window.
+    # The limiter pads with +0.01 to avoid edge-of-window races; allow a
+    # generous lower bound and a sane upper bound.
+    assert elapsed >= window * 0.9, (
+        f"4th acquire returned after {elapsed:.3f}s, expected >= {window:.3f}s — "
+        "limiter is NOT blocking when the window is full"
+    )
+    assert waited > 0.0
+
+
+# ── Constructor / wiring ────────────────────────────────────────────────────
+
+
+def test_constructor_rejects_max_per_minute_zero() -> None:
+    with pytest.raises(ValueError):
+        GeminiTTSClient(project="amit-tts", max_per_minute=0)
+
+
+async def test_rpm_default_matches_module_constant() -> None:
+    # Sanity: factory default == module constant. If one moves, the other moves.
+    client = GeminiTTSClient(project="amit-tts")
+    rpm = client._get_rpm()
+    assert rpm._max == GEMINI_TTS_DEFAULT_MAX_PER_MINUTE
+
+
+async def test_synthesize_acquires_rpm_before_generate_content() -> None:
+    # Order matters: rpm.acquire MUST be awaited before generate_content so
+    # the per-minute quota is paced. Spy on both and verify the timeline.
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)
+    fake_client = _make_fake_client(_make_fake_response(pcm))
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    timeline: list[str] = []
+
+    rpm = tts._get_rpm()
+    real_acquire = rpm.acquire
+
+    async def _spy_acquire() -> float:
+        timeline.append("rpm.acquire")
+        return await real_acquire()
+
+    rpm.acquire = _spy_acquire    # type: ignore[method-assign]
+
+    real_gen = fake_client.aio.models.generate_content
+
+    async def _spy_generate(**kwargs: Any) -> SimpleNamespace:
+        timeline.append("generate_content")
+        return await real_gen(**kwargs)
+
+    fake_client.aio.models.generate_content = _spy_generate
+
+    await tts.synthesize(text="hello", language="en")
+
+    assert timeline == ["rpm.acquire", "generate_content"], (
+        f"expected rpm.acquire before generate_content, got {timeline!r}"
+    )
+
+
+async def test_rpm_acquired_per_retry_attempt() -> None:
+    # The cap is per generate_content CALL, not per synthesize. A retried
+    # synthesize must consume an RPM slot on EACH attempt — otherwise a
+    # 15-call burst × 3 retries each gets ~45 calls into one window.
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)
+    fake_client = _make_eventually_succeeding_client(
+        ResourceExhausted("quota exceeded"), _make_fake_response(pcm)
+    )
+    tts = GeminiTTSClient(project="amit-tts", client=fake_client)
+
+    rpm = tts._get_rpm()
+    acquire_count = {"n": 0}
+    real_acquire = rpm.acquire
+
+    async def _counting_acquire() -> float:
+        acquire_count["n"] += 1
+        return await real_acquire()
+
+    # Replace the bound method on this instance so synthesize hits the spy.
+    rpm.acquire = _counting_acquire  # type: ignore[method-assign]
+
+    await tts.synthesize(text="hello", language="en")
+
+    # 1st attempt raises ResourceExhausted (1 rpm), 2nd attempt succeeds (1 rpm).
+    assert acquire_count["n"] == 2, (
+        f"expected 2 rpm acquires (one per attempt), got {acquire_count['n']}"
+    )
+
+
+async def test_rpm_wait_logged_when_threshold_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # When the rate gate makes a caller wait longer than the log threshold,
+    # we want a ``gemini_tts_rpm_wait`` event so production can see the cap
+    # biting. Use a tiny window so the wait actually exceeds the threshold
+    # without blowing up the test runtime.
+    monkeypatch.setattr(_retry.asyncio, "sleep", _real_sleep)
+
+    pcm = b"\x00" * (24_000 * 1 * 2 // 2)
+    fake_client = _make_fake_client(_make_fake_response(pcm))
+
+    # Pick window = threshold + 0.5s so the second acquire WILL wait > threshold.
+    window = GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS + 0.5
+    tts = GeminiTTSClient(
+        project="amit-tts",
+        client=fake_client,
+        max_per_minute=1,
+    )
+    # Shrink the window on the lazy-built limiter.
+    tts._rpm = _RpmLimiter(max_per_minute=1, window_seconds=window)
+
+    with structlog.testing.capture_logs() as logs:
+        await tts.synthesize(text="a", language="en")    # fills the 1-slot bucket
+        await tts.synthesize(text="b", language="en")    # waits for it to age out
+
+    waits = [e for e in logs if e.get("event") == "gemini_tts_rpm_wait"]
+    assert waits, (
+        "expected at least one gemini_tts_rpm_wait event when the rate gate is biting"
+    )
+    assert waits[0]["queued_for_s"] >= GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS

@@ -172,6 +172,13 @@ class Settings(BaseSettings):
     # data; see each adapter for default-choice reasoning.
     BULKVID_RENDI_MAX_CONCURRENT: int = 6
     BULKVID_GEMINI_TTS_MAX_CONCURRENT: int = 4
+    # Hard ceiling on Gemini TTS calls per 60s window. Vertex enforces
+    # ``aiplatform.googleapis.com/generate_content_requests_per_minute``
+    # at the project level; the observed quota on amit-tts is 15 RPM and
+    # exceeding it returns 429 RESOURCE_EXHAUSTED (chat 2026-06-14). The
+    # concurrency cap alone can't enforce a per-minute budget — see
+    # ``GEMINI_TTS_DEFAULT_MAX_PER_MINUTE`` in the adapter for details.
+    BULKVID_GEMINI_TTS_MAX_PER_MINUTE: int = 15
 
     # ── Feature flags ────────────────────────────────────────────────────
     BULKVID_INTERNAL_PARALLEL: int = 1
