@@ -1239,12 +1239,15 @@ function getJobLog(jobId, rowNum) {
 
 
 /** Called from Sidebar.html: kill ONE specific job. Other jobs keep running —
- *  killing one never cancels another. */
+ *  killing one never cancels another. Also aborts pending/in-flight rows so
+ *  the sidebar reflects the kill immediately (plan
+ *  _plans/2026-06-14-stuck-processing-rows.md §B); the response carries
+ *  ``rows_aborted`` so the toast can say "Killed N rows". */
 function killJob(jobId) {
   if (!jobId) return { ok: false, error: 'no job id' };
   try {
-    _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/kill', { method: 'post' });
-    return { ok: true };
+    const r = _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/kill', { method: 'post' });
+    return { ok: true, rows_aborted: (r && r.rows_aborted) || 0 };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
@@ -1252,11 +1255,17 @@ function killJob(jobId) {
 
 
 /** Called from Sidebar.html: clear the queue — kill ALL of your active jobs.
- *  Rows already in progress finish; everything still waiting is cancelled. */
+ *  Pending and in-flight rows are aborted with a ``killed by user`` result so
+ *  the sidebar reflects the kill immediately (plan
+ *  _plans/2026-06-14-stuck-processing-rows.md §B). */
 function killAllJobs() {
   try {
     const r = _fetchJson('/jobs/kill-all', { method: 'post' });
-    return { ok: true, killed: (r && r.killed) || 0 };
+    return {
+      ok: true,
+      killed: (r && r.killed) || 0,
+      rows_aborted: (r && r.rows_aborted) || 0,
+    };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }

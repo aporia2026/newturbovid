@@ -1015,6 +1015,75 @@ def test_kill_all_503_on_queue_busy(app: FastAPI, client: TestClient) -> None:
     assert r.headers.get("Retry-After") == "5"
 
 
+# ── Kill timeout -> 504 (Plan §B) ───────────────────────────────────────────
+# Without the route-level ``asyncio.wait_for`` bound, a hung libsql roundtrip
+# would pin the kill POST until the Apps Script's 30 s UrlFetch cap fired,
+# and the operator saw "Could not kill" with no diagnostic. The 504 carries
+# a clear "worker may be hung; restart the backend" message instead.
+# Plan: ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+
+
+def _patch_queue_method_to_hang(app: FastAPI, *, on_method: str) -> None:
+    """Replace a queue async method with a coroutine that never returns —
+    simulates a stalled libsql HTTP roundtrip. The route's ``wait_for``
+    is the only thing that should unblock it."""
+    import asyncio
+
+    async def _hangs(*_args, **_kwargs):    # noqa: ANN002, ANN003
+        await asyncio.Event().wait()
+
+    setattr(app.state.queue, on_method, _hangs)
+
+
+def test_kill_job_returns_504_on_timeout(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Shrink the bound so the test settles in <1 s.
+    monkeypatch.setattr(jobs_routes, "_KILL_CALL_TIMEOUT_SECONDS", 0.1)
+    # Submit so there's a job to kill, BEFORE patching kill_job.
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    _patch_queue_method_to_hang(app, on_method="kill_job")
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 504
+    body = r.json()
+    assert "kill timed out" in body["detail"].lower()
+    assert "restart" in body["detail"].lower()
+
+
+def test_kill_all_jobs_returns_504_on_timeout(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_routes, "_KILL_CALL_TIMEOUT_SECONDS", 0.1)
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    _patch_queue_method_to_hang(app, on_method="kill_all_jobs")
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk1"))
+    assert r.status_code == 504
+    assert "kill timed out" in r.json()["detail"].lower()
+
+
+def test_kill_job_returns_rows_aborted_field(client: TestClient) -> None:
+    """Regression for plan §B: the kill response surfaces ``rows_aborted``
+    so the Apps Script can show "Killed N rows" in the toast. Newly
+    submitted job has one pending row; killing it must report 1."""
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["killed"] is True
+    assert body["rows_aborted"] == 1
+
+
+def test_kill_all_jobs_returns_rows_aborted_field(client: TestClient) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["killed"] == 1
+    assert body["rows_aborted"] == 1
+
+
 # ── Helper: run a coroutine from a sync test ────────────────────────────────
 
 

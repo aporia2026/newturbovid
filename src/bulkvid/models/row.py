@@ -23,6 +23,11 @@ STATUS_ZAPCAP_FAILED_KEPT_NO_CAPTIONS = "ZAPCAP_FAILED_KEPT_NO_CAPTIONS"
 STATUS_STORAGE_FAILED = "STORAGE_FAILED"
 STATUS_INTERNAL_ERROR = "INTERNAL_ERROR"
 STATUS_ROW_TIMEOUT = "ROW_TIMEOUT"
+# Operator hit "Kill job" or "Stop all jobs" while this row was pending or
+# in-flight. Distinguished from STATUS_INTERNAL_ERROR so the sidebar can
+# render "killed by user" instead of a generic failure.
+# Plan: ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+STATUS_KILLED_BY_USER = "KILLED_BY_USER"
 
 
 @dataclass

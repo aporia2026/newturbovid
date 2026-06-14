@@ -148,6 +148,49 @@ _WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS = 2.0
 _HEARTBEAT_EVERY = 30
 
 
+# ── record_result retry queue ───────────────────────────────────────────────
+#
+# Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §A. When the worker
+# completes a row but ``record_result`` raises (TimeoutError on a Turso
+# flap, any other exception), the result MUST NOT be silently lost — the
+# old behavior left the row stuck in PROCESSING in the DB while the sheet
+# write proceeded via the decoupled ``CoalescedSheetWriter`` buffer. The
+# operator saw "Starting.." in the sidebar with a growing elapsed timer
+# while the URLs were already in the sheet. Worker restart was the only
+# workaround, and it re-spent every stuck row.
+#
+# Fix: push failed records onto an in-process ``asyncio.Queue``. A
+# long-running drainer task retries each entry with exponential backoff
+# (1 s → 2 s → 4 s → 8 s, capped at 30 s) until either it succeeds OR
+# the per-entry budget below is exhausted. ``_record_result_sync`` is
+# idempotent (it UPDATEs by row id), so retrying is always safe.
+#
+# Per-entry budget — total time we'll spend trying to land a single
+# record_result before logging ``runner_pending_record_giveup`` and
+# dropping the entry. 5 minutes covers a typical Turso flap; admin can
+# raise to 30 min for a known multi-hour outage. Env override:
+# ``BULKVID_RECORD_RESULT_RETRY_MAX_SECONDS``.
+_RECORD_RESULT_RETRY_MAX_SECONDS = float(
+    os.environ.get("BULKVID_RECORD_RESULT_RETRY_MAX_SECONDS") or 300.0
+)
+# Maximum backoff between retries — the exponential schedule (1, 2, 4, 8, 16)
+# caps here so a long outage settles into a steady 30 s polling cadence.
+_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS = 30.0
+# Time we wait, after ``request_shutdown``, for the drainer to flush the
+# pending queue before logging anything still stuck as
+# ``runner_pending_record_dropped``. Bounded so a clean shutdown isn't
+# blocked indefinitely by a non-responsive Turso. Tuned to ~1.5×
+# ``_WORKER_QUERY_TIMEOUT_SECONDS`` so the drainer has time to complete
+# at least one full per-call attempt before we cancel it.
+_RECORD_RESULT_SHUTDOWN_DRAIN_BUDGET_SECONDS = 45.0
+# Buffer-size warning threshold — once the pending queue grows past this
+# many entries, every additional N (``_RECORD_RESULT_BACKLOG_LOG_EVERY``)
+# logs a ``runner_pending_records_backlog`` warning so the operator sees
+# a Turso outage in their HF logs without having to dig.
+_RECORD_RESULT_BACKLOG_THRESHOLD = 1000
+_RECORD_RESULT_BACKLOG_LOG_EVERY = 100
+
+
 def _tab_for_row(row: object) -> str:
     """Map a row instance to the timeout tab name."""
     if isinstance(row, SimpleRow):
@@ -280,6 +323,18 @@ class BatchRunner:
         # in the heartbeat and for the row-timeout failure path. A plain set
         # of tasks is no longer enough.
         self._in_flight: dict[asyncio.Task, _RowMeta] = {}
+        # Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §A. Holds
+        # ``(queued_id, result, attempt, total_wait_s)`` tuples whose
+        # initial ``record_result`` raised. A background drainer task
+        # (``_drain_pending_records``) retries each with exponential
+        # backoff so a Turso flap doesn't strand rows in PROCESSING
+        # forever. Unbounded queue — the typical operation never enqueues
+        # here; only sustained Turso outages do. The drainer logs a
+        # backlog warning past the threshold so the buildup is visible.
+        self._pending_records: asyncio.Queue[
+            tuple[int, RowResult, int, float]
+        ] = asyncio.Queue()
+        self._next_backlog_warn_at: int = _RECORD_RESULT_BACKLOG_THRESHOLD
 
     def request_shutdown(self) -> None:
         _log.info("runner_shutdown_requested")
@@ -294,6 +349,13 @@ class BatchRunner:
             poll_idle_seconds=self._poll_idle,
             recovered_orphans=recovered,
         )
+        # Start the pending-records drainer alongside the main loop. It
+        # runs until shutdown is set AND the queue is empty (with a
+        # bounded extra drain budget on shutdown so a clean stop isn't
+        # blocked indefinitely by a non-responsive Turso). Plan
+        # ``_plans/2026-06-14-stuck-processing-rows.md`` §A.
+        drainer = asyncio.create_task(self._drain_pending_records())
+        _log.info("runner_pending_drainer_start")
 
         try:
             # Heartbeat counter: log every N polls (idle or busy) so a stalled
@@ -378,6 +440,45 @@ class BatchRunner:
             if self._in_flight:
                 await asyncio.gather(*self._in_flight, return_exceptions=True)
         finally:
+            # Give the pending-records drainer a bounded window to flush
+            # its queue (in-flight rows that finished post-shutdown may
+            # still have buffered failed records). Beyond the budget, log
+            # each leftover so an operator can reconcile manually.
+            if not drainer.done():
+                try:
+                    await asyncio.wait_for(
+                        drainer,
+                        timeout=_RECORD_RESULT_SHUTDOWN_DRAIN_BUDGET_SECONDS,
+                    )
+                except TimeoutError:
+                    drainer.cancel()
+                    try:
+                        await drainer
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    # Drain whatever is still queued into the log so the
+                    # results are at least recoverable from observability.
+                    while not self._pending_records.empty():
+                        try:
+                            queued_id, result, attempts, total_wait = (
+                                self._pending_records.get_nowait()
+                            )
+                        except asyncio.QueueEmpty:
+                            break
+                        _log.error(
+                            "runner_pending_record_dropped",
+                            queued_id=queued_id,
+                            row_num=result.row_num,
+                            status=result.status,
+                            video_urls=list(result.video_urls),
+                            error=result.error,
+                            attempts=attempts,
+                            total_wait_s=round(total_wait, 1),
+                        )
+            _log.info(
+                "runner_pending_drainer_stop",
+                pending_at_stop=self._pending_records.qsize(),
+            )
             _log.info("runner_stop", final_in_flight=len(self._in_flight))
 
     def _build_row_meta(self, queued: QueuedRow) -> _RowMeta:
@@ -507,19 +608,36 @@ class BatchRunner:
         # semaphore slot. ``record_result`` is idempotent on retry because
         # the SET writes the same status; getting through eventually is
         # more important than waiting indefinitely on a hung roundtrip.
+        #
+        # Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §A: when the
+        # primary attempt fails (TimeoutError or any other exception), we
+        # MUST NOT drop the result on the floor. The old behaviour left
+        # the row stuck in PROCESSING in the DB while the sheet still got
+        # the URLs via the decoupled CoalescedSheetWriter. Buffer onto
+        # ``_pending_records`` so the drainer task can retry later;
+        # ``_write_back`` continues to fire so the sheet still lands.
+        record_failed = False
+        record_error: str = ""
         try:
             await asyncio.wait_for(
                 self._queue.record_result(queued.id, result),
                 timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
             )
         except TimeoutError:
+            record_failed = True
+            record_error = f"timeout after {_WORKER_QUERY_TIMEOUT_SECONDS}s"
             _log.warning(
                 "runner_record_result_timeout",
                 queued_id=queued.id,
                 timeout_s=_WORKER_QUERY_TIMEOUT_SECONDS,
             )
         except Exception as e:
+            record_failed = True
+            record_error = f"{type(e).__name__}: {e!s}"[:200]
             _log.exception("runner_record_result_failed", error=str(e))
+
+        if record_failed:
+            self._buffer_pending_record(queued.id, result, reason=record_error)
 
         # Look up the job's sheet routing so the writer can flush without
         # a second queue hit. If the job vanished mid-run, skip silently.
@@ -544,8 +662,145 @@ class BatchRunner:
         except Exception as e:
             _log.exception("runner_write_back_failed", error=str(e))
 
+    # ── Pending-record retry queue (Plan §A) ────────────────────────────────
+
+    def _buffer_pending_record(
+        self, queued_id: int, result: RowResult, *, reason: str,
+    ) -> None:
+        """Enqueue a failed ``record_result`` for the background drainer.
+
+        Called from ``_handle_row`` when the primary attempt raised. The
+        drainer task (``_drain_pending_records``) walks this queue with
+        exponential backoff until each entry either succeeds or hits the
+        per-entry budget. ``_record_result_sync`` is idempotent (UPDATE by
+        ``id``), so retrying is always safe.
+
+        Logs a backlog warning past ``_RECORD_RESULT_BACKLOG_THRESHOLD`` so a
+        sustained Turso outage shows up in observability without an
+        operator having to dig through DB metrics.
+        """
+        self._pending_records.put_nowait((queued_id, result, 0, 0.0))
+        qsize = self._pending_records.qsize()
+        _log.warning(
+            "runner_record_result_failed_buffered",
+            queued_id=queued_id,
+            row_num=result.row_num,
+            status=result.status,
+            queue_size_after=qsize,
+            reason=reason,
+        )
+        if qsize >= self._next_backlog_warn_at:
+            _log.warning(
+                "runner_pending_records_backlog",
+                pending=qsize,
+                threshold=_RECORD_RESULT_BACKLOG_THRESHOLD,
+            )
+            self._next_backlog_warn_at = (
+                qsize + _RECORD_RESULT_BACKLOG_LOG_EVERY
+            )
+
+    async def _drain_pending_records(self) -> None:
+        """Background loop. Pull failed record_result entries and retry
+        with exponential backoff until each lands or its per-entry budget
+        is exhausted. Returns when shutdown is set AND the queue is empty.
+
+        Backoff schedule per attempt: 1 s → 2 s → 4 s → 8 s → 16 s →
+        ``_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS`` cap (30 s). During
+        shutdown we skip backoff entirely AND give up immediately on any
+        retry failure — the bounded drain window in ``run()``'s finally
+        block would preempt a stuck retry anyway, so logging the
+        give-up now gives observability complete provenance.
+
+        ``_record_result_sync`` is idempotent (UPDATE by row id), so any
+        previously-partial attempt is safe to repeat. Plan
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §A.
+        """
+        while True:
+            if self._shutdown.is_set() and self._pending_records.empty():
+                return
+            try:
+                entry = await asyncio.wait_for(
+                    self._pending_records.get(), timeout=0.25,
+                )
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                # Honor cancellation from the outer shutdown drain budget.
+                raise
+            except Exception as e:    # noqa: BLE001 — drainer must keep running
+                _log.exception("runner_pending_drainer_loop_error", error=str(e))
+                # Tiny breather so a pathological get() failure doesn't
+                # busy-loop the drainer at 100% CPU.
+                await asyncio.sleep(0.5)
+                continue
+            queued_id, result, attempts, total_wait = entry
+
+            # Backoff between attempts. attempts==0 means this is the
+            # first try (no prior backoff yet) — attempt immediately.
+            # During shutdown we skip backoff so the drain window isn't
+            # wasted on sleeps.
+            if attempts > 0 and not self._shutdown.is_set():
+                backoff = min(
+                    2.0 ** (attempts - 1),
+                    _RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS,
+                )
+                # Honor shutdown promptly even mid-backoff.
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=backoff,
+                    )
+                except TimeoutError:
+                    pass
+                total_wait += backoff
+
+            attempts += 1
+            try:
+                await asyncio.wait_for(
+                    self._queue.record_result(queued_id, result),
+                    timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
+                )
+                _log.info(
+                    "runner_record_result_recovered",
+                    queued_id=queued_id,
+                    row_num=result.row_num,
+                    attempts=attempts,
+                    total_wait_s=round(total_wait, 1),
+                )
+            except Exception as e:    # noqa: BLE001 — drainer must keep running
+                # Give up when the per-entry budget is exhausted OR we're
+                # shutting down (re-enqueueing during shutdown risks
+                # spinning forever inside the bounded drain window).
+                shutting_down = self._shutdown.is_set()
+                if (
+                    total_wait >= _RECORD_RESULT_RETRY_MAX_SECONDS
+                    or shutting_down
+                ):
+                    _log.error(
+                        "runner_pending_record_giveup",
+                        queued_id=queued_id,
+                        row_num=result.row_num,
+                        status=result.status,
+                        video_urls=list(result.video_urls),
+                        error=result.error,
+                        attempts=attempts,
+                        total_wait_s=round(total_wait, 1),
+                        last_error=f"{type(e).__name__}: {e!s}"[:200],
+                        shutdown=shutting_down,
+                    )
+                    continue
+                # Re-enqueue for the next round.
+                self._pending_records.put_nowait(
+                    (queued_id, result, attempts, total_wait)
+                )
+
     # ── Test hooks ──────────────────────────────────────────────────────────
 
     @property
     def in_flight_count(self) -> int:
         return len(self._in_flight)
+
+    @property
+    def pending_records_count(self) -> int:
+        """Live size of the pending record_result retry queue. Used by the
+        admin panel + tests to monitor a Turso outage's blast radius."""
+        return self._pending_records.qsize()

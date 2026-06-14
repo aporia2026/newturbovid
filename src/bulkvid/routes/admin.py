@@ -115,8 +115,13 @@ async def kill_job(
     _user: str = Depends(_check_admin),
 ) -> HTMLResponse:
     queue = _get_queue(request)
-    killed = await queue.kill_job(job_id)
-    _log.info("admin_kill_job", job_id=job_id, killed=killed)
+    killed, rows_aborted = await queue.kill_job(job_id)
+    _log.info(
+        "admin_kill_job",
+        job_id=job_id,
+        killed=killed,
+        rows_aborted=rows_aborted,
+    )
     job = await queue.get_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found")

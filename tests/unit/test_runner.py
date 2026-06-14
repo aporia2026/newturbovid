@@ -627,3 +627,231 @@ async def test_runner_loop_survives_heartbeat_settings_store_error(
     )
     # And the loop got through more than one tick, so the catch worked.
     assert call_count["n"] >= 2
+
+
+# ── Pending record_result retry queue (Plan §A) ─────────────────────────────
+#
+# Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §A: when
+# ``record_result`` raises in the primary ``_handle_row`` path, the result
+# MUST land on an in-process retry queue so a background drainer can keep
+# trying until Turso settles. Without this, the old behaviour stranded
+# rows in PROCESSING in the DB while the sheet write proceeded — operator
+# saw "Starting.." with a growing elapsed timer while the URLs were
+# already in the sheet.
+
+
+async def test_record_result_failure_buffers_and_recovers(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Primary record_result fails twice, then succeeds. The result must
+    land in the DB (row eventually DONE), AND _write_back must still fire
+    immediately (the sheet write isn't blocked on DB recovery)."""
+    from unittest.mock import MagicMock
+
+    # Speed up the test: tiny budgets, no minute-long sleeps.
+    import bulkvid.orchestrator.runner as runner_mod_inner
+    monkeypatch.setattr(
+        runner_mod_inner, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.5,
+    )
+    monkeypatch.setattr(
+        runner_mod_inner, "_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS", 0.05,
+    )
+    monkeypatch.setattr(
+        runner_mod_inner, "_RECORD_RESULT_SHUTDOWN_DRAIN_BUDGET_SECONDS", 2.0,
+    )
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    async def _fake_image_vo(row, _clients, *, job_id=None):
+        return RowResult(
+            row_num=row.row_num, status=STATUS_SUCCESS,
+            video_urls=[f"u{row.row_num}"], cost_usd=0.1,
+        )
+
+    monkeypatch.setattr(runner_mod, "process_image_vo_row", _fake_image_vo)
+
+    # Wrap the real record_result so the first two calls fail; the
+    # third succeeds (settles on the real DB).
+    call_count = {"n": 0}
+    real_record_result = queue.record_result
+
+    async def _flaky_record_result(qid: int, result: RowResult) -> None:
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            raise TimeoutError("simulated Turso flap")
+        await real_record_result(qid, result)
+
+    monkeypatch.setattr(queue, "record_result", _flaky_record_result)
+
+    written: list[tuple[str, int]] = []
+
+    async def _write_back(write: PendingWrite) -> None:
+        written.append((write.job_id, write.row_num))
+
+    rows = [_img_row(2)]
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=rows,
+    )
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.02,
+        write_back=_write_back,
+    )
+
+    async def _shutdown_when_done() -> None:
+        # Wait until the DB shows the row DONE (drainer recovered it).
+        while True:
+            await asyncio.sleep(0.05)
+            job = await queue.get_job(job_id)
+            if job is not None and job.status == JOB_COMPLETED:
+                runner.request_shutdown()
+                return
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_when_done()),
+        timeout=10.0,
+    )
+
+    # 1. Sheet write fired immediately, NOT blocked on DB recovery.
+    assert (job_id, 2) in written
+    # 2. record_result called multiple times — primary failed twice,
+    # drainer retried at least once (succeeded on the 3rd call).
+    assert call_count["n"] >= 3
+    # 3. Buffered + recovered observability fired.
+    buffered = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "runner_record_result_failed_buffered"
+    ]
+    assert buffered, (
+        "expected 'runner_record_result_failed_buffered' warning when "
+        "the primary record_result raised"
+    )
+    recovered = [
+        c for c in fake_log.info.call_args_list
+        if c.args and c.args[0] == "runner_record_result_recovered"
+    ]
+    assert recovered, (
+        "expected 'runner_record_result_recovered' once the drainer "
+        "landed the result on retry"
+    )
+    # The recovered log carries the attempt count + total wait.
+    rec_kwargs = recovered[0].kwargs
+    assert rec_kwargs["attempts"] >= 2
+    assert rec_kwargs["queued_id"] is not None
+
+
+async def test_record_result_persistent_failure_logs_giveup(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When record_result keeps raising past the per-entry budget, the
+    drainer logs 'runner_pending_record_giveup' with the full RowResult
+    so the operator can reconcile manually from observability."""
+    from unittest.mock import MagicMock
+
+    import bulkvid.orchestrator.runner as runner_mod_inner
+    monkeypatch.setattr(
+        runner_mod_inner, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.1,
+    )
+    monkeypatch.setattr(
+        runner_mod_inner, "_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS", 0.02,
+    )
+    # 0.3 s budget so we trip the give-up condition fast.
+    monkeypatch.setattr(
+        runner_mod_inner, "_RECORD_RESULT_RETRY_MAX_SECONDS", 0.3,
+    )
+    monkeypatch.setattr(
+        runner_mod_inner, "_RECORD_RESULT_SHUTDOWN_DRAIN_BUDGET_SECONDS", 1.0,
+    )
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    async def _fake_image_vo(row, _clients, *, job_id=None):
+        return RowResult(
+            row_num=row.row_num, status=STATUS_SUCCESS,
+            video_urls=[f"u{row.row_num}"], cost_usd=0.1,
+        )
+
+    monkeypatch.setattr(runner_mod, "process_image_vo_row", _fake_image_vo)
+
+    async def _always_fails(*_args, **_kwargs):
+        raise TimeoutError("permanent simulated flap")
+
+    monkeypatch.setattr(queue, "record_result", _always_fails)
+
+    rows = [_img_row(2)]
+    await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=rows,
+    )
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.02,
+    )
+
+    async def _shutdown_after_giveup() -> None:
+        # Wait for the give-up log line, then stop the runner.
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            calls = [
+                c for c in fake_log.error.call_args_list
+                if c.args and c.args[0] == "runner_pending_record_giveup"
+            ]
+            if calls:
+                break
+        runner.request_shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_after_giveup()),
+        timeout=10.0,
+    )
+
+    giveup_calls = [
+        c for c in fake_log.error.call_args_list
+        if c.args and c.args[0] == "runner_pending_record_giveup"
+    ]
+    assert giveup_calls, (
+        "expected at least one 'runner_pending_record_giveup' error "
+        "after the per-entry retry budget exhausted"
+    )
+    kw = giveup_calls[0].kwargs
+    # Result payload is fully captured for operator reconciliation.
+    assert kw["row_num"] == 2
+    assert kw["status"] == STATUS_SUCCESS
+    assert kw["video_urls"] == ["u2"]
+    assert kw["attempts"] >= 1
+
+
+async def test_pending_drainer_starts_and_stops(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lifecycle smoke test — the drainer logs its start and stop
+    bookends so a missing drainer is visible in observability."""
+    from unittest.mock import MagicMock
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.01,
+    )
+
+    async def _shutdown_promptly() -> None:
+        await asyncio.sleep(0.05)
+        runner.request_shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_promptly()),
+        timeout=3.0,
+    )
+
+    info_first_args = [
+        c.args[0] for c in fake_log.info.call_args_list if c.args
+    ]
+    assert "runner_pending_drainer_start" in info_first_args
+    assert "runner_pending_drainer_stop" in info_first_args

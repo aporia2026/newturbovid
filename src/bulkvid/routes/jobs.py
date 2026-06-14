@@ -14,6 +14,8 @@ Plan §7 (Security), §13 Phase 4.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import time
 from typing import Any
@@ -55,6 +57,18 @@ from bulkvid.step_extractor import extract_current_step
 # bloat the idempotency table with a giant key. UUID-ish: alnum, dash,
 # underscore, 1-64 chars.
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Hard timeout around the kill DB call. Mirrors the runner's
+# ``_WORKER_QUERY_TIMEOUT_SECONDS`` (commit 62c0950) on the route side:
+# without it, a stalled libsql roundtrip blocks the kill POST forever, the
+# Apps Script's UrlFetch hits its own 30 s cap, and the operator sees
+# "Could not kill" with no diagnostic. 10 s is loose enough to absorb a
+# slow Turso roundtrip (cold-start spikes ~5 s) and tight enough that the
+# Apps Script cap doesn't trip. Plan
+# ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+_KILL_CALL_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_KILL_CALL_TIMEOUT_SECONDS") or 10.0
+)
 
 _log = get_logger("route.jobs")
 
@@ -965,10 +979,26 @@ async def kill_all_jobs(
     queue: JobQueue = Depends(get_queue),
 ) -> dict[str, Any]:
     """Clear the queue: kill all active jobs. Bulk users clear their own;
-    admins clear everyone's. In-flight rows finish; pending rows stop."""
+    admins clear everyone's. Pending and in-flight rows are aborted with
+    a ``killed by user`` result so the sidebar reflects the kill
+    immediately. Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
     scope = None if identity.is_admin else identity.email
     try:
-        killed = await queue.kill_all_jobs(user_email=scope)
+        killed, rows_aborted = await asyncio.wait_for(
+            queue.kill_all_jobs(user_email=scope),
+            timeout=_KILL_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as e:
+        _log.warning(
+            "kill_call_timeout",
+            endpoint="kill_all_jobs",
+            user_email=identity.email,
+            timeout_s=_KILL_CALL_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            504,
+            "kill timed out — worker may be hung; restart the backend",
+        ) from e
     except QueueBusy as e:
         _log.warning(
             "queue_busy_503",
@@ -979,8 +1009,14 @@ async def kill_all_jobs(
         raise HTTPException(
             503, "queue temporarily busy", headers={"Retry-After": "5"}
         ) from e
-    _log.info("jobs_kill_all", by=identity.email, scope=scope or "ALL", killed=killed)
-    return {"killed": killed}
+    _log.info(
+        "jobs_kill_all",
+        by=identity.email,
+        scope=scope or "ALL",
+        killed=killed,
+        rows_aborted=rows_aborted,
+    )
+    return {"killed": killed, "rows_aborted": rows_aborted}
 
 
 @router.post("/{job_id}/kill")
@@ -989,9 +1025,35 @@ async def kill_job(
     identity: Identity = Depends(get_identity),
     queue: JobQueue = Depends(get_queue),
 ) -> dict[str, Any]:
-    await _require_owned_job(job_id, identity, queue)
+    """Kill ``job_id`` and abort its pending/in-flight rows. Bounded by
+    a hard 10 s timeout so a hung libsql roundtrip surfaces as a 504
+    instead of pinning the request forever (the symptom the operator
+    saw on 2026-06-14 as "doesn't let killing this process"). Plan
+    ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
+    # Ownership check uses ``queue.get_job`` (another libsql call) —
+    # wrap it in the same timeout so a hung Turso doesn't pin the
+    # request before we even get to the kill itself.
     try:
-        killed = await queue.kill_job(job_id)
+        await asyncio.wait_for(
+            _require_owned_job(job_id, identity, queue),
+            timeout=_KILL_CALL_TIMEOUT_SECONDS,
+        )
+        killed, rows_aborted = await asyncio.wait_for(
+            queue.kill_job(job_id),
+            timeout=_KILL_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as e:
+        _log.warning(
+            "kill_call_timeout",
+            endpoint="kill_job",
+            job_id=job_id,
+            user_email=identity.email,
+            timeout_s=_KILL_CALL_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            504,
+            "kill timed out — worker may be hung; restart the backend",
+        ) from e
     except QueueBusy as e:
         _log.warning(
             "queue_busy_503",
@@ -1002,5 +1064,11 @@ async def kill_job(
         raise HTTPException(
             503, "queue temporarily busy", headers={"Retry-After": "5"}
         ) from e
-    _log.info("job_kill", job_id=job_id, by=identity.email, killed=killed)
-    return {"job_id": job_id, "killed": killed}
+    _log.info(
+        "job_kill",
+        job_id=job_id,
+        by=identity.email,
+        killed=killed,
+        rows_aborted=rows_aborted,
+    )
+    return {"job_id": job_id, "killed": killed, "rows_aborted": rows_aborted}

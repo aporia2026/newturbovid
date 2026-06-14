@@ -289,8 +289,12 @@ async def test_kill_job_works_for_queued_and_running(queue: JobQueue) -> None:
         user_email="u@aporia.com", sheet_id="s", worksheet="w",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
     )
-    killed = await queue.kill_job(job_id)
+    killed, rows_aborted = await queue.kill_job(job_id)
     assert killed is True
+    # Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B: kill_job now
+    # also aborts the job's pending/processing rows. One pending row enqueued,
+    # so exactly one should have been touched.
+    assert rows_aborted == 1
 
     job = await queue.get_job(job_id)
     assert job is not None
@@ -308,8 +312,9 @@ async def test_kill_job_noop_for_completed(queue: JobQueue) -> None:
         q.id, RowResult(row_num=2, status=STATUS_SUCCESS, cost_usd=0.1)
     )
     # Now COMPLETED — kill_job should be a no-op.
-    killed = await queue.kill_job(job_id)
+    killed, rows_aborted = await queue.kill_job(job_id)
     assert killed is False
+    assert rows_aborted == 0
     job = await queue.get_job(job_id)
     assert job is not None
     assert job.status == JOB_COMPLETED
@@ -356,8 +361,12 @@ async def test_killed_job_pending_rows_are_not_claimed(queue: JobQueue) -> None:
         user_email="u@aporia.com", sheet_id="s", worksheet="w",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
     )
-    assert await queue.kill_job(job_id) is True
-    # A killed job's pending rows must NOT be handed to the worker.
+    killed, rows_aborted = await queue.kill_job(job_id)
+    assert killed is True
+    # Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B: both pending
+    # rows are aborted (status -> ROW_FAILED), not left as ROW_PENDING.
+    assert rows_aborted == 2
+    # A killed job's rows must NOT be handed to the worker.
     assert await queue.claim_next_row() is None
 
 
@@ -411,7 +420,8 @@ async def test_enqueue_allows_rerun_after_job_no_longer_active(queue: JobQueue) 
         user_email="u@aporia.com", sheet_id="S", worksheet="W",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
     )
-    assert await queue.kill_job(job1) is True              # job1 no longer active
+    killed1, _aborted1 = await queue.kill_job(job1)        # job1 no longer active
+    assert killed1 is True
     job2 = await queue.enqueue(
         user_email="u@aporia.com", sheet_id="S", worksheet="W",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
@@ -432,8 +442,10 @@ async def test_kill_all_jobs_kills_every_active_job(queue: JobQueue) -> None:
         user_email="b@x.com", sheet_id="B", worksheet="W",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
     )
-    killed = await queue.kill_all_jobs()
+    killed, rows_aborted = await queue.kill_all_jobs()
     assert killed == 2
+    # Both jobs' single pending rows get aborted.
+    assert rows_aborted == 2
     assert (await queue.get_job(j1)).status == JOB_KILLED
     assert (await queue.get_job(j2)).status == JOB_KILLED
 
@@ -447,10 +459,151 @@ async def test_kill_all_jobs_scoped_to_one_user(queue: JobQueue) -> None:
         user_email="b@x.com", sheet_id="B", worksheet="W",
         tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
     )
-    killed = await queue.kill_all_jobs(user_email="a@x.com")
+    killed, rows_aborted = await queue.kill_all_jobs(user_email="a@x.com")
     assert killed == 1
+    # Only a@x.com's row was aborted; b@x.com's row stays pending.
+    assert rows_aborted == 1
     assert (await queue.get_job(j_a)).status == JOB_KILLED
     assert (await queue.get_job(j_b)).status == JOB_QUEUED
+
+
+# ── Kill cleans up rows (Plan §B) ───────────────────────────────────────────
+
+
+async def test_kill_job_aborts_processing_and_pending_rows(queue: JobQueue) -> None:
+    """Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B: kill must
+    also resolve in-flight uncertainty — any PROCESSING or PENDING row
+    for the killed job is marked FAILED with a ``killed by user`` result.
+    Before this fix the sidebar showed "Starting.." indefinitely on rows
+    whose ``record_result`` write was lost to a Turso flap."""
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3), _img_row(4)],
+    )
+    # Claim two rows (PROCESSING), leave one PENDING.
+    r1 = await queue.claim_next_row()
+    r2 = await queue.claim_next_row()
+    assert r1 is not None and r2 is not None
+
+    killed, rows_aborted = await queue.kill_job(job_id)
+    assert killed is True
+    assert rows_aborted == 3        # 2 processing + 1 pending
+
+    job = await queue.get_job(job_id)
+    assert job is not None
+    assert job.status == JOB_KILLED
+    # Aborted rows count against failed_rows so the sidebar archive's
+    # "done/total" tally adds up to row_count.
+    assert job.failed_rows == 3
+
+    rows = await queue.list_rows(job_id)
+    assert {r["row_num"] for r in rows} == {2, 3, 4}
+    for r in rows:
+        assert r["status"] == "failed"
+        # ``_list_rows_sync`` pulls ``error`` out of the result JSON;
+        # the kill writer puts the sidebar-friendly message there.
+        assert r["error"] == "killed by user"
+
+
+async def test_kill_job_leaves_done_and_already_failed_rows_alone(
+    queue: JobQueue,
+) -> None:
+    """Kill resolves UNCERTAINTY (pending/processing). Rows that already
+    settled to a terminal state stay where they are — overwriting their
+    history would lose forensic information about what actually happened.
+    """
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3), _img_row(4)],
+    )
+    r1 = await queue.claim_next_row()
+    r2 = await queue.claim_next_row()
+    assert r1 is not None and r2 is not None
+    await queue.record_result(
+        r1.id,
+        RowResult(
+            row_num=2, status=STATUS_SUCCESS,
+            video_urls=["https://example.com/v.mp4"], cost_usd=0.1,
+        ),
+    )
+    await queue.record_result(
+        r2.id,
+        RowResult(
+            row_num=3, status=STATUS_ARTICLE_FETCH_FAILED,
+            error="real failure", cost_usd=0.0,
+        ),
+    )
+
+    killed, rows_aborted = await queue.kill_job(job_id)
+    assert killed is True
+    # Only the one still-PENDING row (row 4) is aborted.
+    assert rows_aborted == 1
+
+    rows = {r["row_num"]: r for r in await queue.list_rows(job_id)}
+    assert rows[2]["status"] == "done"
+    assert rows[2]["error"] is None
+    assert rows[3]["status"] == "failed"
+    assert rows[3]["error"] == "real failure"         # NOT overwritten
+    assert rows[4]["status"] == "failed"
+    assert rows[4]["error"] == "killed by user"
+
+
+async def test_kill_all_jobs_aborts_rows_across_multiple_jobs(
+    queue: JobQueue,
+) -> None:
+    j1 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W1",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
+    )
+    j2 = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="S", worksheet="W2",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    # Claim one from j1 so it's PROCESSING; the rest stay PENDING.
+    await queue.claim_next_row()
+
+    killed, rows_aborted = await queue.kill_all_jobs(user_email="u@aporia.com")
+    assert killed == 2
+    assert rows_aborted == 3       # 2 from j1 + 1 from j2
+
+    # Each parent's failed_rows is bumped to match its share.
+    assert (await queue.get_job(j1)).failed_rows == 2
+    assert (await queue.get_job(j2)).failed_rows == 1
+
+
+async def test_record_result_does_not_overwrite_killed_row(
+    queue: JobQueue,
+) -> None:
+    """Race guard: kill landed between processor start and result
+    hand-back. The worker still calls ``record_result`` when its row
+    finally completes, but the row is already FAILED — we must not
+    overwrite it back to DONE and silently undo the operator's kill.
+    Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    queued = await queue.claim_next_row()
+    assert queued is not None
+    # Operator killed mid-flight — row is now FAILED with "killed by user".
+    killed, rows_aborted = await queue.kill_job(job_id)
+    assert killed is True and rows_aborted == 1
+    # Processor finished after the kill; result lands successfully.
+    await queue.record_result(
+        queued.id,
+        RowResult(
+            row_num=2, status=STATUS_SUCCESS,
+            video_urls=["https://example.com/v.mp4"], cost_usd=0.1,
+        ),
+    )
+    rows = {r["row_num"]: r for r in await queue.list_rows(job_id)}
+    assert rows[2]["status"] == "failed"
+    assert rows[2]["error"] == "killed by user"
+    job = await queue.get_job(job_id)
+    # Cost MUST NOT have been added to the job (we did not actually
+    # accept the SUCCESS) — the kill is the authoritative truth.
+    assert job.completed_rows == 0
+    assert job.cost_usd == 0.0
 
 
 # ── _tx() transaction boundaries ────────────────────────────────────────────

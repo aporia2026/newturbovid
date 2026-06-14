@@ -473,11 +473,26 @@ class JobQueue:
         )
         ok = result.status == "SUCCESS" or result.status == "ZAPCAP_FAILED_KEPT_NO_CAPTIONS"
         with self._tx():
+            # Read current status as part of the SELECT so we can skip
+            # the row entirely when it was killed mid-flight. Without
+            # this guard, a processor that succeeded just after the
+            # operator hit "Kill" would overwrite the killed row's
+            # FAILED state back to DONE — silently undoing the user's
+            # explicit action. Plan ``_plans/2026-06-14-stuck-processing-rows.md``
+            # §B last-paragraph race note.
             cur = self._conn.execute(
-                "SELECT job_id FROM row_queue WHERE id = ?", (queue_id,)
+                "SELECT job_id, status FROM row_queue WHERE id = ?",
+                (queue_id,),
             )
             row = cur.fetchone()
             if row is None:
+                return
+            current_status = row["status"]
+            if current_status in (ROW_DONE, ROW_FAILED):
+                # Already terminal — either a duplicate retry of
+                # record_result (Plan §A) or a kill landed between
+                # processor start and result hand-back. Either way the
+                # row is settled; do nothing.
                 return
             job_id = row["job_id"]
             self._conn.execute(
@@ -737,7 +752,22 @@ class JobQueue:
                 medians[tab] = (secs_sorted[mid - 1] + secs_sorted[mid]) / 2.0
         return medians
 
-    def _kill_job_sync(self, job_id: str) -> bool:
+    def _kill_job_sync(self, job_id: str) -> tuple[bool, int]:
+        """Kill a single job AND abort its PENDING/PROCESSING rows.
+
+        Returns ``(jobs_killed_bool, rows_aborted_int)`` so the route can
+        surface "Killed N rows" in the toast — before this fix, the kill
+        only touched ``jobs.status`` and any in-flight row that had lost
+        its ``record_result`` write (Turso flap) lingered in PROCESSING
+        forever, showing "Starting.." in the sidebar with a growing
+        elapsed timer. Plan ``_plans/2026-06-14-stuck-processing-rows.md``
+        §B.
+
+        Rows already DONE/FAILED are left alone — the kill only resolves
+        in-flight uncertainty, not historical state. Bumps the parent
+        job's ``failed_rows`` so the sidebar archive shows the right
+        total ("75/100 killed by user" not "0 failed").
+        """
         try:
             with self._tx():
                 cur = self._conn.execute(
@@ -745,14 +775,23 @@ class JobQueue:
                     "WHERE job_id = ? AND status IN (?, ?)",
                     (JOB_KILLED, _now_iso(), job_id, JOB_QUEUED, JOB_RUNNING),
                 )
-                return cur.rowcount > 0
+                jobs_killed = cur.rowcount > 0
+                if not jobs_killed:
+                    return False, 0
+                rows_aborted = self._abort_rows_for_kill_sync(
+                    job_id_filter=job_id, user_filter=None,
+                )
+                return True, rows_aborted
         except sqlite3.OperationalError as e:
             raise QueueBusy(str(e)) from e
 
-    def _kill_all_sync(self, user_email: str | None = None) -> int:
+    def _kill_all_sync(
+        self, user_email: str | None = None
+    ) -> tuple[int, int]:
         """Kill every active (queued/running) job — for one user, or all when
-        ``user_email`` is None (admin). In-flight rows finish; pending rows stop
-        being claimed (see ``_claim_next_row_sync``)."""
+        ``user_email`` is None (admin) — AND abort their PENDING/PROCESSING
+        rows. Returns ``(jobs_killed_count, rows_aborted_count)``. Plan
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
         try:
             with self._tx():
                 if user_email:
@@ -767,9 +806,111 @@ class JobQueue:
                         "WHERE status IN (?, ?)",
                         (JOB_KILLED, _now_iso(), JOB_QUEUED, JOB_RUNNING),
                     )
-                return cur.rowcount
+                jobs_killed = cur.rowcount
+                if jobs_killed == 0:
+                    return 0, 0
+                rows_aborted = self._abort_rows_for_kill_sync(
+                    job_id_filter=None, user_filter=user_email,
+                )
+                return jobs_killed, rows_aborted
         except sqlite3.OperationalError as e:
             raise QueueBusy(str(e)) from e
+
+    def _abort_rows_for_kill_sync(
+        self, *, job_id_filter: str | None, user_filter: str | None,
+    ) -> int:
+        """Mark every PENDING/PROCESSING row whose parent job is now KILLED
+        as FAILED with a ``killed by user`` result payload. Caller is
+        already inside ``_tx()``. Returns the count of rows touched.
+
+        Mirrors the result-JSON shape ``_record_result_sync`` writes so
+        ``_list_rows_sync`` and the sidebar's error renderer ("killed by
+        user") read it without a second code path. Bumps ``failed_rows``
+        on each parent job in the same UPDATE pass so the archive's
+        ``done/total`` count adds up.
+
+        The ``job_id_filter`` / ``user_filter`` mutually-exclusive pair
+        mirrors ``_kill_job_sync`` vs ``_kill_all_sync`` — passing the
+        same filter the parent UPDATE used means we only touch rows for
+        jobs that JUST moved to KILLED in this transaction.
+        """
+        # Fetch row ids + numbers first so the UPDATE can embed each row's
+        # ``row_num`` into the per-row result JSON. Cheap: indexed lookup
+        # on ``rq.status`` + the parent join.
+        now = _now_iso()
+        if job_id_filter is not None:
+            cur = self._conn.execute(
+                "SELECT rq.id, rq.row_num FROM row_queue rq "
+                "WHERE rq.job_id = ? AND rq.status IN (?, ?)",
+                (job_id_filter, ROW_PENDING, ROW_PROCESSING),
+            )
+        elif user_filter is not None:
+            cur = self._conn.execute(
+                "SELECT rq.id, rq.row_num, rq.job_id FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE j.user_email = ? AND j.status = ? "
+                "AND rq.status IN (?, ?)",
+                (user_filter, JOB_KILLED, ROW_PENDING, ROW_PROCESSING),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT rq.id, rq.row_num, rq.job_id FROM row_queue rq "
+                "JOIN jobs j ON j.job_id = rq.job_id "
+                "WHERE j.status = ? AND rq.status IN (?, ?)",
+                (JOB_KILLED, ROW_PENDING, ROW_PROCESSING),
+            )
+        affected_ids: list[tuple[int, int, str]] = []
+        for r in cur.fetchall():
+            try:
+                row_id = int(r["id"])
+                row_num = int(r["row_num"])
+            except (TypeError, ValueError, IndexError):
+                continue
+            # ``job_id_filter`` path didn't select rq.job_id (we already
+            # have it as the filter). Fall back to it explicitly.
+            if job_id_filter is not None:
+                jid = job_id_filter
+            else:
+                try:
+                    jid = str(r["job_id"])
+                except (TypeError, ValueError, IndexError):
+                    continue
+            affected_ids.append((row_id, row_num, jid))
+        if not affected_ids:
+            return 0
+        # Per-row UPDATE with the row's own row_num baked into the result
+        # JSON. executemany would be cleaner but the result string varies
+        # per row — and the typical kill touches O(10–100) rows, well
+        # inside one libsql roundtrip's budget.
+        per_job_failed_increment: dict[str, int] = {}
+        for row_id, row_num, jid in affected_ids:
+            result_json = json.dumps(
+                {
+                    "row_num": row_num,
+                    "status": "KILLED_BY_USER",
+                    "video_urls": [],
+                    "cost_usd": 0.0,
+                    "elapsed_seconds": 0.0,
+                    "error": "killed by user",
+                    "metadata": {},
+                },
+                ensure_ascii=False,
+            )
+            self._conn.execute(
+                "UPDATE row_queue SET status = ?, finished_at = ?, "
+                "result = ? WHERE id = ?",
+                (ROW_FAILED, now, result_json, row_id),
+            )
+            per_job_failed_increment[jid] = (
+                per_job_failed_increment.get(jid, 0) + 1
+            )
+        for jid, n in per_job_failed_increment.items():
+            self._conn.execute(
+                "UPDATE jobs SET failed_rows = failed_rows + ? "
+                "WHERE job_id = ?",
+                (n, jid),
+            )
+        return len(affected_ids)
 
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
@@ -880,17 +1021,36 @@ class JobQueue:
             user_email=user_email,
         )
 
-    async def kill_job(self, job_id: str) -> bool:
+    async def kill_job(self, job_id: str) -> tuple[bool, int]:
+        """Kill ``job_id`` AND abort its pending/processing rows.
+
+        Returns ``(jobs_killed_bool, rows_aborted_int)``. Plan
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        """
         async with self._lock:
             return await asyncio.to_thread(self._kill_job_sync, job_id)
 
-    async def kill_all_jobs(self, *, user_email: str | None = None) -> int:
-        """Kill all active jobs (one user, or everyone for admins). Returns the
-        number of jobs killed. Backs the sidebar's "Stop all / Clear queue"."""
+    async def kill_all_jobs(
+        self, *, user_email: str | None = None
+    ) -> tuple[int, int]:
+        """Kill all active jobs (one user, or everyone for admins) AND abort
+        their pending/processing rows. Returns
+        ``(jobs_killed_count, rows_aborted_count)``. Backs the sidebar's
+        "Stop all / Clear queue".
+
+        Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        """
         async with self._lock:
-            n = await asyncio.to_thread(self._kill_all_sync, user_email=user_email)
-        _log.info("kill_all_jobs", user_email=user_email or "ALL", killed=n)
-        return n
+            n_jobs, n_rows = await asyncio.to_thread(
+                self._kill_all_sync, user_email=user_email,
+            )
+        _log.info(
+            "kill_all_jobs",
+            user_email=user_email or "ALL",
+            killed=n_jobs,
+            rows_aborted=n_rows,
+        )
+        return n_jobs, n_rows
 
     async def recover_orphaned_rows(self) -> int:
         """Call on worker startup: rows stuck in PROCESSING are released."""
