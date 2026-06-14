@@ -142,9 +142,17 @@ VALID_RATIO_STRINGS: frozenset[str] = frozenset(
 def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
     """Map a sheet-entered size to a valid model ``aspect_ratio`` string.
 
-    Handles ``09:16`` (Sheets time-cast), ``9:16``, and ``WxH`` pixel inputs
-    (reduced via GCD). Falls back to ``default`` for anything unrecognised, so
-    the image model never receives a value it would reject or treat as ``auto``.
+    Handles ``09:16`` (Sheets time-cast), ``9:16``, and ``WxH`` pixel inputs.
+
+    When the input names an EXACT ratio outside ``VALID_RATIO_STRINGS`` (e.g.
+    ``"7:3"``), or a ``WxH`` whose GCD-reduced ratio isn't in the valid set
+    (e.g. ``"1234x567"``), the function SNAPS to the closest valid ratio by
+    smallest ``|w/h - candidate_w/h|``. The previous behaviour — falling
+    back to ``default`` — silently dropped the operator's "blank = use my
+    image" intent on the new native-size path
+    (``_plans/2026-06-14-blank-size-uses-native-image.md`` §D.6).
+
+    Blank or ``auto`` still returns ``default`` (no signal to snap from).
     """
     s = (aspect_ratio or "").strip().lower()
     if not s or s == "auto":
@@ -154,7 +162,12 @@ def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
         parts = s.split(":")
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
             norm = f"{int(parts[0])}:{int(parts[1])}"
-            return norm if norm in VALID_RATIO_STRINGS else default
+            if norm in VALID_RATIO_STRINGS:
+                return norm
+            num, den = int(parts[0]), int(parts[1])
+            if num > 0 and den > 0:
+                return _snap_to_closest_valid_ratio(num, den, default=default)
+            return default
 
     if "x" in s:
         parts = s.split("x")
@@ -163,9 +176,35 @@ def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
             if w > 0 and h > 0:
                 g = math.gcd(w, h)
                 norm = f"{w // g}:{h // g}"
-                return norm if norm in VALID_RATIO_STRINGS else default
+                if norm in VALID_RATIO_STRINGS:
+                    return norm
+                return _snap_to_closest_valid_ratio(w, h, default=default)
 
     return default
+
+
+def _snap_to_closest_valid_ratio(w: int, h: int, *, default: str) -> str:
+    """Pick the ``VALID_RATIO_STRINGS`` entry with the smallest aspect-ratio
+    delta from ``w / h``. Used when the operator's pick (or a probed image)
+    sits between two known ratios — e.g. a 1234×567 image has aspect 2.18,
+    which sits between ``"21:9"`` (2.33) and ``"16:9"`` (1.78); we pick the
+    closer one rather than silently defaulting to ``"9:16"``.
+
+    ``default`` is returned only on the impossible-input branch (h == 0).
+    """
+    if h <= 0:
+        return default
+    target = w / h
+    best = default
+    best_delta = float("inf")
+    for candidate in VALID_RATIO_STRINGS:
+        cw, ch = candidate.split(":")
+        c = int(cw) / int(ch)
+        delta = abs(target - c)
+        if delta < best_delta:
+            best_delta = delta
+            best = candidate
+    return best
 
 
 # ── FFmpeg command templates ─────────────────────────────────────────────────

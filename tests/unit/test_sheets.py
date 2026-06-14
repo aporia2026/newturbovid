@@ -4,7 +4,10 @@ The gspread client is replaced with a MagicMock fake — no real network.
 
 Covers:
   - read_image_vo_rows: row_num assignment (sheet is 1-indexed; header is row 1)
-  - read_image_vo_rows: defaults applied (voice_over=True, zapcap=False, aspect_ratio=9:16)
+  - read_image_vo_rows: defaults applied (voice_over=True, zapcap=False);
+    aspect_ratio passes through blank ("") so the row processor's
+    ``resolve_aspect_ratio`` can probe the manual image's native dimensions
+    (plan _plans/2026-06-14-blank-size-uses-native-image.md)
   - read_image_vo_rows: blank rows skipped
   - read_image_vo_rows: partial rows (article without seed image) skipped
   - read_four_images_rows: how_many drives image URL selection
@@ -199,7 +202,7 @@ async def test_read_image_vo_parses_row_with_defaults() -> None:
             # Data row 1 (sheet row 2).
             ["US", "tech",
              "https://example.com/a", "https://example.com/seed.png",
-             "", "", "",        # defaults: VO=Yes, ZapCap=No, ratio=9:16
+             "", "", "",        # defaults: VO=Yes, ZapCap=No, ratio="" (probed at row time)
              "How To", "urgent",
              "", "", "", ""],
         ]
@@ -218,7 +221,11 @@ async def test_read_image_vo_parses_row_with_defaults() -> None:
     assert r.manual_image_url == "https://example.com/seed.png"
     assert r.voice_over is True            # default
     assert r.zapcap is False               # default
-    assert r.aspect_ratio == "9:16"        # default
+    # Blank "Change Size" flows through verbatim — the row processor's
+    # ``resolve_aspect_ratio`` translates it into the manual image's
+    # native pixel dimensions ("WxH") at processor entry. Plan
+    # ``_plans/2026-06-14-blank-size-uses-native-image.md``.
+    assert r.aspect_ratio == ""
     assert r.script_pattern == "How To"
     assert r.open_comments == "urgent"
 

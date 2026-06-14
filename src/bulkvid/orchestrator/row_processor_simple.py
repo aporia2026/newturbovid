@@ -41,6 +41,7 @@ from bulkvid.models.row import (
     RowResult,
     SimpleRow,
 )
+from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
 from bulkvid.pipeline.language import detect_language
@@ -92,6 +93,13 @@ async def process_simple_row(
     t0 = time.monotonic()
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
+    # Blank Change Size → use the manual image's native pixel dimensions.
+    # Resolves BEFORE metadata + row_start so logs reflect the actual size.
+    row.aspect_ratio = await resolve_aspect_ratio(
+        row.aspect_ratio,
+        manual_image_url=row.manual_image_url,
+        row_num=row.row_num,
+    )
     metadata: dict[str, Any] = {
         "row_num": row.row_num,
         "country": row.country,

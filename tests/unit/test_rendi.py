@@ -544,12 +544,18 @@ async def test_mix_music_returns_url_and_cost() -> None:
         ("16:9", "16:9"),
         ("1:1", "1:1"),
         ("4:5", "4:5"),
-        ("1080x1920", "9:16"),      # WxH reduced via GCD
+        ("1080x1920", "9:16"),      # WxH whose GCD lands on a valid ratio
         ("1080x1080", "1:1"),
-        ("", "9:16"),               # empty -> default
+        ("", "9:16"),               # empty -> default (no signal to snap)
         ("auto", "9:16"),
-        ("garbage", "9:16"),
-        ("7:13", "9:16"),           # valid format but not an allowed ratio -> default
+        ("garbage", "9:16"),        # unparseable -> default
+        # Off-set ratios + off-set WxH inputs SNAP to the closest valid ratio
+        # instead of silently dropping back to 9:16 (the previous bug). Plan
+        # _plans/2026-06-14-blank-size-uses-native-image.md §D.6.
+        ("7:13", "9:16"),           # 0.538 ≈ 9:16 (0.5625) — snap, not default
+        ("5:7", "3:4"),              # 0.714 closer to 3:4 (0.75) than 2:3 (0.667)
+        ("1234x567", "21:9"),       # 2.18 closer to 21:9 (2.33) than 16:9 (1.78)
+        ("1080x1620", "2:3"),        # GCD-reduces straight to 2:3 (in valid set)
     ],
 )
 def test_normalize_aspect_ratio(raw: str, expected: str) -> None:
@@ -557,6 +563,9 @@ def test_normalize_aspect_ratio(raw: str, expected: str) -> None:
 
 
 def test_normalize_aspect_ratio_custom_default() -> None:
+    # ``default`` only applies when the input carries no usable signal (blank,
+    # ``auto``, or unparseable garbage). A valid-format input still snaps to
+    # the closest model ratio.
     assert normalize_aspect_ratio("nonsense", default="1:1") == "1:1"
 
 

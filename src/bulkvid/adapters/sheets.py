@@ -515,7 +515,11 @@ class SheetsClient:
                     manual_image_url=seed,
                     voice_over=_yes(_cell(raw, cols.voice_over), default=True),
                     zapcap=_yes(_cell(raw, cols.zapcap), default=False),
-                    aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
+                    # Blank "Change Size" flows through as "" so the row
+                    # processor's ``resolve_aspect_ratio`` can probe the
+                    # manual image's native pixel dimensions (plan
+                    # ``_plans/2026-06-14-blank-size-uses-native-image.md``).
+                    aspect_ratio=_cell(raw, cols.aspect_ratio),
                     script_pattern=_cell(raw, cols.script_pattern),
                     open_comments=_cell(raw, cols.open_comments),
                 )
@@ -582,7 +586,10 @@ class SheetsClient:
                     voice_over=_yes(_cell(raw, cols.voice_over), default=True),
                     image_urls=chosen,
                     zapcap=_yes(_cell(raw, cols.zapcap), default=False),
-                    aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
+                    # Blank flows through as "" → row processor probes
+                    # ``image_urls[0]`` for native dimensions (plan
+                    # ``_plans/2026-06-14-blank-size-uses-native-image.md``).
+                    aspect_ratio=_cell(raw, cols.aspect_ratio),
                     script_pattern=_cell(raw, cols.script_pattern),
                     open_comments=_cell(raw, cols.open_comments),
                 )
@@ -665,7 +672,10 @@ class SheetsClient:
                     manual_image_url=seed,
                     voice_over=_yes(_cell(raw, cols.voice_over), default=True),
                     zapcap=_yes(_cell(raw, cols.zapcap), default=False),
-                    aspect_ratio=_cell(raw, cols.aspect_ratio, default="9:16"),
+                    # Blank flows through as "" → row processor probes the
+                    # manual image for native dimensions (plan
+                    # ``_plans/2026-06-14-blank-size-uses-native-image.md``).
+                    aspect_ratio=_cell(raw, cols.aspect_ratio),
                     script_pattern=_cell(raw, cols.script_pattern),
                     cards=cards,
                     open_comments=_cell(raw, cols.open_comments),

@@ -45,6 +45,7 @@ from bulkvid.models.row import (
     RowResult,
     TextOnImgRow,
 )
+from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
 
@@ -126,6 +127,14 @@ async def process_text_on_img_row(
     set_context(batch_id=job_id, row_num=row.row_num)
     t0 = time.monotonic()
     costs = _Costs()
+    # Blank Change Size → use the manual image's native pixel dimensions.
+    # Resolves BEFORE ``_image_object_key`` (which slugifies the size into
+    # the storage path) and BEFORE the metadata + row_start log fire.
+    row.aspect_ratio = await resolve_aspect_ratio(
+        row.aspect_ratio,
+        manual_image_url=row.manual_image_url,
+        row_num=row.row_num,
+    )
     object_key = _image_object_key(row)
     metadata: dict[str, Any] = {
         "row_num": row.row_num,

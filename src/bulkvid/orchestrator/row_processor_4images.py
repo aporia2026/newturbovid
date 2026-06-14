@@ -38,6 +38,7 @@ from bulkvid.models.row import (
     FourImagesVO2Row,
     RowResult,
 )
+from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
 from bulkvid.pipeline.language import detect_language
@@ -103,6 +104,16 @@ async def process_4images_vo2_row(
     t0 = time.monotonic()
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
+    # Blank Change Size → probe the FIRST image's native pixel dimensions.
+    # The first manual image carries the canonical size — they're all
+    # rendered at the same aspect anyway, and "use the user's images as-is"
+    # only has one obvious anchor. ``manual_image_url=None`` when the URL
+    # list is empty so the resolver falls back to 9:16 without probing.
+    row.aspect_ratio = await resolve_aspect_ratio(
+        row.aspect_ratio,
+        manual_image_url=row.image_urls[0] if row.image_urls else None,
+        row_num=row.row_num,
+    )
     metadata: dict = {
         "row_num": row.row_num,
         "country": row.country,

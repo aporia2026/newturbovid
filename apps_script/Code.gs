@@ -330,7 +330,11 @@ function _readImageVORow(sheet, rowNum) {
     manual_image_url: _cell(values, cols.manualImage),
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    // Blank "Change Size" flows through as "" so the backend probes the
+    // manual image's native pixel dimensions instead of silently
+    // defaulting to 9:16. Plan
+    // _plans/2026-06-14-blank-size-uses-native-image.md.
+    aspect_ratio: _cell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -357,7 +361,8 @@ function _readFourImagesRow(sheet, rowNum) {
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     image_urls: imageUrls,
     zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    // Blank → backend probes image_urls[0] for native dims. See _readImageVORow.
+    aspect_ratio: _cell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -435,7 +440,9 @@ function _readAvatarRow(sheet, rowNum) {
     avatar_id: _cell(values, cAvatarId).slice(0, 64),
     voice_over: _yes(_cell(values, cVoiceOver), true),
     zapcap: _yes(_cell(values, cZapcap), false),
-    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    // Blank → backend probes manual_image_url (or kie text-to-image fallback
+    // → 9:16). See _readImageVORow.
+    aspect_ratio: _cell(values, cAspectRatio),
     script_pattern: _cell(values, cScriptPat),
     cta_enabled: _yes(_cell(values, cCtaEnabled), false),
     cta_text: _cell(values, cCtaText).slice(0, 80),
@@ -461,7 +468,8 @@ function _readTextOnImgRow(sheet, rowNum) {
     text: _cell(values, cols.text).slice(0, 240),
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    // Blank → backend probes manual_image_url for native dims. See _readImageVORow.
+    aspect_ratio: _cell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -492,7 +500,8 @@ function _readSimpleX4Row(sheet, rowNum) {
     manual_image_url: _cell(values, cols.manualImage),
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    // Blank → backend probes manual_image_url for native dims. See _readImageVORow.
+    aspect_ratio: _cell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     cards: cards,
     open_comments: _cell(values, cols.openComments),

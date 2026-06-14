@@ -59,6 +59,7 @@ from bulkvid.models.row import (
     RowResult,
     SimpleX4Row,
 )
+from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_CARD_TEMPLATE_1_DEFAULT_CTA,
@@ -253,6 +254,13 @@ async def process_simple_x4_row(
     t0 = time.monotonic()
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
+    # Blank Change Size → use the manual image's native pixel dimensions.
+    # Resolves BEFORE metadata + row_start so logs reflect the actual size.
+    row.aspect_ratio = await resolve_aspect_ratio(
+        row.aspect_ratio,
+        manual_image_url=row.manual_image_url,
+        row_num=row.row_num,
+    )
     metadata: dict = {
         "row_num": row.row_num,
         "country": row.country,

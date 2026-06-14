@@ -73,6 +73,7 @@ from bulkvid.models.row import (
     AvatarRow,
     RowResult,
 )
+from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
 from bulkvid.pipeline.cartoon_cta import (
@@ -255,6 +256,16 @@ async def process_avatar_row(
     t0 = time.monotonic()
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
+    # Blank Change Size → use the manual image's native pixel dimensions
+    # (avatar tab allows manual_image_url to be blank; in that case the
+    # resolver falls back to 9:16 since there's nothing to probe). Must
+    # run BEFORE ``normalize_aspect_ratio`` so the kie scene generation
+    # below sees the snapped ratio derived from the probed pixels.
+    row.aspect_ratio = await resolve_aspect_ratio(
+        row.aspect_ratio,
+        manual_image_url=row.manual_image_url or None,
+        row_num=row.row_num,
+    )
     aspect = normalize_aspect_ratio(row.aspect_ratio)
     # Resolve operator-facing overlay knobs up front so the row_start log
     # records what we'll ACTUALLY render (not what was raw in the cell).
