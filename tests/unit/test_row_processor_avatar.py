@@ -546,9 +546,10 @@ def test_avatar_margin_y_respects_pill_height_floor() -> None:
     that floor so they don't desync."""
     # Canvas where canvas_h × 0.08 rounds to <40. Eg. 400 × 0.08 = 32.
     margin = _avatar_margin_y_for_canvas(400, cta_enabled=True)
-    # pill_h clamped to 40, plus bottom_margin = round(400 × 0.03) = 12,
-    # plus the 16 px gap.
-    assert margin == 12 + 40 + AVATAR_OVER_CTA_GAP_PX
+    # pill_h clamped to 40 (the point of this test); bottom_margin tracks
+    # the shared PILL_BOTTOM_MARGIN_FRAC constant; plus the 16 px gap.
+    expected_bottom_margin = int(round(400 * PILL_BOTTOM_MARGIN_FRAC))
+    assert margin == expected_bottom_margin + 40 + AVATAR_OVER_CTA_GAP_PX
 
 
 @respx.mock
