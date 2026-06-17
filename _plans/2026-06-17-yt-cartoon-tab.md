@@ -168,6 +168,20 @@ Tests: golden test on cartoon path (regression firewall) +
   No new paid service. Per-shot graceful degradation kept so a single failed
   shot doesn't kill a 15/20s single-video row.
 
+## Post-launch fixes (2026-06-17, first live run job-316c46f420f2371b)
+
+1. **Ready Video write-back skipped.** ``batch_write_video_urls`` had no
+   ``yt_cartoon`` branch in its positional_fallback chain → ``else None`` →
+   ``skip_unknown_tab_type`` → videos never written to P/Q. Added
+   ``_YtCartoonCols`` (ready_video_start = P / col 15) + wired the write,
+   read-processed, and header-rows maps in ``adapters/sheets.py``.
+2. **Dead air on long videos.** Video was forced to the full bucket length
+   while the VO was sized at the cartoon's slow 1.5 wps, so a fast engaging
+   delivery left ~10s of silence on a 20s clip. Fix: video length now tracks
+   the measured VO (``fit_video_to_vo``, capped at bucket, floored 6s) and the
+   word budget rose to 2.3 wps (~45 words on 20s vs 29). Engaging prompt
+   reworded to a 1-3 sentence script that fills the window.
+
 ## Open questions for Yoav
 
 1. Blank-Tone default = engaging (this tab's purpose)? Or calm?

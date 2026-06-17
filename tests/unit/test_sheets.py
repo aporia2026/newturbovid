@@ -28,7 +28,12 @@ import pytest
 
 from bulkvid.adapters.sheets import FOUR_IMAGES_COLS, IMAGE_VO_COLS, SheetsClient
 from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
-from bulkvid.orchestrator.queue import TAB_AVATAR, TAB_FOUR_IMAGES, TAB_IMAGE_VO
+from bulkvid.orchestrator.queue import (
+    TAB_AVATAR,
+    TAB_FOUR_IMAGES,
+    TAB_IMAGE_VO,
+    TAB_YT_CARTOON,
+)
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -438,6 +443,36 @@ async def test_four_images_writes_to_columns_N_through_Q() -> None:
     cells = {u["range"]: u["values"][0][0] for u in updates}
     # 4Images: ready videos start at col N (1-indexed col 14), 0-indexed col 13.
     assert cells == {"N3": "u1", "O3": "u2"}
+
+
+async def test_yt_cartoon_writes_to_columns_P_and_Q() -> None:
+    """Regression for the dead-write bug (Yoav 2026-06-17): the yt-cartoon
+    tab had no branch in ``batch_write_video_urls``'s positional_fallback
+    chain, so it hit ``else None`` and the write was SKIPPED entirely — the
+    finished videos never landed in P/Q. With no header row in the fake
+    client, the write MUST fall back to the positional column (P = 0-indexed
+    15) and write BOTH ready videos."""
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+
+    n = await sc.batch_write_video_urls(
+        [
+            _write(
+                sheet_id="sheet-Y",
+                worksheet="yt-cartoon",
+                tab_type=TAB_YT_CARTOON,
+                row_num=2,
+                video_urls=["u1", "u2"],   # 10s bucket → 2 videos
+            )
+        ]
+    )
+    assert n == 2
+
+    ws = worksheets[("sheet-Y", "yt-cartoon")]
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # yt-cartoon: ready videos start at col P (1-indexed col 16), 0-indexed 15.
+    assert cells == {"P2": "u1", "Q2": "u2"}
 
 
 async def test_groups_by_sheet_and_worksheet_one_batch_each() -> None:

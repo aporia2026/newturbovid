@@ -37,16 +37,25 @@ from dataclasses import dataclass
 VID_LENGTH_DEFAULT = 10
 VID_LENGTH_BUCKETS: tuple[int, ...] = (10, 15, 20)
 
-# Spoken words per second at the SLOW end of Gemini TTS after the row
-# processor's atempo speed-up — the same ~1.5 wps the cartoon tab sizes its
-# ~10-word / 7.5s line against. Used to size the per-bucket word budget so the
-# voiceover fills the window without overrunning it (the processor's
-# shorten-and-retry path is the backstop if a line still comes out long).
-WORDS_PER_SECOND = 1.5
+# Spoken words per second used to size the per-bucket word budget. The cartoon
+# tab uses ~1.5 wps (its SLOW-end estimate) because an 8s clip can absorb a
+# little trailing silence. yt-cartoon's longer buckets cannot: at 1.5 wps a
+# fast/engaging delivery finishes the line in ~8s and leaves ~10s of dead air on
+# a 20s video (the bug Yoav hit on job-316c46f420f2371b). 2.3 wps roughly
+# doubles the narration (≈45 words on the 20s bucket vs 29) so the line actually
+# fills the window; the processor's atempo + shorten-and-retry path is the
+# backstop when a slow delivery overruns, and ``fit_video_to_vo`` trims any
+# residual gap so there is never significant dead air.
+WORDS_PER_SECOND = 2.3
 
 # Trailing silence dwell after the voiceover, mirrors the cartoon constant
 # (``VO_TAIL_SECONDS``). The effective VO window is ``target - tail``.
 VO_TAIL_SECONDS = 0.5
+
+# Floor on the rendered video length once it is shrunk to the narration (see
+# ``fit_video_to_vo``). Stops a pathologically short VO from producing a
+# blink-length clip whose shots can't breathe.
+MIN_VIDEO_SECONDS = 6.0
 
 # Seedance only generates these clip lengths (seconds). We always generate the
 # SMALLEST legal tier that still covers a shot's trimmed length, so a 3.3s or
@@ -166,6 +175,35 @@ def plan_shots_for_length(raw: object) -> ShotPlan:
         max_words=max_words,
         max_effective_vo=max_effective_vo,
     )
+
+
+def fit_video_to_vo(
+    effective_vo: float, plan: ShotPlan, *, has_vo: bool
+) -> tuple[float, list[float]]:
+    """Shrink the rendered video to the actual narration length.
+
+    Returns ``(total_video_seconds, per_clip_seconds)``. The cartoon tab forces
+    a flat length and tolerates trailing silence; yt-cartoon's longer buckets
+    must NOT, so we set the video length to the measured voiceover plus the
+    dwell tail, capped at the bucket target and floored at ``MIN_VIDEO_SECONDS``.
+    The per-clip trims are redistributed evenly across the (fixed) shot count so
+    they sum to the new length and every shot still appears (the Seedance clips
+    were generated at the 4s tier, which always covers a per-clip <= 4s).
+
+    ``has_vo=False`` (no voiceover) keeps the full bucket — a silent video has
+    no narration to track, so it stays at its planned length.
+    """
+    if not has_vo:
+        return plan.target_seconds, list(plan.per_clip_seconds)
+    total = min(
+        plan.target_seconds,
+        max(MIN_VIDEO_SECONDS, round(effective_vo + VO_TAIL_SECONDS, 3)),
+    )
+    per = round(total / plan.num_shots, 3)
+    per_clip = [per] * plan.num_shots
+    drift = round(total - sum(per_clip), 3)
+    per_clip[-1] = round(per_clip[-1] + drift, 3)
+    return total, per_clip
 
 
 # ── Tone ─────────────────────────────────────────────────────────────────────

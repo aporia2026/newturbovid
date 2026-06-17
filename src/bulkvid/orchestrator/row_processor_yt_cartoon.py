@@ -89,6 +89,7 @@ from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.yt_cartoon import (
     TONE_CALM,
     ShotPlan,
+    fit_video_to_vo,
     normalize_tone,
     plan_shots_for_length,
     resolve_cap_top,
@@ -394,6 +395,14 @@ async def process_yt_cartoon_row(
                     costs.storage += vo_up.cost_usd
                     vo_url = vo_up.url
 
+                    # Shrink the video to the narration so a fast/short VO
+                    # doesn't leave dead air (Yoav 2026-06-17). Capped at the
+                    # bucket, floored so shots can breathe; per-clip trims
+                    # redistributed so every shot still appears.
+                    target_video_seconds, per_clip_seconds = fit_video_to_vo(
+                        effective, shot_plan, has_vo=True
+                    )
+
                     _log.info(
                         "yt_cartoon_vo_sized",
                         idea=idx + 1,
@@ -401,7 +410,9 @@ async def process_yt_cartoon_row(
                         vo_raw_seconds=round(tts.duration_seconds, 3),
                         vo_effective_seconds=round(effective, 3),
                         vo_atempo=round(vo_atempo, 3),
-                        target_video_seconds=target_video_seconds,
+                        target_video_seconds=round(target_video_seconds, 3),
+                        vo_dwell_seconds=round(target_video_seconds - effective, 3),
+                        bucket_seconds=shot_plan.target_seconds,
                         max_effective=max_effective,
                         per_clip_seconds=[round(p, 3) for p in per_clip_seconds],
                         seedance_durations=list(seedance_durations),

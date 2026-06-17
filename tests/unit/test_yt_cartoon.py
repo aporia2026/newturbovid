@@ -90,11 +90,19 @@ def test_plan_word_budget_scales_with_length() -> None:
     w15 = yc.plan_shots_for_length("15").target_words
     w20 = yc.plan_shots_for_length("20").target_words
     assert w10 < w15 < w20
-    # Sized at ~1.5 words/sec of effective window, min<=target<=max.
+    # min<=target<=max, and never below the floor.
     for raw in ("10", "15", "20"):
         p = yc.plan_shots_for_length(raw)
         assert p.min_words <= p.target_words <= p.max_words
         assert p.min_words >= yc._MIN_WORDS_FLOOR
+
+
+def test_plan_word_budget_fills_longer_buckets() -> None:
+    # Regression guard for the dead-air bug (job-316c46f420f2371b): the 20s
+    # bucket must ask for a substantial narration (~45 words), not the old
+    # ~29 that finished early and left silence.
+    assert yc.plan_shots_for_length("20").target_words >= 40
+    assert yc.plan_shots_for_length("15").target_words >= 30
 
 
 def test_plan_seedance_durations_are_always_legal() -> None:
@@ -111,6 +119,39 @@ def test_smallest_legal_duration_packs_correctly() -> None:
     assert yc._smallest_legal_duration(8.0) == 8
     assert yc._smallest_legal_duration(10.0) == 12
     assert yc._smallest_legal_duration(99.0) == 12   # clamps to max tier
+
+
+# ── fit_video_to_vo (dead-air fix) ───────────────────────────────────────────
+
+
+def test_fit_video_to_vo_short_vo_trims_dead_air() -> None:
+    # A 11s narration on a 20s bucket must yield an ~11.5s video, NOT a 20s
+    # video with 8.5s of silence (the bug Yoav hit).
+    plan = yc.plan_shots_for_length("20")
+    total, per_clip = yc.fit_video_to_vo(11.0, plan, has_vo=True)
+    assert total == 11.5
+    assert len(per_clip) == plan.num_shots
+    assert round(sum(per_clip), 3) == 11.5
+
+
+def test_fit_video_to_vo_caps_at_bucket() -> None:
+    plan = yc.plan_shots_for_length("20")
+    total, per_clip = yc.fit_video_to_vo(19.5, plan, has_vo=True)
+    assert total == 20.0   # 19.5 + 0.5 dwell, capped at the 20s bucket
+    assert round(sum(per_clip), 3) == 20.0
+
+
+def test_fit_video_to_vo_floors_tiny_vo() -> None:
+    plan = yc.plan_shots_for_length("20")
+    total, _ = yc.fit_video_to_vo(2.0, plan, has_vo=True)
+    assert total == yc.MIN_VIDEO_SECONDS   # 2.5 floored so shots can breathe
+
+
+def test_fit_video_to_vo_no_vo_keeps_full_bucket() -> None:
+    plan = yc.plan_shots_for_length("15")
+    total, per_clip = yc.fit_video_to_vo(0.0, plan, has_vo=False)
+    assert total == plan.target_seconds == 15.0
+    assert per_clip == plan.per_clip_seconds
 
 
 # ── Tone registry ────────────────────────────────────────────────────────────
