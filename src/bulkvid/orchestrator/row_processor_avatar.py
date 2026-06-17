@@ -82,7 +82,7 @@ from bulkvid.pipeline.cartoon_cta import (
     render_cartoon_cta_overlay_bytes,
 )
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
-from bulkvid.pipeline.language import detect_language
+from bulkvid.pipeline.language import detect_language, reconcile_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
@@ -329,6 +329,12 @@ async def process_avatar_row(
         try:
             lang = await detect_language(clients.openai, article_body)
             costs.language += lang.cost_usd
+            # Safety net: a wrong/transient scrape can return wrong-language
+            # content; prefer the operator's explicit market (Country / URL
+            # locale) when it conflicts with detection (chat 2026-06-17).
+            lang = reconcile_language(
+                lang, article_url=row.article_url, country=row.country
+            )
 
             analysis = await classify_open_comments(clients.openai, row.open_comments)
             costs.classify += analysis.cost_usd

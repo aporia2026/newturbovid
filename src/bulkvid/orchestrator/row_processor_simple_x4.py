@@ -79,7 +79,7 @@ from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.headline_gen import generate_card_headline
 from bulkvid.pipeline.image_gen import edit_with_fallback
 from bulkvid.pipeline.image_prompt import build_collage_prompt, describe_source_image
-from bulkvid.pipeline.language import detect_language
+from bulkvid.pipeline.language import detect_language, reconcile_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
@@ -355,6 +355,11 @@ async def process_simple_x4_row(
         try:
             lang_result = await detect_language(clients.openai, article_body)
             costs.language += lang_result.cost_usd
+            # Safety net: prefer the operator's explicit market (Country / URL
+            # locale) if detection conflicts (a bad scrape can mislead it).
+            lang_result = reconcile_language(
+                lang_result, article_url=row.article_url, country=row.country
+            )
             language: str = lang_result.language
             metadata["language"] = language
         except Exception as e:

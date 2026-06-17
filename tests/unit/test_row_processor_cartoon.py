@@ -43,6 +43,7 @@ from bulkvid.orchestrator.row_processor_cartoon import (
     process_cartoon_row,
 )
 from bulkvid.pipeline.cartoon_prompt import CartoonIdea, CartoonPlan, CartoonShot
+from bulkvid.pipeline.language import LanguageResult
 
 # ── Fakes ─────────────────────────────────────────────────────────────────────
 
@@ -183,7 +184,11 @@ def _plan(num_ideas: int = 2, num_shots: int = 2) -> CartoonPlan:
 @pytest.fixture(autouse=True)
 def _stub_pipeline(monkeypatch):
     async def _detect(_client, _body):
-        return SimpleNamespace(language="en", cost_usd=0.0)
+        # Real LanguageResult (not SimpleNamespace) so reconcile_language can
+        # read .confidence / replace(); "es" matches the MX test row so the
+        # safety net passes it through unchanged (reconcile has its own cover
+        # in test_language_reconcile.py).
+        return LanguageResult(language="es", confidence=0.99, cost_usd=0.0, cached=False)
 
     async def _classify(_client, _text):
         return SimpleNamespace(mode=SimpleNamespace(value="none"), cost_usd=0.0)

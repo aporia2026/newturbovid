@@ -44,7 +44,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_SCRIPT_PROMPT
-from bulkvid.pipeline.language import detect_language
+from bulkvid.pipeline.language import detect_language, reconcile_language
 from bulkvid.pipeline.open_comments import classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
 from bulkvid.pipeline.script_gen import generate_script
@@ -145,6 +145,12 @@ async def process_simple_row(
         try:
             lang = await detect_language(clients.openai, article_body)
             costs.language += lang.cost_usd
+            # Safety net: a wrong/transient scrape can return wrong-language
+            # content; prefer the operator's explicit market (Country / URL
+            # locale) when it conflicts with detection (chat 2026-06-17).
+            lang = reconcile_language(
+                lang, article_url=row.article_url, country=row.country
+            )
 
             analysis = await classify_open_comments(clients.openai, row.open_comments)
             costs.classify += analysis.cost_usd
