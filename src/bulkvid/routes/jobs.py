@@ -49,6 +49,7 @@ from bulkvid.orchestrator.queue import (
     Job,
     JobQueue,
     QueueBusy,
+    QueueUnavailable,
 )
 from bulkvid.step_extractor import extract_current_step
 
@@ -665,6 +666,24 @@ async def submit_job(
             rows=rows,
             idempotency_key=idem_key,
         )
+    except QueueUnavailable as e:
+        # Turso was unreachable through the full timeout + reconnect + retry
+        # cycle in JobQueue._run_db. This is what used to surface as a bare
+        # HTTP 500; now it's a 503 the Apps Script retries safely (the submit
+        # is idempotent via the key + deterministic job_id). Plan
+        # ``_plans/2026-06-17-submit-500s-turso-resilience.md``. MUST precede
+        # the QueueBusy handler — QueueUnavailable subclasses it.
+        _log.warning(
+            "queue_unavailable_503",
+            endpoint="submit_job",
+            user_email=identity.email,
+            original_error=str(e),
+        )
+        raise HTTPException(
+            503,
+            "queue temporarily unavailable, please retry",
+            headers={"Retry-After": "5"},
+        ) from e
     except QueueBusy as e:
         _log.warning(
             "queue_busy_503",

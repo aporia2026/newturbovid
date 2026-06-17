@@ -15,16 +15,18 @@ Plan §5 ("Process split"), §13 Phase 3.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from bulkvid.logging import get_logger
 from bulkvid.models.row import (
@@ -41,6 +43,9 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator import db as _db
 
 _log = get_logger("queue")
+
+# Return type preserved across the _run_db resilience wrapper.
+_T = TypeVar("_T")
 
 
 # Job statuses
@@ -71,6 +76,30 @@ TAB_AVATAR = "avatar"
 # 24h is comfortably larger than any plausible user retry interval; older rows
 # are pruned opportunistically on every enqueue.
 IDEMPOTENCY_TTL_SECONDS = 86_400
+
+
+# ── Web-path DB resilience (Turso flap hardening) ───────────────────────────
+#
+# The submit/poll endpoints talk to Turso (remote libSQL) over HTTPS — every
+# statement is a network round-trip that can flap. The WORKER side already
+# survives this (hard ``asyncio.wait_for`` timeout + broad ``except`` + retry
+# buffer, runner.py); the web path historically did not, so a single flap
+# during ``enqueue`` bubbled as a bare HTTP 500 and a wedged connection stayed
+# wedged until the process restarted. ``JobQueue._run_db`` mirrors the worker's
+# discipline on the web path: time-box each call, and on ANY failure throw the
+# connection away, open a fresh one, and retry before giving up with a 503.
+# Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md``.
+#
+# 15 s is loose enough to absorb a slow Turso roundtrip (cold-start spikes
+# ~5-10 s) and tight enough to beat the Apps Script's 30 s UrlFetch cap. All
+# three are env-overridable for a per-deploy tune without a code change.
+_DB_CALL_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_DB_CALL_TIMEOUT_SECONDS") or 15.0
+)
+_DB_MAX_ATTEMPTS = int(os.environ.get("BULKVID_DB_MAX_ATTEMPTS") or 3)
+# Backoff between attempts (after a discard-and-reconnect). Clamped to the last
+# entry if attempts ever exceed the schedule length.
+_DB_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 
 
 _SCHEMA = """
@@ -132,6 +161,18 @@ class QueueBusy(RuntimeError):
     """
 
 
+class QueueUnavailable(QueueBusy):
+    """Raised when a web-facing DB call still fails after the full
+    timeout + reconnect + retry cycle in ``_run_db`` — i.e. Turso is
+    genuinely unreachable right now, not merely busy. Subclasses
+    ``QueueBusy`` so the existing route ``except QueueBusy`` blocks map it to
+    HTTP 503 + ``Retry-After`` and the Apps Script retries it safely (the
+    submit is idempotent via the idempotency key + deterministic job_id).
+    This is the class that replaces the old bare HTTP 500 on a Turso flap.
+    Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md``.
+    """
+
+
 @dataclass
 class Job:
     job_id: str
@@ -165,6 +206,20 @@ def _now_iso() -> str:
 
 def _new_job_id() -> str:
     return f"job-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+
+def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
+    """Stable ``job_id`` derived from (user, idempotency_key).
+
+    A retried submit (same key) recomputes the SAME id, so the
+    ``INSERT OR IGNORE`` writes in ``_enqueue_sync`` make replay exactly-once
+    even if the prior attempt only partially wrote before a Turso flap. The
+    email is included so two users can never collide on a shared key, and so a
+    forged key still can't address another user's job (ownership is also
+    enforced at the route). 16 hex chars = 64 bits — collision-safe for this
+    table's lifetime. Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md``."""
+    digest = hashlib.sha256(f"{user_email}\n{idempotency_key}".encode()).hexdigest()
+    return f"job-{digest[:16]}"
 
 
 def _row_to_payload(
@@ -223,30 +278,82 @@ class JobQueue:
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        # Single shared connection per instance. ``_db.connect`` returns
-        # plain sqlite3 when ``sync_url`` is empty (dev/tests) and a libsql
-        # embedded replica otherwise (prod). The remainder of this class
-        # uses only the DB-API 2.0 surface both backends support, so it
+        # Connection params stashed so ``_reconnect_sync`` can rebuild a fresh
+        # connection after a Turso flap wedges the current one. ``_db.connect``
+        # returns plain sqlite3 when ``sync_url`` is empty (dev/tests) and a
+        # libsql remote connection otherwise (prod). The remainder of this
+        # class uses only the DB-API 2.0 surface both backends support, so it
         # treats the connection identically. See
-        # ``_plans/2026-06-04-migrate-to-hf-spaces-turso.md``.
-        self._conn = _db.connect(
+        # ``_plans/2026-06-04-migrate-to-hf-spaces-turso.md`` and
+        # ``_plans/2026-06-17-submit-500s-turso-resilience.md``.
+        self._sync_url = sync_url
+        self._auth_token = auth_token
+        self._sync_interval_seconds = sync_interval_seconds
+        self._conn = self._open_connection()
+        self._lock = asyncio.Lock()
+        _log.info("queue_init", db_path=str(self._db_path))
+
+    def _open_connection(self) -> Any:
+        """Open and fully configure a DB connection (row factory, WAL, schema).
+
+        Used at construction AND by ``_reconnect_sync`` — keeping the setup in
+        one place means a reconnected handle is configured identically to the
+        original (same row factory, same schema/index guarantees)."""
+        conn = _db.connect(
             self._db_path,
-            sync_url=sync_url,
-            auth_token=auth_token,
-            sync_interval_seconds=sync_interval_seconds,
+            sync_url=self._sync_url,
+            auth_token=self._auth_token,
+            sync_interval_seconds=self._sync_interval_seconds,
         )
         # ``row_factory = sqlite3.Row`` is a sqlite3-only extension; libsql
         # also exposes it (DB-API 2.0 + sqlite3 compat). If a future libsql
         # build drops it we fall back to the plain tuple cursor and adapt at
         # read sites — flagged so the failure is loud, not silent.
         try:
-            self._conn.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row
         except AttributeError:
             _log.warning("row_factory_unsupported", note="dict-like row access disabled")
-        self._conn.executescript("PRAGMA journal_mode=WAL;")
-        self._conn.executescript(_SCHEMA)
-        self._lock = asyncio.Lock()
-        _log.info("queue_init", db_path=str(self._db_path))
+        conn.executescript("PRAGMA journal_mode=WAL;")
+        conn.executescript(_SCHEMA)
+        # Unique index for idempotent enqueue (added 2026-06-17). Kept OUT of
+        # ``_SCHEMA`` and guarded on its own: a legacy ``row_queue`` that
+        # somehow holds a duplicate ``(job_id, row_num)`` would make
+        # ``CREATE UNIQUE INDEX`` fail, and that MUST NOT take the whole
+        # service down at boot. If it fails we log and continue — INSERT OR
+        # IGNORE then degrades to the runtime ``_active_duplicate_row_nums``
+        # guard (today's behaviour), no worse than before. Fresh DBs get the
+        # index and thus DB-level exactly-once on retry. Plan
+        # ``_plans/2026-06-17-submit-500s-turso-resilience.md`` §Change 2.
+        try:
+            conn.executescript(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_row_queue_job_rownum "
+                "ON row_queue(job_id, row_num);"
+            )
+        except Exception as e:    # never fail boot on a legacy duplicate row
+            _log.warning(
+                "unique_index_create_failed",
+                index="idx_row_queue_job_rownum",
+                error=str(e)[:200],
+            )
+        return conn
+
+    def _reconnect_sync(self, *, reason: str) -> None:
+        """Throw away the current connection and open a fresh one.
+
+        Cheap-and-dumb on purpose: we never try to *heal* a half-dead libsql
+        socket, we replace it. ``self._conn`` is swapped to the new handle
+        first so the old one can be closed best-effort (a timed-out worker
+        thread may still hold a reference, so a close failure is swallowed).
+        If opening fails (Turso fully down) the exception propagates and
+        ``_run_db`` counts it as a failed attempt. Plan
+        ``_plans/2026-06-17-submit-500s-turso-resilience.md`` §Change 1."""
+        old = self._conn
+        self._conn = self._open_connection()
+        # Best-effort close: a timed-out worker thread may still hold the old
+        # handle, so swallow any failure rather than crash the reconnect.
+        with suppress(Exception):
+            old.close()
+        _log.warning("db_reconnect", reason=reason)
 
     # ── Transactions ────────────────────────────────────────────────────────
 
@@ -335,10 +442,17 @@ class JobQueue:
 
         If ``idempotency_key`` is supplied and matches a previously recorded
         (user, key) pair, the prior ``job_id`` is returned with
-        ``idempotency_hit=True`` — no new rows are inserted. This makes the
-        submit POST safe to retry when PA's frontend drops the response on
-        the way back to the Apps Script (see
-        ``_plans/2026-06-04-submit-500-defensive-fix.md``).
+        ``idempotency_hit=True`` — no new rows are inserted.
+
+        Idempotent BY CONSTRUCTION (plan 2026-06-17): when a key is present the
+        ``job_id`` is derived deterministically from (user_email, key), and the
+        jobs / row_queue / idempotency writes all use ``INSERT OR IGNORE``. So a
+        retry of a submit whose response the backend dropped — OR whose first
+        attempt only PARTIALLY wrote before a Turso flap — recomputes the same
+        ids and simply fills in whatever is missing, with zero duplicate rows
+        (hence zero duplicate videos / double paid-API spend). Without a key
+        (legacy clients) the id is random and the runtime
+        ``_active_duplicate_row_nums`` guard is the only dedup, as before.
         """
         try:
             if idempotency_key:
@@ -350,7 +464,11 @@ class JobQueue:
                 if prior is not None:
                     return prior, True
 
-            job_id = _new_job_id()
+            job_id = (
+                _deterministic_job_id(user_email, idempotency_key)
+                if idempotency_key
+                else _new_job_id()
+            )
             now = _now_iso()
             with self._tx():
                 # Re-check inside the tx — closes the race where two concurrent
@@ -371,8 +489,12 @@ class JobQueue:
                 # rather than a job that would hang forever as queued 0/0.
                 status = JOB_QUEUED if kept else JOB_COMPLETED
                 finished = None if kept else now
+                # INSERT OR IGNORE: a retry that recomputes the same
+                # deterministic ``job_id`` no-ops on the PK instead of erroring,
+                # and the row_count from the FIRST attempt is preserved (the
+                # ignored re-insert doesn't clobber it). Plan 2026-06-17.
                 self._conn.execute(
-                    "INSERT INTO jobs "
+                    "INSERT OR IGNORE INTO jobs "
                     "(job_id, user_email, sheet_id, worksheet, tab_type, status, "
                     "row_count, created_at, finished_at) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
@@ -381,20 +503,13 @@ class JobQueue:
                     ),
                 )
                 if kept:
-                    self._conn.executemany(
-                        "INSERT INTO row_queue (job_id, row_num, payload, status) "
-                        "VALUES (?,?,?,?)",
-                        [
-                            (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
-                            for r in kept
-                        ],
-                    )
+                    self._insert_rows_batched(job_id, tab_type, kept)
                 if idempotency_key:
-                    # Recorded INSIDE the same tx as the jobs/row_queue inserts:
-                    # a crash mid-write rolls back both, so we never end up
-                    # with an idempotency row pointing at a non-existent job.
+                    # Recorded alongside the jobs/row_queue inserts. INSERT OR
+                    # IGNORE so a retry (or a concurrent same-key submit racing
+                    # past the lookups above) can't trip the PRIMARY KEY.
                     self._conn.execute(
-                        "INSERT INTO idempotency_keys "
+                        "INSERT OR IGNORE INTO idempotency_keys "
                         "(key, user_email, job_id, created_at, created_ts) "
                         "VALUES (?,?,?,?,?)",
                         (idempotency_key, user_email, job_id, now, time.time()),
@@ -420,6 +535,39 @@ class JobQueue:
                 row_nums=sorted(dupes),
             )
         return job_id, False
+
+    def _insert_rows_batched(
+        self,
+        job_id: str,
+        tab_type: str,
+        kept: list[Any],
+    ) -> None:
+        """Insert ``kept`` rows with a single multi-row statement per chunk.
+
+        Why not ``executemany``: the libsql shim unrolls remote-mode
+        ``executemany`` into N separate ``execute()`` calls (commit 5a74f62),
+        so an N-row submit was N network round-trips — N chances for a Turso
+        flap to fail the whole enqueue. A single
+        ``INSERT OR IGNORE ... VALUES (...),(...),...`` is ONE round-trip per
+        chunk and ONE statement (so it dodges the remote-executemany no-op
+        bug). ``INSERT OR IGNORE`` on the ``(job_id, row_num)`` unique index
+        makes a retry fill only the missing rows — never a duplicate. Chunked
+        at 100 rows to stay clear of any statement-size / bind-param ceiling.
+        Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md`` §Change 3."""
+        chunk = 100
+        sql_head = (
+            "INSERT OR IGNORE INTO row_queue (job_id, row_num, payload, status) "
+            "VALUES "
+        )
+        for start in range(0, len(kept), chunk):
+            part = kept[start:start + chunk]
+            placeholders = ",".join("(?,?,?,?)" for _ in part)
+            params: list[Any] = []
+            for r in part:
+                params.extend(
+                    (job_id, r.row_num, _row_to_payload(r, tab_type), ROW_PENDING)
+                )
+            self._conn.execute(sql_head + placeholders, params)
 
     def _claim_next_row_sync(self) -> QueuedRow | None:
         """Atomically pull the next pending row and mark it processing.
@@ -930,6 +1078,69 @@ class JobQueue:
 
     # ── Async API ───────────────────────────────────────────────────────────
 
+    async def _run_db(
+        self, fn: Callable[..., _T], *args: Any, op: str, **kwargs: Any
+    ) -> _T:
+        """Run a sync DB helper in a thread, time-boxed, with discard-and-
+        reconnect retry — the web path's mirror of the worker's resilience.
+
+        Each attempt runs ``fn`` under ``self._lock`` (so a reconnect can never
+        race a concurrent op on the shared connection) with a hard
+        ``asyncio.wait_for`` timeout. On ANY failure (libsql throws an
+        undocumented grab-bag, so we catch broad ``Exception`` exactly like the
+        worker does) we throw the connection away, open a fresh one, back off,
+        and retry. After ``_DB_MAX_ATTEMPTS`` we raise ``QueueUnavailable`` (a
+        ``QueueBusy``) → HTTP 503, which the Apps Script retries safely. A
+        ``QueueBusy`` raised by ``fn`` itself (local sqlite OperationalError) is
+        already classified and surfaces immediately. Plan
+        ``_plans/2026-06-17-submit-500s-turso-resilience.md`` §Change 1."""
+        last_exc: BaseException | None = None
+        for attempt in range(_DB_MAX_ATTEMPTS):
+            async with self._lock:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.to_thread(fn, *args, **kwargs),
+                        timeout=_DB_CALL_TIMEOUT_SECONDS,
+                    )
+                except QueueBusy:
+                    raise
+                except Exception as e:    # libsql throws an undocumented grab-bag
+                    last_exc = e
+                    attempts_left = _DB_MAX_ATTEMPTS - attempt - 1
+                    _log.warning(
+                        "db_call_retry",
+                        op=op,
+                        attempt=attempt + 1,
+                        of=_DB_MAX_ATTEMPTS,
+                        reason=type(e).__name__,
+                        error=str(e)[:200],
+                        attempts_left=attempts_left,
+                    )
+                    if attempts_left <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._reconnect_sync,
+                                reason=f"{op}:{type(e).__name__}",
+                            ),
+                            timeout=_DB_CALL_TIMEOUT_SECONDS,
+                        )
+                    except Exception as re:    # reconnect may itself flap
+                        _log.warning(
+                            "db_reconnect_failed", op=op, error=str(re)[:200]
+                        )
+            # Back off OUTSIDE the lock so other web ops aren't blocked while we
+            # wait out the flap.
+            await asyncio.sleep(
+                _DB_RETRY_BACKOFF_SECONDS[
+                    min(attempt, len(_DB_RETRY_BACKOFF_SECONDS) - 1)
+                ]
+            )
+        raise QueueUnavailable(
+            f"{op} failed after {_DB_MAX_ATTEMPTS} attempts: {last_exc}"
+        )
+
     async def enqueue(
         self,
         *,
@@ -945,19 +1156,21 @@ class JobQueue:
         When ``idempotency_key`` is supplied and the (user, key) pair has been
         recorded by a prior call, the **prior** ``job_id`` is returned and no
         new rows are inserted — so the Apps Script can safely retry a submit
-        whose response PA's frontend dropped without creating a duplicate job
-        (see ``_plans/2026-06-04-submit-500-defensive-fix.md``).
+        whose response the backend dropped without creating a duplicate job
+        (see ``_plans/2026-06-04-submit-500-defensive-fix.md``). Wrapped in
+        ``_run_db`` so a Turso flap mid-enqueue self-heals instead of bubbling
+        a 500 (``_plans/2026-06-17-submit-500s-turso-resilience.md``).
         """
-        async with self._lock:
-            job_id, hit = await asyncio.to_thread(
-                self._enqueue_sync,
-                user_email=user_email,
-                sheet_id=sheet_id,
-                worksheet=worksheet,
-                tab_type=tab_type,
-                rows=rows,
-                idempotency_key=idempotency_key,
-            )
+        job_id, hit = await self._run_db(
+            self._enqueue_sync,
+            user_email=user_email,
+            sheet_id=sheet_id,
+            worksheet=worksheet,
+            tab_type=tab_type,
+            rows=rows,
+            idempotency_key=idempotency_key,
+            op="enqueue",
+        )
         if hit:
             _log.info(
                 "idempotency_hit",
@@ -985,21 +1198,23 @@ class JobQueue:
             await asyncio.to_thread(self._record_result_sync, queue_id, result)
 
     async def get_job(self, job_id: str) -> Job | None:
-        return await asyncio.to_thread(self._get_job_sync, job_id)
+        return await self._run_db(self._get_job_sync, job_id, op="get_job")
 
     async def list_jobs(
         self, *, user_email: str | None = None, limit: int = 50
     ) -> list[Job]:
-        return await asyncio.to_thread(self._list_jobs_sync, user_email=user_email, limit=limit)
+        return await self._run_db(
+            self._list_jobs_sync, user_email=user_email, limit=limit, op="list_jobs"
+        )
 
     async def list_rows(self, job_id: str) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._list_rows_sync, job_id)
+        return await self._run_db(self._list_rows_sync, job_id, op="list_rows")
 
     async def eta_medians(self, *, sample_size: int = 50) -> dict[str, float]:
         """Median per-tab row processing time in seconds. See
         ``_eta_medians_sync``."""
-        return await asyncio.to_thread(
-            self._eta_medians_sync, sample_size=sample_size
+        return await self._run_db(
+            self._eta_medians_sync, sample_size=sample_size, op="eta_medians"
         )
 
     async def user_queue_depth(
@@ -1008,17 +1223,18 @@ class JobQueue:
         """Async wrapper for ``_user_queue_depth_sync``. Returns
         ``(in_flight, queued, queued_per_tab)``. ``user_email=None`` is the
         admin view (whole fleet)."""
-        return await asyncio.to_thread(
-            self._user_queue_depth_sync, user_email=user_email,
+        return await self._run_db(
+            self._user_queue_depth_sync, user_email=user_email, op="user_queue_depth"
         )
 
     async def user_oldest_pending_row_age_seconds(
         self, *, user_email: str | None,
     ) -> int | None:
         """Async wrapper for ``_user_oldest_pending_row_age_seconds_sync``."""
-        return await asyncio.to_thread(
+        return await self._run_db(
             self._user_oldest_pending_row_age_seconds_sync,
             user_email=user_email,
+            op="oldest_pending_age",
         )
 
     async def kill_job(self, job_id: str) -> tuple[bool, int]:
