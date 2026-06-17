@@ -21,7 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from urllib.parse import parse_qs, urlparse
 
 from bulkvid.adapters.openai_client import OpenAIClient
 from bulkvid.logging import get_logger
@@ -41,6 +42,46 @@ DEFAULT_LANGUAGE = "en"
 DETECTION_MODEL = "gpt-5.4-mini"
 CACHE_SIZE = 256
 SNIPPET_LEN = 500
+
+
+# ── Explicit-market signals (safety net for a wrong-language scrape) ─────────
+#
+# Article-language detection is primary, but a bad/transient scrape can hand us
+# the wrong-language content — e.g. a programmatic page that served English at
+# fetch time even though it's Spanish now. When detection conflicts with the
+# operator's EXPLICIT market signal (the sheet Country column, or a
+# ``locale=xx_YY`` in the pasted article URL), we prefer the explicit signal
+# rather than ship a wrong-language video to a localized market. Chat
+# 2026-06-17: an es_MX cartoon row went out in English for exactly this reason.
+
+# Country (ISO 3166-1 alpha-2) → language (ISO 639-1), UNAMBIGUOUS markets
+# only. Multilingual countries (CH, BE, CA, IN, ...) are deliberately omitted
+# so they fall through to article detection / URL locale instead of being
+# forced to one language. Every value is in ``SUPPORTED_LANGUAGES``.
+COUNTRY_TO_LANGUAGE: dict[str, str] = {
+    # Spanish-speaking markets
+    "MX": "es", "ES": "es", "AR": "es", "CO": "es", "CL": "es", "PE": "es",
+    "VE": "es", "EC": "es", "GT": "es", "CU": "es", "BO": "es", "DO": "es",
+    "HN": "es", "PY": "es", "SV": "es", "NI": "es", "CR": "es", "PA": "es",
+    "UY": "es",
+    # English
+    "US": "en", "GB": "en", "UK": "en", "AU": "en", "NZ": "en", "IE": "en",
+    # Portuguese
+    "BR": "pt", "PT": "pt",
+    # Other single-dominant-language markets
+    "FR": "fr", "DE": "de", "AT": "de", "IT": "it", "NL": "nl", "PL": "pl",
+    "RU": "ru", "TR": "tr", "JP": "ja", "KR": "ko", "CN": "zh", "TW": "zh",
+    "VN": "vi", "TH": "th", "ID": "id", "SE": "sv", "NO": "no", "DK": "da",
+    "FI": "fi", "CZ": "cs", "GR": "el", "RO": "ro", "HU": "hu", "UA": "uk",
+    "IL": "he",
+    # Arabic-dominant markets
+    "SA": "ar", "AE": "ar", "EG": "ar", "JO": "ar", "KW": "ar", "QA": "ar",
+    "OM": "ar", "BH": "ar", "LB": "ar", "IQ": "ar", "LY": "ar", "MA": "ar",
+    "DZ": "ar", "TN": "ar",
+}
+
+# URL query params that carry an explicit content locale, e.g. ``locale=es_MX``.
+_LOCALE_PARAM_KEYS = frozenset({"locale"})
 
 
 SYSTEM_PROMPT = (
@@ -183,6 +224,70 @@ async def detect_language(
     return LanguageResult(
         language=lang, confidence=confidence, cost_usd=result.cost_usd, cached=False
     )
+
+
+# ── Reconciliation (explicit-market safety net) ──────────────────────────────
+
+
+def parse_locale_language(url: str) -> str | None:
+    """Language from a ``locale=xx_YY`` (or ``xx-YY`` / ``xx``) query param in
+    ``url``, validated against ``SUPPORTED_LANGUAGES``. ``None`` when the param
+    is absent or the language isn't supported."""
+    if not url:
+        return None
+    try:
+        qs = parse_qs(urlparse(url).query)
+    except ValueError:
+        return None
+    for raw_key, values in qs.items():
+        if raw_key.lower() in _LOCALE_PARAM_KEYS and values:
+            head = values[0].strip().replace("-", "_").split("_", 1)[0][:2].lower()
+            if head in SUPPORTED_LANGUAGES:
+                return head
+    return None
+
+
+def expected_language(article_url: str, country: str) -> tuple[str | None, str | None]:
+    """The language a row is *expected* to be in, from explicit operator
+    signals: the Country column first (the deliberate market selection), then a
+    ``locale=`` in the article URL. Returns ``(lang, signal)`` — signal is
+    ``"country"`` or ``"locale"`` — or ``(None, None)`` when neither yields an
+    unambiguous supported language (so detection stays authoritative)."""
+    mapped = COUNTRY_TO_LANGUAGE.get((country or "").strip().upper())
+    if mapped:
+        return mapped, "country"
+    loc = parse_locale_language(article_url)
+    if loc:
+        return loc, "locale"
+    return None, None
+
+
+def reconcile_language(
+    detected: LanguageResult, *, article_url: str, country: str
+) -> LanguageResult:
+    """Safety net over ``detect_language`` — article detection stays primary.
+
+    When the detected language CONFLICTS with the operator's explicit market
+    signal (Country column, or a ``locale=`` in the article URL), prefer the
+    explicit signal: a conflict almost always means the scrape returned
+    wrong-language content (a bad/transient render), and shipping a
+    wrong-language video to a localized market is the worst outcome. Logs
+    ``language_conflict`` so misfires are visible in prod. With no explicit
+    signal, or when it agrees with detection, the detected language is returned
+    unchanged. Chat 2026-06-17 (es_MX cartoon row shipped in English because
+    the source served English bytes at fetch time)."""
+    expected, signal = expected_language(article_url, country)
+    if expected is None or expected == detected.language:
+        return detected
+    _log.warning(
+        "language_conflict",
+        detected=detected.language,
+        detected_confidence=round(detected.confidence, 3),
+        expected=expected,
+        signal=signal,
+        url=(article_url or "")[:200],
+    )
+    return replace(detected, language=expected)
 
 
 def clear_cache() -> None:
