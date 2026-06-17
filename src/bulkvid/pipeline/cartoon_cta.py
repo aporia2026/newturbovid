@@ -8,17 +8,19 @@ the bottom of every cartoon video that has ``CTA = Yes`` set on the sheet.
 Design (Yoav 2026-06-08: "a beautiful consistent CTA button design that
 will match each size"):
 
-  * Pill: full-width (94% of canvas), rounded ends, anchored at the bottom
-    with a small breathing margin.
+  * Pill: full-width (94% of canvas), rounded ends, lifted clear of
+    TikTok's bottom safe zone (the caption / username / sound ticker /
+    progress-bar band that covers the lower part of the frame in-feed).
   * Color: bright yellow ``#FFC31E`` with bold black text — matches
     Template 2's CTA pill so the simple_x4 and cartoon outputs feel like
     one product family.
   * Typography: bundled Inter Variable Bold (full Latin Ext + Cyrillic +
     Greek + Vietnamese coverage). Font size auto-shrinks if the localised
     CTA text would overflow the pill width.
-  * Scales by proportion (pill height = 8% of canvas, side margin = 3%),
-    so 1080×1920 (9:16), 1080×1080 (1:1), and 1080×1350 (4:5) all render
-    a visually consistent CTA without per-ratio tuning.
+  * Scales by proportion (pill height = 8% of canvas, bottom margin = 19%
+    to sit above TikTok's bottom UI + paid-ad CTA), so 1080×1920 (9:16),
+    1080×1080 (1:1), and 1080×1350 (4:5) all render a visually consistent
+    CTA without per-ratio tuning.
 
 The PNG is mostly transparent; ffmpeg overlays it directly onto the cartoon
 video frame at (0, 0). The transparent area passes through the video below.
@@ -49,7 +51,16 @@ PILL_TEXT_COLOR: Final[tuple[int, int, int]] = (20, 20, 20)            # near-bl
 # Layout proportions — relative to canvas height/width so every supported
 # aspect ratio (9:16, 1:1, 4:5, 16:9) renders the same visual weight.
 PILL_HEIGHT_FRAC: Final[float] = 0.08          # ~8% of canvas height
-PILL_BOTTOM_MARGIN_FRAC: Final[float] = 0.03   # gap from canvas bottom
+# Bottom margin as a fraction of canvas height. Lifted from the old 0.03
+# (~58px on a 1920-tall frame, which sat the pill at y≈1708-1862 — buried
+# under TikTok's UI) into TikTok's safe zone. TikTok overlays the bottom
+# ~320px of a 1080×1920 frame (caption, username, sound ticker, progress
+# bar; ad placements block ~370px for the native CTA), so content should
+# stay above y≈1600. 0.19 puts the pill's BOTTOM edge at ~y1555 (≈81%
+# down), clearing that band AND the ~370px paid-ad zone. Applies
+# proportionally to every aspect ratio. (Yoav 2026-06-17: "the cta button …
+# on tiktok it won't be visible, should be a bit upper to match tiktok".)
+PILL_BOTTOM_MARGIN_FRAC: Final[float] = 0.19   # gap from canvas bottom (TikTok safe zone)
 PILL_WIDTH_FRAC: Final[float] = 0.94           # near-full canvas width
 PILL_FONT_HEIGHT_FRAC: Final[float] = 0.45     # font ≈ 45% of pill height
 PILL_MIN_FONT_HEIGHT_FRAC: Final[float] = 0.25 # auto-shrink floor
