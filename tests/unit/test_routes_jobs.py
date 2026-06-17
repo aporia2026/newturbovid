@@ -35,6 +35,7 @@ from bulkvid.orchestrator.queue import (
     TAB_SIMPLE,
     TAB_SIMPLE_X4,
     JobQueue,
+    QueueUnavailable,
 )
 from bulkvid.routes import jobs as jobs_routes
 
@@ -1134,3 +1135,22 @@ def test_row_to_out_blank_chosen_template_id_becomes_none() -> None:
     }
     out = _row_to_out("job-X", raw)
     assert out.chosen_template_id is None
+
+
+def test_submit_queue_unavailable_returns_503(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the queue exhausts its reconnect+retry cycle and raises
+    QueueUnavailable, the route returns 503 + Retry-After (NOT a bare 500), so
+    the Apps Script retries the idempotent submit invisibly. Plan
+    ``_plans/2026-06-17-submit-500s-turso-resilience.md``."""
+
+    async def _boom(**kwargs: object) -> str:
+        raise QueueUnavailable("turso unreachable after retries")
+
+    monkeypatch.setattr(app.state.queue, "enqueue", _boom)
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 503
+    assert r.headers.get("Retry-After") == "5"
+    # The fixed message never leaks the underlying error.
+    assert "turso" not in r.text.lower()

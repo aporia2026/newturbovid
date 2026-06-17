@@ -19,7 +19,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from bulkvid import __version__
 from bulkvid.auth import build_verifier_from_settings
@@ -125,6 +126,35 @@ app = FastAPI(
 app.include_router(jobs_routes.router)
 app.include_router(health_routes.router)
 app.include_router(admin_routes.router)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Final safety net: convert ANY unhandled exception into a clean 503.
+
+    A Turso flap, a Google JWKS verification hiccup, or any cause we did not
+    anticipate degrades to an invisible client retry (the Apps Script retries
+    5xx) instead of the bare ``HTTP 500 Internal Server Error`` popup. The
+    body is a fixed string — it never echoes the exception, SQL, connection
+    string, or token (logged server-side only). ``HTTPException`` (our
+    explicit 4xx codes) and request-validation errors have their own handlers
+    and never reach here, so 400/401/403/404/422 still behave exactly as
+    before. Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md`` §Change 4.
+    """
+    _log.warning(
+        "unhandled_exception",
+        path=request.url.path,
+        method=request.method,
+        exc_type=type(exc).__name__,
+        error=str(exc)[:200],
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "backend temporarily unavailable, please retry"},
+        headers={"Retry-After": "5"},
+    )
 
 
 def init_wsgi() -> FastAPI:
