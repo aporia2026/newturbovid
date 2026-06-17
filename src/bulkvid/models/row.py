@@ -201,6 +201,51 @@ class CartoonRow:
 
 
 @dataclass
+class YtCartoonRow:
+    """yt-cartoon tab input row — engaging, variable-length cartoon videos.
+
+    A variable-geometry sibling of :class:`CartoonRow` (the flat-8s ``cartoon``
+    tab). Same article-driven, no-seed-image, multi-shot pipeline, PLUS four
+    operator knobs the new tab adds after ZapCap (sheet columns G-J):
+
+      * ``tone``         — ``Tone`` cell. Blank → engaging (this tab exists for
+        the new lively/clickable narration); an explicit calm-ish word opts
+        back into today's calm cartoon delivery. Resolved by
+        ``pipeline.yt_cartoon.normalize_tone``.
+      * ``cap_position`` — ``Cap Position`` relative-nudge cell shifting the
+        ZapCap caption height vs default.
+      * ``cta_position`` — ``CTA Position`` relative-nudge cell shifting the
+        CTA pill height vs default.
+      * ``vid_length``   — ``Vid Length`` cap cell (up to 10 / 15 / 20s). The
+        processor scales shots + voiceover to fill it and produces TWO videos
+        on the 10s bucket, ONE on 15s/20s. Resolved by
+        ``pipeline.yt_cartoon.plan_shots_for_length``.
+
+    Manual Image (D) is present in the sheet but ignored, exactly like cartoon.
+    The existing cartoon path is untouched — this is a separate row + processor
+    that REUSES the shared planner / TTS-sizing / CTA / ZapCap / Rendi helpers.
+    Plan: ``_plans/2026-06-17-yt-cartoon-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # CTA pill on/off (mirrors cartoon)
+    cta_text: str = ""                # operator text; empty = per-language default
+    # NEW yt-cartoon knobs — all blank = today's defaults.
+    tone: str = ""                    # "" | "engaging" | "calm"
+    cap_position: str = ""            # nudge label (e.g. "Higher")
+    cta_position: str = ""            # nudge label
+    vid_length: str = ""              # "" | "10" | "15" | "20" (or "up to 15s")
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 

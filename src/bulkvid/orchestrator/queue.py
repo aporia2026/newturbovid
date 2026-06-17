@@ -39,6 +39,7 @@ from bulkvid.models.row import (
     SimpleRow,
     SimpleX4Row,
     TextOnImgRow,
+    YtCartoonRow,
 )
 from bulkvid.orchestrator import db as _db
 
@@ -66,6 +67,7 @@ TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
 TAB_CARTOON = "cartoon"
+TAB_YT_CARTOON = "yt_cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
 TAB_TEXT_ON_IMG = "text_on_img"
 TAB_AVATAR = "avatar"
@@ -223,7 +225,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -247,7 +249,7 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
 
 def _payload_to_row(
     payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -256,6 +258,8 @@ def _payload_to_row(
         return SimpleRow(**data)
     if tab == TAB_CARTOON:
         return CartoonRow(**data)
+    if tab == TAB_YT_CARTOON:
+        return YtCartoonRow(**data)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(data)
     if tab == TAB_TEXT_ON_IMG:
@@ -1279,7 +1283,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -1288,6 +1292,8 @@ def payload_to_row(
         return SimpleRow(**payload)
     if tab == TAB_CARTOON:
         return CartoonRow(**payload)
+    if tab == TAB_YT_CARTOON:
+        return YtCartoonRow(**payload)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(payload)
     if tab == TAB_TEXT_ON_IMG:

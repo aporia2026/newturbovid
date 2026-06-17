@@ -120,6 +120,45 @@ Return STRICT JSON only, shaped exactly like:
 {{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
 
 
+# ── yt-cartoon engaging planner prompt (Yoav 2026-06-17) ─────────────────────
+#
+# The yt-cartoon tab's "engaging" Tone uses this instead of the calm prompt
+# above. Same placeholders, same JSON shape, same hard brand-safety rules — the
+# ONLY difference is the voiceover voice: punchy, hook-first, scroll-stopping,
+# but fenced in by an explicit compliance block so it stays shippable on paid
+# native (Taboola/Outbrain) AND YouTube Shorts. The council's loudest warning
+# was that "clickable" and "no fake urgency / no fear-mongering" pull the model
+# in opposite directions on the same sentence — so the tension is resolved HERE,
+# inside the prompt, not left to chance. Plan: ``_plans/2026-06-17-yt-cartoon-tab.md``.
+YT_CARTOON_ENGAGING_PROMPT_DEFAULT = """You are a sharp short-form ad writer making PUNCHY, scroll-stopping animated cartoon videos from a news article. You write the visuals and a fast, lively voiceover that makes people stop scrolling and tap "Read More".
+
+Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate short video told in exactly {num_shots} shots.
+
+For EACH idea return:
+- voiceover: ONE energetic spoken line in {language}, about {target_words} words ({min_words}-{max_words}), paced fast and punchy. OPEN WITH A HOOK in the first few words — a curiosity gap, a direct "you", a sharp question, or one surprising-but-true detail pulled straight from the article. Use short, snappy sentences and everyday spoken language. Build a little curiosity that tapping "Read More" would satisfy. The line MUST be a COMPLETE THOUGHT that ends in a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition. End on a strong, conclusive word — a vivid noun or an action verb — so it lands, not trails off.
+- style_direction: a short delivery hint — fast, upbeat, energetic, conversational.
+- shots: an array of exactly {num_shots} shots, each with:
+    * scene: a vivid description of ONE cartoon scene (subject, setting, framing). Vertical composition.
+    * motion: how that scene animates (lively but natural movements and dynamic camera moves).
+
+COMPLIANCE — these are paid ads; the hook must be punchy but MUST NOT cross these lines:
+- NO health, medical, or weight-loss claims, cures, or "doctors hate this" framing.
+- NO guaranteed money, income, savings, or returns claims, and no "get rich" promises.
+- NO fake urgency ("act now", "today only", "limited time", "before it's gone").
+- NO fear-mongering, scare tactics, or shock-bait ("you won't believe", "this one weird trick", "what happens next will shock you", "shocking", "miracle").
+- NO absolute promises or sensational superlatives ("the best ever", "guaranteed", "instantly").
+- FACT-FAITHFUL: use ONLY facts the article actually supports. Never invent statistics, prices, names, quotes, or outcomes. Curiosity comes from REAL, specific detail — not made-up claims.
+
+HARD RULES (same as the calm style):
+1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (say 'a compact car', NOT 'a Volkswagen'). All vehicles, products, and signage are plain and unbranded — no logos, badges, or readable license plates.
+2. Within one idea, keep ONE recurring main character described IDENTICALLY across the shots (same age, hair, clothing) so the shots feel continuous.
+3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus.
+4. Keep it tasteful and brand-safe.
+
+Return STRICT JSON only, shaped exactly like:
+{{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
+
+
 # ── Sensitive-apparel safeguard (Evgeny 2026-06-04) ──────────────────────────
 
 SENSITIVE_APPAREL_RULES_DEFAULT = """SENSITIVE APPAREL: STRICT VISUAL RULES
@@ -214,6 +253,8 @@ SETTING_SCRIPT_SYSTEM_PROMPT = "script_system_prompt"
 SETTING_SIMPLE_SCRIPT_PROMPT = "simple_script_prompt"
 SETTING_SIMPLE_X4_SCRIPT_PROMPT = "simple_x4_script_prompt"
 SETTING_CARTOON_PLANNER_PROMPT = "cartoon_planner_prompt"
+# yt-cartoon "engaging" Tone planner prompt (Yoav 2026-06-17).
+SETTING_YT_CARTOON_ENGAGING_PROMPT = "yt_cartoon_engaging_planner_prompt"
 SETTING_SENSITIVE_APPAREL_RULES = "sensitive_apparel_rules"
 SETTING_SENSITIVE_APPAREL_KEYWORDS = "sensitive_apparel_keywords"
 
@@ -224,6 +265,9 @@ SETTING_ROW_TIMEOUT_SIMPLE = "row_timeout_simple_seconds"
 SETTING_ROW_TIMEOUT_IMAGE_VO = "row_timeout_image_vo_seconds"
 SETTING_ROW_TIMEOUT_4IMAGES = "row_timeout_4images_seconds"
 SETTING_ROW_TIMEOUT_CARTOON = "row_timeout_cartoon_seconds"
+# yt-cartoon reuses cartoon's multi-shot pipeline but can run longer (up to 5
+# shots on the 20s bucket), so it gets its own (larger-headroom) timeout key.
+SETTING_ROW_TIMEOUT_YT_CARTOON = "row_timeout_yt_cartoon_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -276,6 +320,20 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "videos (voiceover + scene descriptions). Use {language}, "
             "{num_ideas}, {num_shots}, {target_words}, {min_words}, and "
             "{max_words} as placeholders."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_YT_CARTOON_ENGAGING_PROMPT,
+        label="yt-cartoon: engaging planner prompt",
+        default=YT_CARTOON_ENGAGING_PROMPT_DEFAULT,
+        multiline=True,
+        description=(
+            "System prompt for the yt-cartoon tab when a row's Tone is "
+            "'engaging' (or blank — engaging is this tab's default). Punchy, "
+            "hook-first narration fenced by an ad-compliance block. A Tone of "
+            "'calm' falls back to the Cartoon planner prompt above. Same "
+            "{language}, {num_ideas}, {num_shots}, {target_words}, "
+            "{min_words}, {max_words} placeholders."
         ),
     ),
     SettingDef(
@@ -340,6 +398,17 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
         description=(
             "Hard wall-clock budget for a Cartoon-tab row (planner + multi-"
             "shot). Env BULKVID_ROW_TIMEOUT_SECONDS_CARTOON overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_YT_CARTOON,
+        label="Row timeout: yt-cartoon (seconds)",
+        default="1500",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a yt-cartoon-tab row (planner + up to "
+            "5 shots on the 20s bucket). Larger than Cartoon's headroom. Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_YT_CARTOON overrides."
         ),
     ),
     SettingDef(

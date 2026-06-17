@@ -72,6 +72,7 @@ def render_cartoon_cta_overlay_bytes(
     canvas_width: int,
     canvas_height: int,
     font_override: str | None = None,
+    bottom_margin_frac: float | None = None,
 ) -> bytes:
     """Render a transparent-PNG overlay carrying a single CTA pill at the bottom.
 
@@ -82,6 +83,11 @@ def render_cartoon_cta_overlay_bytes(
 
     ``cta_text`` must be non-empty — empty CTAs are filtered by the caller
     (the row processor only invokes this when ``cta_enabled`` is True).
+
+    ``bottom_margin_frac`` overrides the pill's gap from the canvas bottom
+    (default ``PILL_BOTTOM_MARGIN_FRAC`` = 0.19). The yt-cartoon tab's
+    "CTA Position" nudge passes an adjusted, clamped fraction here; cartoon
+    callers pass nothing and keep the default safe-zone position.
     """
     if not cta_text or not cta_text.strip():
         raise ValueError("cartoon CTA overlay requires non-empty cta_text")
@@ -89,6 +95,9 @@ def render_cartoon_cta_overlay_bytes(
         raise ValueError(
             f"canvas dimensions must be positive (got {canvas_width}x{canvas_height})"
         )
+    margin_frac = (
+        PILL_BOTTOM_MARGIN_FRAC if bottom_margin_frac is None else bottom_margin_frac
+    )
 
     canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -99,7 +108,7 @@ def render_cartoon_cta_overlay_bytes(
     pill_w = int(round(canvas_width * PILL_WIDTH_FRAC))
     pill_pad_x = int(round(canvas_width * 0.04))
     pill_pad_y = int(round(pill_h * 0.18))
-    bottom_margin = int(round(canvas_height * PILL_BOTTOM_MARGIN_FRAC))
+    bottom_margin = int(round(canvas_height * margin_frac))
     pill_center_y = canvas_height - bottom_margin - pill_h // 2
 
     # Font size proportional to pill height + auto-shrink so long localised

@@ -15,6 +15,7 @@ const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_CARTOON = 'cartoon';
+const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
 const TAB_TEXT_ON_IMG = 'text_on_img';
 const TAB_AVATAR = 'avatar';
@@ -65,6 +66,16 @@ const SIZE_DROPDOWN_OPTIONS = [
   '9:16', '4:5', '1:1', '16:9', '4:3', '3:4', '5:4', '2:3', '3:2', '21:9',
 ];
 
+// yt-cartoon dropdown options (2026-06-17). Tone toggles the narration style;
+// Cap/CTA Position nudge the caption + CTA pill height relative to default;
+// Vid Length caps the video at 10/15/20s. Backend coerces these defensively,
+// so the labels just need to be recognisable (it lowercases + matches digits).
+const YT_CARTOON_TONE_OPTIONS = ['Engaging', 'Calm'];
+const YT_CARTOON_POSITION_OPTIONS = [
+  'Much Higher', 'Higher', 'Default', 'Lower', 'Much Lower',
+];
+const YT_CARTOON_VID_LENGTH_OPTIONS = ['up to 10s', 'up to 15s', 'up to 20s'];
+
 /** Column maps — MUST match src/bulkvid/adapters/sheets.py (1-indexed for Sheets). */
 const IMAGE_VO_COLS = {
   country: 1, vertical: 2, article: 3, manualImage: 4,
@@ -111,6 +122,22 @@ const CARTOON_COLS = {
   lastInputCol: 11,
 };
 
+// yt-cartoon tab (2026-06-17): the cartoon layout PLUS four new columns
+// inserted after ZapCap (F) — Tone (G), Cap Position (H), CTA Position (I),
+// Vid Length (J) — which shift Change Size..Ready Video right by 4. Read by
+// HEADER NAME first (like the avatar tab) so inserting/moving columns can't
+// silently corrupt the input; these positional values are the fallback for a
+// fresh sheet. Manual Image (D) is present but ignored (scenes are generated).
+const YT_CARTOON_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  voiceOver: 5, zapcap: 6,
+  tone: 7, capPosition: 8, ctaPosition: 9, vidLength: 10,
+  aspectRatio: 11, scriptPattern: 12, ctaEnabled: 13, ctaText: 14,
+  openComments: 15,
+  readyVideo1: 16, readyVideo2: 17,
+  lastInputCol: 15,
+};
+
 // paste text on img (2026-06-09): A-D from Image-VO, then a Text column at
 // E (the overlay text), then the standard F-J input columns shifted right
 // by 1. One video per row, so Ready Video lands at K.
@@ -155,6 +182,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
+    .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
 }
@@ -214,6 +242,12 @@ function _detectTabType(sheet) {
   }
   // "simple" -> ONE video from the existing Manual Image, NO image generation.
   if (name.indexOf('simple') !== -1) return TAB_SIMPLE;
+  // "yt-cartoon" -> engaging, variable-length cartoon (Tone / Cap Position /
+  // CTA Position / Vid Length knobs). MUST be checked BEFORE the generic
+  // "cartoon" match below, since the name "yt-cartoon" contains "cartoon".
+  if (name.indexOf('yt-cartoon') !== -1 || name.indexOf('yt cartoon') !== -1) {
+    return TAB_YT_CARTOON;
+  }
   // "cartoon" -> generate animated multi-shot videos from text (no seed image).
   // Checked by NAME because the tab shares the Image-VO "Manual Image" header.
   if (name.indexOf('cartoon') !== -1) return TAB_CARTOON;
@@ -392,6 +426,54 @@ function _readCartoonRow(sheet, rowNum) {
 }
 
 
+function _readYtCartoonRow(sheet, rowNum) {
+  // yt-cartoon: cartoon inputs PLUS four new knobs (Tone, Cap Position, CTA
+  // Position, Vid Length). Every column is resolved by HEADER NAME first
+  // (mirrors _readAvatarRow) so the operator can insert/move columns without
+  // breaking the read — important because this tab is brand new and still
+  // being laid out. The YT_CARTOON_COLS positional index is the fallback for a
+  // fresh sheet whose headers don't match. Manual Image (D) is ignored.
+  const cols = YT_CARTOON_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cTone         = _colForHeaders(headerMap, ['Tone'], cols.tone);
+  const cCapPosition  = _colForHeaders(headerMap, ['Cap Position', 'Caption Position'], cols.capPosition);
+  const cCtaPosition  = _colForHeaders(headerMap, ['CTA Position'], cols.ctaPosition);
+  const cVidLength    = _colForHeaders(headerMap, ['Vid Length', 'Video Length'], cols.vidLength);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments'], cols.openComments);
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+    // New knobs — sent as raw labels; the backend normalises them.
+    tone: _cell(values, cTone).slice(0, 40),
+    cap_position: _cell(values, cCapPosition).slice(0, 40),
+    cta_position: _cell(values, cCtaPosition).slice(0, 40),
+    vid_length: _cell(values, cVidLength).slice(0, 40),
+  };
+}
+
+
 function _readAvatarRow(sheet, rowNum) {
   // video with avatar: every input column is resolved by HEADER NAME
   // first, with the AVATAR_COLS positional value as fallback for sheets
@@ -522,6 +604,14 @@ function _validateCartoon(r) {
 }
 
 
+function _validateYtCartoon(r) {
+  // Same as cartoon — only the article is required. The four knob columns are
+  // optional (blank = defaults) and coerced server-side.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
 function _validateFourImages(r) {
   if (!r.article_url) return 'article URL missing';
   if (r.how_many < 1 || r.how_many > 4) return 'how_many must be 1..4';
@@ -647,6 +737,7 @@ function generateAllUnprocessed() {
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
+    : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
     : tabType === TAB_AVATAR ? AVATAR_COLS
     : IMAGE_VO_COLS
@@ -672,12 +763,14 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   // each have their own reader (different column maps).
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
+    : tabType === TAB_YT_CARTOON ? _readYtCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
     : tabType === TAB_AVATAR ? _readAvatarRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
+    : tabType === TAB_YT_CARTOON ? _validateYtCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
     : tabType === TAB_AVATAR ? _validateAvatar
@@ -708,6 +801,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
+      : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
       : tabType === TAB_AVATAR ? AVATAR_COLS
       : IMAGE_VO_COLS
@@ -749,6 +843,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
+  else if (tabType === TAB_YT_CARTOON) payload.rows_yt_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
   else if (tabType === TAB_TEXT_ON_IMG) payload.rows_text_on_img = rows;
   else if (tabType === TAB_AVATAR) payload.rows_avatar = rows;
@@ -1020,6 +1115,61 @@ function applySizeDropdowns() {
 }
 
 
+// ─── yt-cartoon dropdowns ───────────────────────────────────────────────────
+
+/** One-shot: (re)apply the Tone / Cap Position / CTA Position / Vid Length
+ *  dropdowns on every yt-cartoon tab. Resolves each column BY HEADER NAME, so
+ *  it follows the column wherever the operator put it. Idempotent and
+ *  non-strict (blank + free-typed values are allowed — the backend coerces
+ *  them), matching applySizeDropdowns. The Change Size column on this tab is
+ *  handled by applySizeDropdowns like every other tab. */
+function applyYtCartoonDropdowns() {
+  const ui = SpreadsheetApp.getUi();
+  const specs = [
+    { headers: ['Tone'], options: YT_CARTOON_TONE_OPTIONS,
+      help: 'Engaging (lively, clickable) or Calm (current style). Blank = Engaging.' },
+    { headers: ['Cap Position', 'Caption Position'], options: YT_CARTOON_POSITION_OPTIONS,
+      help: 'Nudge the caption height vs default. Blank = Default.' },
+    { headers: ['CTA Position'], options: YT_CARTOON_POSITION_OPTIONS,
+      help: 'Nudge the CTA button height vs default. Blank = Default.' },
+    { headers: ['Vid Length', 'Video Length'], options: YT_CARTOON_VID_LENGTH_OPTIONS,
+      help: 'Cap the video length. Blank = up to 10s. 10s makes 2 videos; 15s/20s make 1.' },
+  ];
+
+  const updated = [];
+  SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
+    if (_detectTabType(sheet) !== TAB_YT_CARTOON) return;
+    const headerMap = _buildHeaderColMap(sheet);
+    const firstData = 2;
+    const maxRow = sheet.getMaxRows();
+    if (maxRow < firstData) return;
+    var applied = 0;
+    specs.forEach(function (spec) {
+      const col = _colForHeaders(headerMap, spec.headers, 0);
+      if (!col) return;    // column not present under any known name — skip
+      const validation = SpreadsheetApp.newDataValidation()
+        .requireValueInList(spec.options, true)
+        .setAllowInvalid(true)    // blank + free-typed values are fine
+        .setHelpText(spec.help)
+        .build();
+      sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
+        .setDataValidation(validation);
+      applied++;
+    });
+    if (applied) updated.push(sheet.getName() + ' (' + applied + ' dropdowns)');
+  });
+
+  ui.alert(
+    'yt-cartoon dropdowns updated',
+    updated.length
+      ? 'Applied to:\n\n• ' + updated.join('\n• ')
+        + '\n\nAlso run "Update size dropdowns on all tabs" for the Change Size column.'
+      : 'No yt-cartoon tab found. Name a tab "yt-cartoon" and re-run.',
+    ui.ButtonSet.OK
+  );
+}
+
+
 // ─── Sidebar ────────────────────────────────────────────────────────────────
 
 function showJobsSidebar() {
@@ -1195,7 +1345,9 @@ function _submitJobWithRetry_(payload) {
 
 function _rowCountForPayload_(payload) {
   return (payload.rows_image_vo || payload.rows_four_images
-    || payload.rows_simple || payload.rows_cartoon || []).length;
+    || payload.rows_simple || payload.rows_cartoon || payload.rows_yt_cartoon
+    || payload.rows_simple_x4 || payload.rows_text_on_img
+    || payload.rows_avatar || []).length;
 }
 
 

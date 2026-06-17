@@ -38,6 +38,7 @@ from bulkvid.models.row import (
     SimpleRow,
     SimpleX4Row,
     TextOnImgRow,
+    YtCartoonRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
@@ -48,11 +49,13 @@ from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
 from bulkvid.orchestrator.row_processor_simple_x4 import process_simple_x4_row
 from bulkvid.orchestrator.row_processor_text_on_img import process_text_on_img_row
+from bulkvid.orchestrator.row_processor_yt_cartoon import process_yt_cartoon_row
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_4IMAGES,
     SETTING_ROW_TIMEOUT_CARTOON,
     SETTING_ROW_TIMEOUT_IMAGE_VO,
     SETTING_ROW_TIMEOUT_SIMPLE,
+    SETTING_ROW_TIMEOUT_YT_CARTOON,
     SETTING_STUCK_ROW_THRESHOLD,
 )
 from bulkvid.orchestrator.sheet_writer import PendingWrite
@@ -77,6 +80,7 @@ _TAB_SIMPLE = "simple"
 _TAB_IMAGE_VO = "image_vo"
 _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
+_TAB_YT_CARTOON = "yt_cartoon"
 _TAB_SIMPLE_X4 = "simple_x4"
 _TAB_TEXT_ON_IMG = "text_on_img"
 _TAB_AVATAR = "avatar"
@@ -86,6 +90,9 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_IMAGE_VO: 900.0,       # 15 min — image gen is heavier
     _TAB_4IMAGES: 720.0,        # 12 min
     _TAB_CARTOON: 1200.0,       # 20 min — planner + multi-shot
+    # yt-cartoon runs cartoon's pipeline but with up to 5 shots (20s bucket),
+    # so it gets more headroom than the flat-8s cartoon tab.
+    _TAB_YT_CARTOON: 1500.0,    # 25 min
     # simple_x4 shares image_vo's heavy image-gen path + adds one small
     # headline GPT call + CPU-bound overlay work. Same budget — overlay
     # work is sub-second, headline call is <2s.
@@ -104,6 +111,7 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_IMAGE_VO: SETTING_ROW_TIMEOUT_IMAGE_VO,
     _TAB_4IMAGES: SETTING_ROW_TIMEOUT_4IMAGES,
     _TAB_CARTOON: SETTING_ROW_TIMEOUT_CARTOON,
+    _TAB_YT_CARTOON: SETTING_ROW_TIMEOUT_YT_CARTOON,
     # simple_x4 reuses the image_vo timeout setting — same shape of work.
     _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
     # text_on_img reuses the simple timeout — same shape of work + overlay.
@@ -205,10 +213,12 @@ def _tab_for_row(row: object) -> str:
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
         return _TAB_4IMAGES
+    if isinstance(row, YtCartoonRow):
+        return _TAB_YT_CARTOON
     if isinstance(row, CartoonRow):
         return _TAB_CARTOON
     # Unknown shape — give it the longest budget so we don't kill it prematurely.
-    return _TAB_CARTOON
+    return _TAB_YT_CARTOON
 
 
 def _env_timeout_override(tab: str) -> float | None:
@@ -289,6 +299,8 @@ async def _dispatch_to_processor(
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):
         return await process_4images_vo2_row(row, clients, job_id=job_id)
+    if isinstance(row, YtCartoonRow):
+        return await process_yt_cartoon_row(row, clients, job_id=job_id)
     if isinstance(row, CartoonRow):
         return await process_cartoon_row(row, clients, job_id=job_id)
     # Defensive — payload survived parsing but matched no known shape.
