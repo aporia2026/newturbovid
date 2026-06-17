@@ -170,9 +170,25 @@ def _format_planner_prompt(
 
 
 def _user_message(
-    article_body: str, open_comments: OpenCommentsAnalysis
+    article_body: str,
+    open_comments: OpenCommentsAnalysis,
+    *,
+    vertical: str = "",
+    country: str = "",
 ) -> str:
     parts: list[str] = []
+    # Give the planner the topic + audience signal so it can pick a character
+    # that FITS this row instead of defaulting to the same generic person every
+    # time (the recurring glasses-woman bug, Yoav 2026-06-17). Empty values are
+    # omitted so cartoon callers that don't pass them are unaffected.
+    ctx_bits: list[str] = []
+    if vertical.strip():
+        ctx_bits.append(f"vertical/topic: {vertical.strip()}")
+    if country.strip():
+        ctx_bits.append(f"target country/market: {country.strip()}")
+    if ctx_bits:
+        parts.append("CONTEXT (pick characters + scenes that fit this audience): "
+                     + "; ".join(ctx_bits))
     if open_comments.tone_hints:
         parts.append("TONE_HINTS: " + "; ".join(open_comments.tone_hints))
     if open_comments.directives:
@@ -559,7 +575,9 @@ async def generate_cartoon_plan(
             stage="cartoon_planner_prompt",
             matched_keyword=safety.matched_keyword,
         )
-    user = _user_message(article_body, open_comments)
+    user = _user_message(
+        article_body, open_comments, vertical=vertical, country=country
+    )
 
     _log.info(
         "cartoon_plan_submit",

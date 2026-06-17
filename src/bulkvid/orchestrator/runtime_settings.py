@@ -112,7 +112,7 @@ For EACH idea return:
 
 HARD RULES:
 1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all vehicles, products, and signage as plain and unbranded — no logos, badges, or readable license plates.
-2. Within one idea, keep ONE recurring main character and describe them IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
+2. Pick a main character whose age, gender, ethnicity, and look FIT this article's topic, vertical, and target country, and vary the character across different videos. Do NOT default to the same generic person every time — in particular, avoid always using a young woman with short dark hair and glasses. Then describe that ONE character IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
 3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus. Do not ask for words or numbers.
 4. Keep it tasteful and brand-safe.
 
@@ -151,7 +151,7 @@ COMPLIANCE — these are paid ads; the hook must be punchy but MUST NOT cross th
 
 HARD RULES (same as the calm style):
 1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (say 'a compact car', NOT 'a Volkswagen'). All vehicles, products, and signage are plain and unbranded — no logos, badges, or readable license plates.
-2. Within one idea, keep ONE recurring main character described IDENTICALLY across the shots (same age, hair, clothing) so the shots feel continuous.
+2. Pick a main character whose age, gender, ethnicity, and look genuinely FIT this article's topic, vertical, and target country, and make different videos use clearly DIFFERENT characters. Do NOT default to the same generic person every time — in particular, do NOT keep using a young woman with short dark hair and glasses unless the topic truly calls for it. Then describe that ONE chosen character IDENTICALLY across the shots (same age, hair, clothing) so the shots feel continuous.
 3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus.
 4. Keep it tasteful and brand-safe.
 
