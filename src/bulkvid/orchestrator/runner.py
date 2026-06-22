@@ -133,26 +133,46 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
 DEFAULT_STUCK_ROW_THRESHOLD_SECONDS = 300.0
 
 
-# Hard timeout around every libsql query the worker makes against the
-# shared queue. Without this, a single stalled Turso HTTP call blocks
-# the ``asyncio.to_thread`` worker thread INDEFINITELY, the runner's
-# main ``await`` never returns, no heartbeat fires, and the worker
-# silently hangs while jobs pile up in the queue. Chat 2026-06-09: the
-# operator saw exactly this — ``job_enqueued`` + ``active_jobs=1`` but
-# zero ``runner_heartbeat`` lines for 100+ seconds, so the worker was
-# deadlocked on an unresponsive libsql connection.
+# Time-boxing, discard-and-reconnect, and retry of every worker DB call now
+# live in ``JobQueue._run_db`` (queue.py) — the same machinery that hardened
+# the web path. The worker's ``claim_next_row`` / ``record_result`` /
+# ``recover_orphaned_rows`` route through it, so the runner no longer wraps
+# each query in its own ``asyncio.wait_for``: a stalled libsql roundtrip is
+# abandoned and the connection recycled INSIDE the call, and a call that
+# still fails after the wrapper's retries raises ``QueueUnavailable`` which
+# the loop handles below. Chat 2026-06-09 (worker hung on an unresponsive
+# libsql connection — fixed once for the web path, now for the worker too) +
+# Plan ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1.
 #
-# 30 s is loose enough to absorb a slow libsql roundtrip (we've seen
-# cold-start spikes ~5-10 s) but tight enough that a genuinely stalled
-# connection gets caught on the next ``poll_idle`` tick rather than
-# forever. Override via env var on a per-deploy basis.
-_WORKER_QUERY_TIMEOUT_SECONDS = float(
-    os.environ.get("BULKVID_WORKER_QUERY_TIMEOUT_SECONDS") or 30.0
-)
-# Brief backoff after a query timeout so a flapping Turso doesn't get
-# hammered. Independent of ``poll_idle_seconds`` (which controls the
-# normal idle cadence).
+# Brief backoff between failed claim attempts so a flapping/unreachable Turso
+# doesn't get hammered. Independent of ``poll_idle_seconds`` (the normal idle
+# cadence).
 _WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS = 2.0
+
+
+# ── Liveness watchdog (Plan 2026-06-22 §Prong 2) ────────────────────────────
+#
+# Prong 1 (reconnect via ``_run_db``) heals an expired/dropped Turso stream in
+# place. It CANNOT heal the rarer wedge where orphaned ``to_thread`` threads —
+# uncancellable, blocked inside libsql — exhaust the default
+# ``ThreadPoolExecutor`` (on a 2-vCPU box that pool is only ~6 threads), after
+# which even a reconnect attempt can't get a thread. The only recovery then is
+# a fresh process. supervisord ``autorestart=true`` restarts a process that
+# EXITS, but a hung-but-alive worker never exits — which is exactly why
+# operators had to click HF "Restart" by hand. The watchdog closes that gap:
+# after a run of consecutive claim failures it force-exits so supervisord
+# relaunches a clean process. It fires ONLY when nothing is in flight AND
+# nothing is buffered, so it can never kill paid work or strand a completed
+# result (which a restart would otherwise reprocess into a duplicate video).
+# At ~30-47 s per failed ``_run_db`` cycle plus backoff, the default of 6 is
+# ~5 minutes of continuous unreachability — well past any transient flap,
+# which prong 1 heals in one cycle (resetting the counter). Env-tunable.
+_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES = int(
+    os.environ.get("BULKVID_WORKER_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES") or 6
+)
+# Non-zero exit code so the force-exit reads as abnormal in supervisord's
+# logs; ``autorestart`` relaunches it regardless of the code.
+_WATCHDOG_EXIT_CODE = 1
 
 
 # Heartbeat cadence: number of consecutive empty polls before the runner
@@ -195,9 +215,9 @@ _RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS = 30.0
 # Time we wait, after ``request_shutdown``, for the drainer to flush the
 # pending queue before logging anything still stuck as
 # ``runner_pending_record_dropped``. Bounded so a clean shutdown isn't
-# blocked indefinitely by a non-responsive Turso. Tuned to ~1.5×
-# ``_WORKER_QUERY_TIMEOUT_SECONDS`` so the drainer has time to complete
-# at least one full per-call attempt before we cancel it.
+# blocked indefinitely by a non-responsive Turso. Sized comfortably above one
+# full ``_run_db`` cycle (per-call time-box × retries) so the drainer has time
+# to complete at least one attempt before we cancel it.
 _RECORD_RESULT_SHUTDOWN_DRAIN_BUDGET_SECONDS = 45.0
 # Buffer-size warning threshold — once the pending queue grows past this
 # many entries, every additional N (``_RECORD_RESULT_BACKLOG_LOG_EVERY``)
@@ -359,6 +379,10 @@ class BatchRunner:
             tuple[int, RowResult, int, float]
         ] = asyncio.Queue()
         self._next_backlog_warn_at: int = _RECORD_RESULT_BACKLOG_THRESHOLD
+        # Liveness watchdog: consecutive claim failures, reset on any success
+        # (including an empty-queue ``None``, which still proves the connection
+        # is alive). Drives ``_maybe_watchdog_exit``. Plan 2026-06-22 §Prong 2.
+        self._consecutive_claim_failures: int = 0
 
     def request_shutdown(self) -> None:
         _log.info("runner_shutdown_requested")
@@ -389,23 +413,31 @@ class BatchRunner:
             # constant lives at module scope so tests can patch it.
             _polls_since_heartbeat = 0
             while not self._shutdown.is_set():
-                # Hard timeout around the libsql claim query. A stalled
-                # Turso HTTP roundtrip would otherwise hang this await
-                # forever — no heartbeat, no recovery (chat 2026-06-09).
+                # ``claim_next_row`` now self-heals (time-box + discard-and-
+                # reconnect + retry) inside ``_run_db`` (queue.py), so the
+                # runner no longer wraps it in its own ``asyncio.wait_for``. A
+                # claim that still fails after that raises (``QueueUnavailable``
+                # or anything else); count it for the liveness watchdog, back
+                # off, and carry on — the loop must never die. Plan
+                # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md``.
                 try:
-                    queued = await asyncio.wait_for(
-                        self._queue.claim_next_row(),
-                        timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
-                    )
-                except TimeoutError:
+                    queued = await self._queue.claim_next_row()
+                except Exception as e:    # noqa: BLE001 — runner must keep running
+                    self._consecutive_claim_failures += 1
                     _log.warning(
-                        "runner_claim_timeout",
-                        timeout_s=_WORKER_QUERY_TIMEOUT_SECONDS,
+                        "runner_claim_failed",
+                        error=str(e)[:200],
+                        error_type=type(e).__name__,
+                        consecutive=self._consecutive_claim_failures,
                         backoff_s=_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS,
                     )
-                    # Brief backoff so a flapping libsql doesn't get
-                    # pummeled, then continue the loop. Shutdown still
-                    # interrupts via the wait_for below.
+                    # Last-resort backstop: a worker wedged past in-place
+                    # recovery force-exits so supervisord relaunches a clean
+                    # process — but ONLY when nothing is in flight and nothing
+                    # is buffered (see ``_maybe_watchdog_exit``).
+                    self._maybe_watchdog_exit()
+                    # Brief backoff so a flapping/unreachable libsql isn't
+                    # hammered; shutdown still interrupts via the wait below.
                     try:
                         await asyncio.wait_for(
                             self._shutdown.wait(),
@@ -414,16 +446,9 @@ class BatchRunner:
                     except TimeoutError:
                         pass
                     continue
-                except Exception as e:    # noqa: BLE001 — runner must keep running
-                    _log.exception("runner_claim_error", error=str(e))
-                    try:
-                        await asyncio.wait_for(
-                            self._shutdown.wait(),
-                            timeout=_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS,
-                        )
-                    except TimeoutError:
-                        pass
-                    continue
+                # A successful claim — even an empty-queue ``None`` — proves the
+                # connection is alive, so reset the watchdog counter.
+                self._consecutive_claim_failures = 0
                 if queued is None:
                     _polls_since_heartbeat += 1
                     if _polls_since_heartbeat >= _HEARTBEAT_EVERY:
@@ -518,6 +543,44 @@ class BatchRunner:
     def _on_task_done(self, task: asyncio.Task) -> None:
         self._in_flight.pop(task, None)
         self._sem.release()
+
+    def _maybe_watchdog_exit(self) -> None:
+        """Force-exit a wedged worker so supervisord relaunches a clean process.
+
+        Fires ONLY when ALL of:
+          * consecutive claim failures have reached the threshold (in-place
+            reconnect via ``_run_db`` has not recovered for ~minutes), AND
+          * nothing is in flight (``in_flight_count == 0``) — so no row is
+            mid-pipeline and no paid-API work is killed, AND
+          * nothing is buffered (``pending_records_count == 0``) — so no
+            completed-but-unrecorded result is lost; on the next boot
+            ``recover_orphaned_rows`` would reset such a row PROCESSING->PENDING
+            and reprocess it (duplicate video + duplicate spend).
+
+        Under those gates the process holds nothing worth saving, so a hard
+        ``os._exit`` is pure recovery. ``os._exit`` (not ``sys.exit``) bypasses
+        interpreter cleanup so a wedged process can't hang on the way out. Plan
+        ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 2.
+        """
+        if (
+            self._consecutive_claim_failures
+            < _WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES
+        ):
+            return
+        if self.in_flight_count != 0 or self.pending_records_count != 0:
+            # Something to lose — keep spinning (and keep trying to reconnect)
+            # rather than risk killing paid work or stranding a result.
+            return
+        _log.error(
+            "runner_watchdog_exit",
+            consecutive_claim_failures=self._consecutive_claim_failures,
+            threshold=_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES,
+            note=(
+                "worker wedged with nothing in flight or buffered; forcing "
+                "restart so supervisord relaunches a clean process"
+            ),
+        )
+        os._exit(_WATCHDOG_EXIT_CODE)
 
     async def _emit_heartbeat(self, *, idle: bool) -> None:
         """Log a heartbeat. Always enumerates stuck in-flight rows.
@@ -627,49 +690,35 @@ class BatchRunner:
                 error=f"unhandled: {e!s}",
             )
 
-        # Same timeout discipline as the claim above: a stalled libsql
-        # write would otherwise pin this task forever and silently leak a
-        # semaphore slot. ``record_result`` is idempotent on retry because
-        # the SET writes the same status; getting through eventually is
-        # more important than waiting indefinitely on a hung roundtrip.
-        #
-        # Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §A: when the
-        # primary attempt fails (TimeoutError or any other exception), we
-        # MUST NOT drop the result on the floor. The old behaviour left
-        # the row stuck in PROCESSING in the DB while the sheet still got
-        # the URLs via the decoupled CoalescedSheetWriter. Buffer onto
-        # ``_pending_records`` so the drainer task can retry later;
-        # ``_write_back`` continues to fire so the sheet still lands.
-        record_failed = False
-        record_error: str = ""
+        # ``record_result`` self-heals inside ``_run_db`` (time-box +
+        # discard-and-reconnect + retry); it is idempotent on retry because
+        # the SET writes the same status. If it STILL fails after the
+        # wrapper's retries (``QueueUnavailable`` or any other error), the
+        # result MUST NOT be dropped: the old behaviour left the row stuck in
+        # PROCESSING in the DB while the sheet still got the URLs via the
+        # decoupled CoalescedSheetWriter. Buffer onto ``_pending_records`` so
+        # the drainer retries later; ``_write_back`` below still fires so the
+        # sheet lands regardless. Plan
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` +
+        # ``_plans/2026-06-14-stuck-processing-rows.md`` §A.
         try:
-            await asyncio.wait_for(
-                self._queue.record_result(queued.id, result),
-                timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            record_failed = True
-            record_error = f"timeout after {_WORKER_QUERY_TIMEOUT_SECONDS}s"
+            await self._queue.record_result(queued.id, result)
+        except Exception as e:    # noqa: BLE001 — never drop a result on the floor
             _log.warning(
-                "runner_record_result_timeout",
+                "runner_record_result_failed",
                 queued_id=queued.id,
-                timeout_s=_WORKER_QUERY_TIMEOUT_SECONDS,
+                error=str(e)[:200],
+                error_type=type(e).__name__,
             )
-        except Exception as e:
-            record_failed = True
-            record_error = f"{type(e).__name__}: {e!s}"[:200]
-            _log.exception("runner_record_result_failed", error=str(e))
-
-        if record_failed:
-            self._buffer_pending_record(queued.id, result, reason=record_error)
+            self._buffer_pending_record(
+                queued.id, result, reason=f"{type(e).__name__}: {e!s}"[:200]
+            )
 
         # Look up the job's sheet routing so the writer can flush without
-        # a second queue hit. If the job vanished mid-run, skip silently.
+        # a second queue hit. ``get_job`` self-heals via ``_run_db``; if the
+        # job vanished mid-run, skip silently.
         try:
-            job = await asyncio.wait_for(
-                self._queue.get_job(queued.job_id),
-                timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
-            )
+            job = await self._queue.get_job(queued.job_id)
             if job is None:
                 return
             write = PendingWrite(
@@ -779,10 +828,8 @@ class BatchRunner:
 
             attempts += 1
             try:
-                await asyncio.wait_for(
-                    self._queue.record_result(queued_id, result),
-                    timeout=_WORKER_QUERY_TIMEOUT_SECONDS,
-                )
+                # record_result self-heals via _run_db; no outer wait_for here.
+                await self._queue.record_result(queued_id, result)
                 _log.info(
                     "runner_record_result_recovered",
                     queued_id=queued_id,

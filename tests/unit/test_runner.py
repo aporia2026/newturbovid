@@ -506,62 +506,71 @@ async def test_heartbeat_quiet_when_no_rows_stuck(
     fake_log.warning.assert_not_called()
 
 
-async def test_runner_loop_survives_claim_timeout(
+async def test_runner_loop_survives_claim_failure(
     queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression for chat 2026-06-09: a stalled libsql ``claim_next_row``
-    call would hang the worker's ``await`` forever, no heartbeat fires,
-    the queue piles up. With ``asyncio.wait_for`` wrapping the claim, a
-    stuck call times out, logs ``runner_claim_timeout``, backs off
-    briefly, and the loop continues — proving the worker is no longer
-    pinned by a single bad libsql HTTP roundtrip.
+    """A claim that keeps failing must NOT pin the worker.
+
+    Time-boxing + discard-and-reconnect now live INSIDE ``claim_next_row``
+    (via ``JobQueue._run_db``), so a stalled libsql roundtrip is abandoned and
+    the connection recycled within the call; only a claim that still fails
+    after that budget raises (e.g. ``QueueUnavailable`` on a fully unreachable
+    Turso). When it does, the loop logs ``runner_claim_failed``, backs off, and
+    keeps cycling — proving the worker is no longer pinned by a bad connection.
+    The "stalled call gets time-boxed" guarantee itself is covered at the
+    ``_run_db`` layer in ``test_queue_resilience.py``. Plan
+    ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1.
     """
     from unittest.mock import MagicMock
 
-    # Shrink the timeouts so the test doesn't have to wait 30 seconds.
-    monkeypatch.setattr(runner_mod, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(runner_mod, "_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS", 0.01)
+    # Keep the watchdog out of this test — we're proving loop survival, not the
+    # force-exit backstop (covered separately). A huge threshold never trips.
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 10_000
+    )
     fake_log = MagicMock()
     monkeypatch.setattr(runner_mod, "_log", fake_log)
 
-    # Replace claim_next_row with a never-returning coroutine to simulate
-    # a stalled libsql HTTP roundtrip.
+    # Replace claim_next_row with one that always raises — what the worker sees
+    # after ``_run_db`` exhausts its reconnect+retry budget against a dead DB.
     call_count = {"n": 0}
 
-    async def _stuck_claim() -> None:
+    async def _failing_claim() -> None:
         call_count["n"] += 1
-        await asyncio.Event().wait()    # never returns
+        raise RuntimeError("simulated unreachable Turso")
 
-    monkeypatch.setattr(queue, "claim_next_row", _stuck_claim)
+    monkeypatch.setattr(queue, "claim_next_row", _failing_claim)
 
     runner = BatchRunner(
         queue, _make_dummy_clients(),
         max_concurrent=1, poll_idle_seconds=0.01,
     )
 
-    async def _shutdown_after_timeouts() -> None:
-        # Wait for at least two claim attempts -> proves the loop
-        # cycled past a stuck call (didn't deadlock).
+    async def _shutdown_after_failures() -> None:
+        # Wait for at least two claim attempts -> proves the loop cycled past a
+        # failed call (didn't deadlock or die).
         while call_count["n"] < 2:
             await asyncio.sleep(0.02)
         runner.request_shutdown()
 
     await asyncio.wait_for(
-        asyncio.gather(runner.run(), _shutdown_after_timeouts()),
+        asyncio.gather(runner.run(), _shutdown_after_failures()),
         timeout=3.0,
     )
 
-    # Saw at least two attempts (loop didn't hang on the first).
+    # Saw at least two attempts (loop didn't hang or crash on the first).
     assert call_count["n"] >= 2
-    # Logged the timeout warning at least once.
-    timeout_warnings = [
+    # Logged the failure warning, and the consecutive counter climbed.
+    failed_warnings = [
         c for c in fake_log.warning.call_args_list
-        if c.args and c.args[0] == "runner_claim_timeout"
+        if c.args and c.args[0] == "runner_claim_failed"
     ]
-    assert timeout_warnings, (
-        f"expected at least one 'runner_claim_timeout' warning, saw: "
+    assert failed_warnings, (
+        f"expected at least one 'runner_claim_failed' warning, saw: "
         f"{fake_log.warning.call_args_list!r}"
     )
+    assert failed_warnings[-1].kwargs["consecutive"] >= 2
 
 
 async def test_runner_loop_survives_heartbeat_settings_store_error(
@@ -650,9 +659,6 @@ async def test_record_result_failure_buffers_and_recovers(
 
     # Speed up the test: tiny budgets, no minute-long sleeps.
     import bulkvid.orchestrator.runner as runner_mod_inner
-    monkeypatch.setattr(
-        runner_mod_inner, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.5,
-    )
     monkeypatch.setattr(
         runner_mod_inner, "_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS", 0.05,
     )
@@ -753,9 +759,6 @@ async def test_record_result_persistent_failure_logs_giveup(
 
     import bulkvid.orchestrator.runner as runner_mod_inner
     monkeypatch.setattr(
-        runner_mod_inner, "_WORKER_QUERY_TIMEOUT_SECONDS", 0.1,
-    )
-    monkeypatch.setattr(
         runner_mod_inner, "_RECORD_RESULT_RETRY_MAX_BACKOFF_SECONDS", 0.02,
     )
     # 0.3 s budget so we trip the give-up condition fast.
@@ -855,3 +858,147 @@ async def test_pending_drainer_starts_and_stops(
     ]
     assert "runner_pending_drainer_start" in info_first_args
     assert "runner_pending_drainer_stop" in info_first_args
+
+
+# ── Liveness watchdog (Plan 2026-06-22 §Prong 2) ────────────────────────────
+#
+# The watchdog force-exits a worker that has been unable to claim for a run of
+# attempts so supervisord relaunches a clean process — but ONLY when nothing is
+# in flight and nothing is buffered, so it can never burn paid work or strand a
+# completed result (which a restart would reprocess into a duplicate video).
+
+
+def test_watchdog_exits_when_wedged_idle_and_unbuffered(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At/over the threshold with nothing in flight AND nothing buffered, the
+    watchdog calls ``os._exit`` so supervisord restarts a clean process."""
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 3
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+    runner._consecutive_claim_failures = 3
+    # Fresh runner: in_flight == 0 and pending_records == 0 by construction.
+    runner._maybe_watchdog_exit()
+
+    assert exits == [runner_mod._WATCHDOG_EXIT_CODE]
+
+
+def test_watchdog_does_not_exit_below_threshold(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One short flap (counter below the threshold) must never force-exit."""
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 5
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+    runner._consecutive_claim_failures = 4    # below 5
+    runner._maybe_watchdog_exit()
+
+    assert exits == []
+
+
+async def test_watchdog_does_not_exit_when_rows_in_flight(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even past the threshold, the watchdog must NOT kill the process while a
+    row is mid-pipeline — that would burn paid API spend."""
+    import time
+
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 2
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=2)
+    runner._consecutive_claim_failures = 5    # well over the threshold
+
+    async def _block() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_block())
+    runner._in_flight[task] = runner_mod._RowMeta(
+        start_monotonic=time.monotonic(),
+        queued_id=1, job_id="j", row_num=1, tab="image_vo",
+    )
+    try:
+        runner._maybe_watchdog_exit()
+        assert exits == []    # in-flight paid work -> must not exit
+    finally:
+        task.cancel()
+        try:
+            await task
+        except BaseException:    # noqa: BLE001 — best-effort cleanup
+            pass
+
+
+def test_watchdog_does_not_exit_when_records_buffered(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed-but-unrecorded result in the retry buffer blocks the
+    watchdog: restarting would reset that row PROCESSING->PENDING on the next
+    boot and reprocess it (duplicate video + duplicate spend)."""
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 2
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=1)
+    runner._consecutive_claim_failures = 5
+    runner._pending_records.put_nowait(
+        (1, RowResult(row_num=1, status=STATUS_SUCCESS), 0, 0.0)
+    )
+    runner._maybe_watchdog_exit()
+
+    assert exits == []
+
+
+async def test_watchdog_counter_resets_on_successful_claim(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful claim — even an empty-queue ``None`` — clears the
+    consecutive-failure counter, so transient flaps never accumulate toward the
+    watchdog threshold."""
+    monkeypatch.setattr(runner_mod, "_WORKER_QUERY_TIMEOUT_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES", 10_000
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    seq = {"n": 0}
+
+    async def _fail_twice_then_empty():
+        seq["n"] += 1
+        if seq["n"] <= 2:
+            raise RuntimeError("flap")
+        return None    # success: empty queue, proves the connection is alive
+
+    monkeypatch.setattr(queue, "claim_next_row", _fail_twice_then_empty)
+
+    runner = BatchRunner(
+        queue, _make_dummy_clients(),
+        max_concurrent=1, poll_idle_seconds=0.01,
+    )
+
+    async def _shutdown_after_recovery() -> None:
+        # Two failures then at least two empty-queue successes.
+        while seq["n"] < 4:
+            await asyncio.sleep(0.01)
+        runner.request_shutdown()
+
+    await asyncio.wait_for(
+        asyncio.gather(runner.run(), _shutdown_after_recovery()),
+        timeout=3.0,
+    )
+
+    assert runner._consecutive_claim_failures == 0
+    assert exits == []    # never reached the (huge) threshold

@@ -82,17 +82,20 @@ TAB_AVATAR = "avatar"
 IDEMPOTENCY_TTL_SECONDS = 86_400
 
 
-# ── Web-path DB resilience (Turso flap hardening) ───────────────────────────
+# ── DB resilience (Turso flap hardening) — shared by web AND worker ──────────
 #
-# The submit/poll endpoints talk to Turso (remote libSQL) over HTTPS — every
-# statement is a network round-trip that can flap. The WORKER side already
-# survives this (hard ``asyncio.wait_for`` timeout + broad ``except`` + retry
-# buffer, runner.py); the web path historically did not, so a single flap
-# during ``enqueue`` bubbled as a bare HTTP 500 and a wedged connection stayed
-# wedged until the process restarted. ``JobQueue._run_db`` mirrors the worker's
-# discipline on the web path: time-box each call, and on ANY failure throw the
-# connection away, open a fresh one, and retry before giving up with a 503.
-# Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md``.
+# Every statement is an HTTPS round-trip to Turso (remote libSQL) that can flap;
+# Hrana streams also expire after ~10s idle and the libsql client does not
+# auto-recover. ``JobQueue._run_db`` is the single place that survives this:
+# time-box each call, and on ANY failure throw the connection away, open a
+# fresh one, back off, and retry before giving up. The submit/poll endpoints
+# route through it (a flap during ``enqueue`` becomes a 503 the Apps Script
+# retries, not a bare HTTP 500 — Plan
+# ``_plans/2026-06-17-submit-500s-turso-resilience.md``), and so does the
+# worker hot loop — ``claim_next_row`` / ``record_result`` /
+# ``recover_orphaned_rows`` — so a wedged worker self-heals instead of
+# spinning forever on a dead connection (Plan
+# ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md``).
 #
 # 15 s is loose enough to absorb a slow Turso roundtrip (cold-start spikes
 # ~5-10 s) and tight enough to beat the Apps Script's 30 s UrlFetch cap. All
@@ -1198,12 +1201,23 @@ class JobQueue:
         return job_id
 
     async def claim_next_row(self) -> QueuedRow | None:
-        async with self._lock:
-            return await asyncio.to_thread(self._claim_next_row_sync)
+        # Routed through ``_run_db`` so the WORKER hot loop self-heals from an
+        # expired/dropped Turso (Hrana) stream exactly like the web path:
+        # time-box, discard-and-reconnect, retry. ``_run_db`` acquires
+        # ``self._lock`` itself, so this MUST NOT also wrap in
+        # ``async with self._lock`` — ``asyncio.Lock`` is not reentrant and a
+        # second acquire would deadlock the worker on its first claim. Plan
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1.
+        return await self._run_db(self._claim_next_row_sync, op="claim_next_row")
 
     async def record_result(self, queue_id: int, result: RowResult) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._record_result_sync, queue_id, result)
+        # Same self-healing path as ``claim_next_row``; ``_run_db`` holds the
+        # lock, so do NOT re-lock here (non-reentrant). On exhaustion it raises
+        # ``QueueUnavailable``; the runner catches that and buffers the result
+        # onto its retry queue so nothing is dropped.
+        await self._run_db(
+            self._record_result_sync, queue_id, result, op="record_result"
+        )
 
     async def get_job(self, job_id: str) -> Job | None:
         return await self._run_db(self._get_job_sync, job_id, op="get_job")
@@ -1277,9 +1291,14 @@ class JobQueue:
         return n_jobs, n_rows
 
     async def recover_orphaned_rows(self) -> int:
-        """Call on worker startup: rows stuck in PROCESSING are released."""
-        async with self._lock:
-            n = await asyncio.to_thread(self._recover_orphaned_rows_sync)
+        """Call on worker startup: rows stuck in PROCESSING are released.
+
+        Routed through ``_run_db`` (self-healing) so a Turso flap at boot
+        reconnects and retries instead of failing the worker before it can
+        drain anything. ``_run_db`` takes the lock; no second lock here."""
+        n = await self._run_db(
+            self._recover_orphaned_rows_sync, op="recover_orphaned_rows"
+        )
         if n > 0:
             _log.warning("orphaned_rows_recovered", count=n)
         return n
