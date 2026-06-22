@@ -159,6 +159,36 @@ Return STRICT JSON only, shaped exactly like:
 {{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
 
 
+# ── simple-motion planner prompt (Yoav 2026-06-22) ───────────────────────────
+#
+# The simple-motion tab animates SUPER-REALISTIC photographs, not cartoons. It
+# reuses the cartoon planner (same JSON shape, same placeholders, same hard
+# brand-safety + complete-sentence rules) but the scene descriptions must read as
+# real, photographic scenes — otherwise the planner's "cartoon scene" wording
+# fights ``REALISTIC_STYLE`` in the image prompt. ``num_ideas`` is 1 and
+# ``num_shots`` is 2 for this tab (one 8s video, two 4s shots). Plan:
+# ``_plans/2026-06-22-simple-motion-tab.md``.
+SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT = """You are a creative director making SHORT, realistic, live-action-style social videos from a news article. You plan believable PHOTOGRAPHIC scenes and a tight voiceover.
+
+Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate ~6-7 second video told in exactly {num_shots} shots.
+
+For EACH idea return:
+- voiceover: ONE short spoken line in {language}, about {target_words} words ({min_words}-{max_words}), natural and engaging, readable in ~6-7 seconds. MUST be a COMPLETE THOUGHT that ends in a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition — finish the sentence. The final word should feel CONCLUSIVE — a strong noun or an action verb that lands the thought. AVOID ending on a bare adjective ("independent", "smart", "ready", "different") or an abstract noun that begs a follow-up — the line must feel finished on first listen.
+- style_direction: a short delivery hint for the voice actor.
+- shots: an array of exactly {num_shots} shots, each with:
+    * scene: a vivid description of ONE realistic, photographic scene (real-looking person or setting, subject, framing, lighting). Vertical composition. Describe it as a real photo or live footage — NOT a cartoon, illustration, or animation.
+    * motion: how that scene should gently animate (small, natural movements and subtle, cinematic camera moves).
+
+HARD RULES:
+1. Use GENERIC, ordinary people and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all vehicles, products, and signage as plain and unbranded — no logos, badges, or readable license plates.
+2. Pick a main subject whose age, gender, ethnicity, and look FIT this article's topic, vertical, and target country, and vary the subject across different videos. Do NOT default to the same generic person every time. Then describe that ONE subject IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
+3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus. Do not ask for words or numbers.
+4. Keep it tasteful and brand-safe.
+
+Return STRICT JSON only, shaped exactly like:
+{{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
+
+
 # ── Sensitive-apparel safeguard (Evgeny 2026-06-04) ──────────────────────────
 
 SENSITIVE_APPAREL_RULES_DEFAULT = """SENSITIVE APPAREL: STRICT VISUAL RULES
@@ -255,6 +285,8 @@ SETTING_SIMPLE_X4_SCRIPT_PROMPT = "simple_x4_script_prompt"
 SETTING_CARTOON_PLANNER_PROMPT = "cartoon_planner_prompt"
 # yt-cartoon "engaging" Tone planner prompt (Yoav 2026-06-17).
 SETTING_YT_CARTOON_ENGAGING_PROMPT = "yt_cartoon_engaging_planner_prompt"
+# simple-motion realistic planner prompt (Yoav 2026-06-22).
+SETTING_SIMPLE_MOTION_PLANNER_PROMPT = "simple_motion_planner_prompt"
 SETTING_SENSITIVE_APPAREL_RULES = "sensitive_apparel_rules"
 SETTING_SENSITIVE_APPAREL_KEYWORDS = "sensitive_apparel_keywords"
 
@@ -268,6 +300,9 @@ SETTING_ROW_TIMEOUT_CARTOON = "row_timeout_cartoon_seconds"
 # yt-cartoon reuses cartoon's multi-shot pipeline but can run longer (up to 5
 # shots on the 20s bucket), so it gets its own (larger-headroom) timeout key.
 SETTING_ROW_TIMEOUT_YT_CARTOON = "row_timeout_yt_cartoon_seconds"
+# simple-motion runs cartoon's pipeline but with ONE idea (1 video, ≤2 generated
+# images) — same multi-shot ceiling as cartoon is plenty of headroom.
+SETTING_ROW_TIMEOUT_SIMPLE_MOTION = "row_timeout_simple_motion_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -334,6 +369,20 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "'calm' falls back to the Cartoon planner prompt above. Same "
             "{language}, {num_ideas}, {num_shots}, {target_words}, "
             "{min_words}, {max_words} placeholders."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_SIMPLE_MOTION_PLANNER_PROMPT,
+        label="simple-motion: planner prompt",
+        default=SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT,
+        multiline=True,
+        description=(
+            "System prompt for the simple-motion tab — plans SUPER-REALISTIC "
+            "photographic scenes + an article-driven voiceover (not cartoons). "
+            "Same {language}, {num_ideas}, {num_shots}, {target_words}, "
+            "{min_words}, {max_words} placeholders as the Cartoon prompt. The "
+            "tab generates only the images a row leaves blank; pasted images "
+            "(columns D/E) are animated as-is."
         ),
     ),
     SettingDef(
@@ -409,6 +458,17 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "Hard wall-clock budget for a yt-cartoon-tab row (planner + up to "
             "5 shots on the 20s bucket). Larger than Cartoon's headroom. Env "
             "BULKVID_ROW_TIMEOUT_SECONDS_YT_CARTOON overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
+        label="Row timeout: simple-motion (seconds)",
+        default="1200",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a simple-motion-tab row (planner + 2 "
+            "shots, image-gen and/or manual-image re-upload). Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_SIMPLE_MOTION overrides."
         ),
     ),
     SettingDef(

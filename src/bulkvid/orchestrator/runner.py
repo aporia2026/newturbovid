@@ -35,6 +35,7 @@ from bulkvid.models.row import (
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
+    SimpleMotionRow,
     SimpleRow,
     SimpleX4Row,
     TextOnImgRow,
@@ -47,6 +48,7 @@ from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
+from bulkvid.orchestrator.row_processor_simple_motion import process_simple_motion_row
 from bulkvid.orchestrator.row_processor_simple_x4 import process_simple_x4_row
 from bulkvid.orchestrator.row_processor_text_on_img import process_text_on_img_row
 from bulkvid.orchestrator.row_processor_yt_cartoon import process_yt_cartoon_row
@@ -55,6 +57,7 @@ from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_CARTOON,
     SETTING_ROW_TIMEOUT_IMAGE_VO,
     SETTING_ROW_TIMEOUT_SIMPLE,
+    SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
     SETTING_ROW_TIMEOUT_YT_CARTOON,
     SETTING_STUCK_ROW_THRESHOLD,
 )
@@ -77,6 +80,7 @@ _log = get_logger("runner")
 # Cartoon legitimately runs ~3x longer than the others (planner + N shots).
 
 _TAB_SIMPLE = "simple"
+_TAB_SIMPLE_MOTION = "simple_motion"
 _TAB_IMAGE_VO = "image_vo"
 _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
@@ -90,6 +94,9 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_IMAGE_VO: 900.0,       # 15 min — image gen is heavier
     _TAB_4IMAGES: 720.0,        # 12 min
     _TAB_CARTOON: 1200.0,       # 20 min — planner + multi-shot
+    # simple-motion runs cartoon's pipeline with ONE idea (1 video, ≤2 generated
+    # images and/or manual-image re-uploads). Same 20-min ceiling is ample.
+    _TAB_SIMPLE_MOTION: 1200.0,
     # yt-cartoon runs cartoon's pipeline but with up to 5 shots (20s bucket),
     # so it gets more headroom than the flat-8s cartoon tab.
     _TAB_YT_CARTOON: 1500.0,    # 25 min
@@ -111,6 +118,7 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_IMAGE_VO: SETTING_ROW_TIMEOUT_IMAGE_VO,
     _TAB_4IMAGES: SETTING_ROW_TIMEOUT_4IMAGES,
     _TAB_CARTOON: SETTING_ROW_TIMEOUT_CARTOON,
+    _TAB_SIMPLE_MOTION: SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
     _TAB_YT_CARTOON: SETTING_ROW_TIMEOUT_YT_CARTOON,
     # simple_x4 reuses the image_vo timeout setting — same shape of work.
     _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
@@ -203,6 +211,8 @@ def _tab_for_row(row: object) -> str:
     """Map a row instance to the timeout tab name."""
     if isinstance(row, SimpleRow):
         return _TAB_SIMPLE
+    if isinstance(row, SimpleMotionRow):
+        return _TAB_SIMPLE_MOTION
     if isinstance(row, SimpleX4Row):
         return _TAB_SIMPLE_X4
     if isinstance(row, TextOnImgRow):
@@ -289,6 +299,8 @@ async def _dispatch_to_processor(
     """
     if isinstance(row, SimpleRow):
         return await process_simple_row(row, clients, job_id=job_id)
+    if isinstance(row, SimpleMotionRow):
+        return await process_simple_motion_row(row, clients, job_id=job_id)
     if isinstance(row, SimpleX4Row):
         return await process_simple_x4_row(row, clients, job_id=job_id)
     if isinstance(row, TextOnImgRow):

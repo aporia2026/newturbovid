@@ -246,6 +246,42 @@ class YtCartoonRow:
 
 
 @dataclass
+class SimpleMotionRow:
+    """simple-motion tab input row — animate super-realistic images.
+
+    A sibling of :class:`CartoonRow` (same article-driven planner / TTS-sizing /
+    CTA / ZapCap / Rendi pipeline) with two differences:
+
+      * Images are SUPER-REALISTIC photographs, not cartoons (the row processor
+        prepends ``REALISTIC_STYLE`` instead of ``CARTOON_STYLE`` and uses the
+        ``simple_motion_planner_prompt`` which describes photographic scenes).
+      * The operator can paste their OWN images. ``manual_image_1`` (sheet col D)
+        is shot 1; ``manual_image_2`` (col E) is shot 2. A blank cell is
+        auto-generated; a filled cell is animated as-is. So a row produces ONE
+        8-second video (two 4s shots stitched), written to Ready Video 1.
+
+    Same CTA columns as cartoon (Yoav 2026-06-08 pattern). The cartoon /
+    yt-cartoon orchestration is untouched — this is a separate row + processor
+    that REUSES the shared helpers. Plan:
+    ``_plans/2026-06-22-simple-motion-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_1: str               # col D — blank → generate; filled → as-is
+    manual_image_2: str               # col E — blank → generate; filled → as-is
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # mirrors cartoon — yellow pill at bottom
+    cta_text: str = ""                # operator text; empty = per-language default
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 

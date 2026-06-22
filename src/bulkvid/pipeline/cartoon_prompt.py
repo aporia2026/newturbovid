@@ -59,6 +59,17 @@ CARTOON_STYLE = (
     "colors, modern 2D animated-film look."
 )
 
+# Super-realistic look for the ``simple-motion`` tab. Passed to
+# ``image_prompt_for_shot(style=…)`` so generated shots come out as believable
+# photographs, NOT illustrations. The trailing "not an illustration, render, or
+# cartoon" is load-bearing — it keeps nano-banana-2 from drifting back toward the
+# stylised default. Plan ``_plans/2026-06-22-simple-motion-tab.md``.
+REALISTIC_STYLE = (
+    "Ultra-realistic photograph, true-to-life detail, natural lighting, "
+    "authentic colors and textures, shallow depth of field, shot on a "
+    "full-frame camera — photorealistic, not an illustration, render, or cartoon."
+)
+
 # Each voiceover targets ~5-6 seconds of speech, sized so that even at the slow
 # end of the Gemini TTS rate (~1.5 wps observed after the 1.3x speed-up), the
 # full line fits inside the cartoon row processor's hard 8.0s video ceiling
@@ -209,13 +220,19 @@ def _user_message(
     return "\n\n".join(parts)
 
 
-def image_prompt_for_shot(scene: str, *, is_chained: bool) -> str:
+def image_prompt_for_shot(
+    scene: str, *, is_chained: bool, style: str = CARTOON_STYLE
+) -> str:
     """Compose the full nano-banana-2 prompt for one shot.
 
-    Prepends the shared cartoon STYLE; for chained (shot 2+) shots, appends the
+    Prepends the given visual ``style``; for chained (shot 2+) shots, appends the
     consistency clause so the image-to-image step holds the character.
+
+    ``style`` defaults to ``CARTOON_STYLE`` so the cartoon / yt-cartoon callers
+    are byte-identical; the simple-motion tab passes ``REALISTIC_STYLE`` for
+    photographic shots.
     """
-    base = f"{CARTOON_STYLE} {scene.strip()} {NO_BRANDING}"
+    base = f"{style} {scene.strip()} {NO_BRANDING}"
     return f"{base} {CONSISTENCY_CLAUSE}" if is_chained else base
 
 

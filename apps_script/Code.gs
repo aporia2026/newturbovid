@@ -14,6 +14,7 @@
 const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
+const TAB_SIMPLE_MOTION = 'simple_motion';
 const TAB_CARTOON = 'cartoon';
 const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
@@ -120,6 +121,22 @@ const CARTOON_COLS = {
   openComments: 11,
   readyVideo1: 12, readyVideo2: 13,
   lastInputCol: 11,
+};
+
+// simple-motion tab (2026-06-22): animate super-realistic images. Image-VO A-C,
+// then TWO Manual Image columns (D = shot 1, E = shot 2), then Voice Over /
+// ZapCap / Change Size / Script Pattern, then CTA + CTA Text (mirrors cartoon),
+// then Open Comments + Ready Video. Read by HEADER NAME first (like avatar /
+// yt-cartoon) so inserting/moving columns can't corrupt the read; these
+// positional values are the fallback. ONE video per row → Ready Video 1 (M).
+const SIMPLE_MOTION_COLS = {
+  country: 1, vertical: 2, article: 3,
+  manualImage1: 4, manualImage2: 5,
+  voiceOver: 6, zapcap: 7, aspectRatio: 8, scriptPattern: 9,
+  ctaEnabled: 10, ctaText: 11,
+  openComments: 12,
+  readyVideo1: 13, readyVideo2: 14,
+  lastInputCol: 12,
 };
 
 // yt-cartoon tab (2026-06-17): the cartoon layout PLUS four new columns
@@ -239,6 +256,12 @@ function _detectTabType(sheet) {
   // shape. Must be checked BEFORE plain "simple" since the name contains it.
   if (name.indexOf('x4') !== -1) {
     return _isSimpleX4Migrated(sheet) ? TAB_SIMPLE_X4 : TAB_IMAGE_VO;
+  }
+  // "simple-motion" -> animate super-realistic images (manual D/E or generated).
+  // MUST be checked BEFORE the generic "simple" match below, since the name
+  // "simple-motion" contains "simple".
+  if (name.indexOf('simple-motion') !== -1 || name.indexOf('simple motion') !== -1) {
+    return TAB_SIMPLE_MOTION;
   }
   // "simple" -> ONE video from the existing Manual Image, NO image generation.
   if (name.indexOf('simple') !== -1) return TAB_SIMPLE;
@@ -426,6 +449,49 @@ function _readCartoonRow(sheet, rowNum) {
 }
 
 
+function _readSimpleMotionRow(sheet, rowNum) {
+  // simple-motion: cartoon-style inputs PLUS two Manual Image columns (D = shot
+  // 1, E = shot 2). Every column is resolved by HEADER NAME first (mirrors
+  // _readAvatarRow / _readYtCartoonRow) so the operator can insert/move columns
+  // without breaking the read; the SIMPLE_MOTION_COLS positional index is the
+  // fallback. A blank image cell → the backend generates a realistic image; a
+  // filled cell → the backend animates it as-is.
+  const cols = SIMPLE_MOTION_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage1 = _colForHeaders(headerMap, ['Manual Image 1', 'Manual Image'], cols.manualImage1);
+  const cManualImage2 = _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_1: _cell(values, cManualImage1),
+    manual_image_2: _cell(values, cManualImage2),
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
 function _readYtCartoonRow(sheet, rowNum) {
   // yt-cartoon: cartoon inputs PLUS four new knobs (Tone, Cap Position, CTA
   // Position, Vid Length). Every column is resolved by HEADER NAME first
@@ -604,6 +670,15 @@ function _validateCartoon(r) {
 }
 
 
+function _validateSimpleMotion(r) {
+  // Only the article is required (it drives the voiceover + any generated
+  // scenes). Both Manual Image columns are optional — a blank cell is
+  // auto-generated, a filled cell is animated as-is.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
 function _validateYtCartoon(r) {
   // Same as cartoon — only the article is required. The four knob columns are
   // optional (blank = defaults) and coerced server-side.
@@ -736,6 +811,7 @@ function generateAllUnprocessed() {
   const cols = (
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+    : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
     : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -763,6 +839,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   // each have their own reader (different column maps).
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
+    : tabType === TAB_SIMPLE_MOTION ? _readSimpleMotionRow
     : tabType === TAB_YT_CARTOON ? _readYtCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
@@ -770,6 +847,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
+    : tabType === TAB_SIMPLE_MOTION ? _validateSimpleMotion
     : tabType === TAB_YT_CARTOON ? _validateYtCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
@@ -800,6 +878,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     const videoCol = (
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
+      : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
       : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -842,6 +921,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   };
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
+  else if (tabType === TAB_SIMPLE_MOTION) payload.rows_simple_motion = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_YT_CARTOON) payload.rows_yt_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;

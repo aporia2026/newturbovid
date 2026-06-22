@@ -42,6 +42,7 @@ from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
+    TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
     TAB_TEXT_ON_IMG,
     TAB_YT_CARTOON,
@@ -236,6 +237,37 @@ CARTOON_COLS = _CartoonCols()
 
 
 @dataclass(frozen=True)
+class _SimpleMotionCols:
+    """Layout for the ``simple-motion`` tab (2026-06-22).
+
+    Image-VO columns A-C, then TWO Manual Image columns (D = shot 1, E = shot 2),
+    then Voice Over / ZapCap / Change Size / Script Pattern, then CTA + CTA Text
+    mirroring cartoon, then Open Comments + Ready Video. The row produces ONE
+    8s video, so only Ready Video 1 (M) is written; Ready Video 2 (N) is present
+    in the sheet but left empty. The write-back resolves the column by header
+    name first, but this positional value is the fallback AND the gate that lets
+    the write run at all. Plan ``_plans/2026-06-22-simple-motion-tab.md``.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image_1: int = 3   # D  (shot 1 — blank → generate)
+    manual_image_2: int = 4   # E  (shot 2 — blank → generate)
+    voice_over: int = 5       # F  (shifted from E)
+    zapcap: int = 6           # G
+    aspect_ratio: int = 7     # H
+    script_pattern: int = 8   # I
+    cta_enabled: int = 9      # J  (Yes/No dropdown)
+    cta_text: int = 10        # K
+    open_comments: int = 11   # L
+    ready_video_start: int = 12   # M = 0-indexed col 12
+
+
+SIMPLE_MOTION_COLS = _SimpleMotionCols()
+
+
+@dataclass(frozen=True)
 class _YtCartoonCols:
     """Layout for the ``yt-cartoon`` tab (2026-06-17).
 
@@ -306,6 +338,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_IMAGE_VO: 1,
     TAB_FOUR_IMAGES: 1,
     TAB_SIMPLE: 1,
+    TAB_SIMPLE_MOTION: 1,
     TAB_CARTOON: 1,
     TAB_YT_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
@@ -489,6 +522,8 @@ class SheetsClient:
         path can skip rows that already have output."""
         if layout in (TAB_IMAGE_VO, TAB_SIMPLE):
             col = IMAGE_VO_COLS.ready_video_start
+        elif layout == TAB_SIMPLE_MOTION:
+            col = SIMPLE_MOTION_COLS.ready_video_start
         elif layout == TAB_CARTOON:
             col = CARTOON_COLS.ready_video_start
         elif layout == TAB_YT_CARTOON:
@@ -843,6 +878,8 @@ class SheetsClient:
             positional_fallback = (
                 IMAGE_VO_COLS.ready_video_start
                 if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
+                else SIMPLE_MOTION_COLS.ready_video_start
+                if tab_type == TAB_SIMPLE_MOTION
                 else CARTOON_COLS.ready_video_start
                 if tab_type == TAB_CARTOON
                 else YT_CARTOON_COLS.ready_video_start
