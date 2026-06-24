@@ -1,25 +1,41 @@
-"""Cartoon row processor — animated, multi-shot videos generated from text.
+"""simple-motion row processor — animate super-realistic images.
 
-The "cartoon" tab does NO seed image. Per row it produces TWO independent
-~6-7s videos, each a stitched sequence of short Seedance image-to-video clips
-over a short voiceover.
+A sibling of ``row_processor_cartoon``. The cartoon tab generates cartoon scenes
+from scratch and produces TWO videos per row. The simple-motion tab produces ONE
+8-second video per row (two 4s shots stitched) from SUPER-REALISTIC photographs,
+and lets the operator paste their OWN images:
 
-Pipeline (plan _plans/2026-06-03-cartoon-mode.md):
+  * Manual Image 1 (sheet col D) is shot 1; Manual Image 2 (col E) is shot 2.
+  * A blank cell is auto-generated (realistic style); a filled cell is animated
+    as-is (downloaded + re-uploaded to our storage, no AI rewrite).
+
+To keep the existing cartoon / yt-cartoon paths byte-identical, this module does
+NOT touch ``process_cartoon_row``. It REUSES the shared pure helpers — the planner
+(``generate_cartoon_plan`` with the realistic prompt + ``num_ideas=1``), the
+atempo sizer (``compute_atempo``), the shortener, the CTA renderer, ZapCap, and
+the Rendi concat — and only swaps the image step (manual-or-generate) and the
+image style (``REALISTIC_STYLE``).
+
+Pipeline:
   1. Article fetch (Tavily -> ScrapingBee)
-  2. language detect -> classify Open Comments
-  3. generate_cartoon_plan -> 2 ideas, each with a VO line + N scene/motion shots
-  4. For EACH idea (concurrently), build one video:
-     a. TTS the voiceover -> measure duration -> upload                (if VO=Yes)
-     b. nano-banana-2: shot 1 text-to-image, shots 2+ image-to-image
-        chained on shot 1 (carries the character/style across the cut)
-     c. Seedance: animate each shot image (4s clips)                   (concurrent)
-     d. Rendi: trim each clip to VO/num_shots and concat + overlay VO
+  2. language detect -> classify Open Comments -> safety
+  3. generate_cartoon_plan (realistic prompt) -> 1 idea: a VO line + 2 scene/motion shots
+  4. Build ONE video:
+     a. TTS the voiceover -> size to the flat 8.0s window                (if VO=Yes)
+     b. shot images: manual -> as-is; blank -> nano-banana-2 realistic
+        (shot 2 chains on shot 1 so a generated frame matches its neighbour)
+     c. Seedance: animate each shot image (4s clips)                     (concurrent)
+     d. Rendi: concat + overlay VO, optional CTA pill
      e. persist to storage, free Rendi storage, optional ZapCap
-  5. Write back two Ready Video URLs.
+  5. Write back ONE Ready Video URL (Ready Video 1).
 
-Graceful degradation: a failed later shot reuses the previous shot's image/clip
-(a hold) rather than failing the whole video; a failed idea is dropped but the
-other idea still ships. Only a row with ZERO usable videos fails.
+Graceful degradation mirrors cartoon: a failed later shot reuses the previous
+shot's image/clip (a hold); only a row with ZERO usable clips fails. The story is
+driven entirely by the article (Yoav 2026-06-22); the motion for a pasted image
+is a universal gentle push-in (the planner can't see the photo), while a
+generated shot uses the planner's scene-matched motion.
+
+Plan: ``_plans/2026-06-22-simple-motion-tab.md``.
 """
 
 from __future__ import annotations
@@ -52,13 +68,29 @@ from bulkvid.models.row import (
     STATUS_SUCCESS,
     STATUS_VIDEO_ASSEMBLY_FAILED,
     STATUS_ZAPCAP_FAILED_KEPT_NO_CAPTIONS,
-    CartoonRow,
     RowResult,
+    SimpleMotionRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.row_processor_cartoon import (
+    IMAGE_RESOLUTION,
+    MAX_EFFECTIVE_VO_SECONDS,
+    SEEDANCE_DURATION_SHORT,
+    SEEDANCE_RESOLUTION,
+    SPEECH_ATEMPO_RETRY_MAX,
+    TARGET_VIDEO_SECONDS,
+    VO_SHORTEN_MIN_WORDS,
+    VO_SHORTEN_STEP,
+    compute_atempo,
+)
+from bulkvid.orchestrator.runtime_settings import (
+    SETTING_SIMPLE_MOTION_PLANNER_PROMPT,
+    SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT,
+)
 from bulkvid.pipeline.cartoon_cta import render_cartoon_cta_overlay_bytes
 from bulkvid.pipeline.cartoon_prompt import (
     CARTOON_TARGET_WORDS,
+    REALISTIC_STYLE,
     CartoonIdea,
     generate_cartoon_plan,
     image_prompt_for_shot,
@@ -72,107 +104,18 @@ from bulkvid.pipeline.safety import resolve_safety
 _log = get_logger("row")
 
 
-# ── Tunables (admin-surfaced in Phase 5) ─────────────────────────────────────
+# ── Tunables ─────────────────────────────────────────────────────────────────
 
-CARTOON_NUM_IDEAS = 2          # videos per row (Ready Video 1 + 2)
-CARTOON_NUM_SHOTS = 2          # shots stitched per video
-SEEDANCE_DURATION_SHORT = 4    # seconds per Seedance clip (4/8/12 only)
-SEEDANCE_RESOLUTION = "720p"
-IMAGE_RESOLUTION = "1K"        # nano-banana-2 resolution (animated -> 720p)
+SM_NUM_IDEAS = 1          # ONE video per row (Ready Video 1)
+SM_NUM_SHOTS = 2          # two 4s shots stitched into the 8s video
 
-# Cartoon videos are a **flat 8.0s every time**. Two 4s Seedance clips concat
-# to 8s of footage; the VO overlays the first ~6-7s of that with VO_TAIL
-# silence dwell to the end. If the synthesized VO measures effectively longer
-# than MAX_EFFECTIVE_VO_SECONDS, the row processor calls shorten_voiceover()
-# and re-TTSes ONCE; if it still doesn't fit, the idea is dropped and the
-# OTHER idea ships. The audio is never truncated mid-word.
-# See _plans/2026-06-04-cartoon-8s-hard-cap.md.
-TARGET_VIDEO_SECONDS = 8.0
-VO_TAIL_SECONDS = 0.5                                  # silence dwell after VO
-MAX_EFFECTIVE_VO_SECONDS = TARGET_VIDEO_SECONDS - VO_TAIL_SECONDS    # 7.5s
-
-# When shortening a too-long VO, target this many fewer words than the
-# planner's normal target — and never go below VO_SHORTEN_MIN_WORDS (a 6-word
-# line is roughly 4s at slow delivery, leaving healthy margin under the cap).
-VO_SHORTEN_MIN_WORDS = 6
-VO_SHORTEN_STEP = 3
-
-# Per-row playback speed for the VO. The default ``SPEECH_ATEMPO`` (1.3) was
-# tuned for "Gemini TTS reads too slowly" — but fast TTS deliveries (short
-# lines, energetic style) come out 3–5s raw and don't need to be sped up.
-# ``compute_atempo`` picks the smallest atempo (>=1.0) that still lets the
-# raw audio fit inside ``MAX_EFFECTIVE_VO_SECONDS``, capped at ``SPEECH_ATEMPO``
-# to protect voice quality. Net: short VOs play at natural speed and fill more
-# of the 8s window; long VOs still get sped up just enough to fit.
-SPEECH_ATEMPO_MIN = 1.0
-
-# Retry-only ceiling. The first attempt protects voice quality with the
-# 1.3x default, but if the shortener trimmed the line and the re-TTS still
-# overshoots by a small margin (Spanish/German compounds blow up character
-# counts) it's far better to nudge the speed up than to drop the idea
-# entirely. 1.55x stays inside Gemini TTS's "natural-sounding" range; past
-# 1.6x the voice starts to feel rushed. See:
-#   * job-1780933855-3c614650 — three of four idea-1s dropped on margins
-#     of 78ms / 1.25s / 2.3s; 1.5x rescued all three.
-#   * job-1780936528-524e40fb row 5 idea 1 — German 11.61s VO overshoots
-#     at 1.5x (7.741s effective) by 241ms; 1.55x (7.49s effective) ships.
-SPEECH_ATEMPO_RETRY_MAX = 1.55
-
-
-def compute_atempo(
-    raw_seconds: float,
-    *,
-    max_atempo: float = SPEECH_ATEMPO,
-    max_effective: float = MAX_EFFECTIVE_VO_SECONDS,
-) -> tuple[float, float]:
-    """Pick a per-row atempo for the VO.
-
-    Returns ``(atempo, effective_seconds)`` where ``effective_seconds`` is the
-    actual played length of the VO after ffmpeg applies the ``atempo`` filter.
-
-    ``max_atempo`` (default ``SPEECH_ATEMPO`` = 1.3) is the ceiling on speedup.
-    Pass ``SPEECH_ATEMPO_RETRY_MAX`` on the shorten-and-retry path to rescue
-    borderline overshoots instead of dropping the idea.
-
-    ``max_effective`` (default ``MAX_EFFECTIVE_VO_SECONDS`` = 7.5s) is the VO
-    window the audio must fit inside. The yt-cartoon tab passes a larger,
-    per-Vid-Length window (e.g. 19.5s for the 20s bucket); cartoon callers pass
-    nothing and keep the flat-8s window.
-
-    Logic:
-      - Raw audio ≤ MAX_EFFECTIVE_VO_SECONDS (7.5s): no speedup needed, atempo=1.0.
-        The VO plays at natural pace, which sounds better and fills more of the
-        8s video — directly addresses the "v2-style" 3-second trailing-silence
-        bug.
-      - Raw audio > 7.5s but ≤ 7.5 × max_atempo: speed up just enough to fit.
-        ``atempo = raw / 7.5``; effective lands at exactly 7.5s.
-      - Raw audio > 7.5 × max_atempo: even max speedup doesn't fit. Return
-        ``(max_atempo, raw/max_atempo)`` — the caller will see
-        ``effective > MAX_EFFECTIVE_VO_SECONDS`` and trigger the
-        shorten-and-retry path (or drop, if this already WAS the retry).
-
-    Floating-point note: in the "speed up just enough to fit" branch we
-    return the cap value as a literal, NOT ``raw_seconds / atempo``. By
-    construction the math says effective == cap, but IEEE 754 division can
-    drift a few ULPs and the caller's ``effective > cap`` check then false-
-    positives on FP noise (see job ``local-desktop-l6i1bf7-20260604T103814Z``
-    for the regression that prompted this comment — raw 8.17s came back as
-    7.5000000001 and dropped a clean idea).
-    """
-    if raw_seconds <= 0:
-        return max_atempo, 0.0
-    if raw_seconds <= max_effective:
-        return SPEECH_ATEMPO_MIN, raw_seconds
-    needed = raw_seconds / max_effective
-    if needed <= max_atempo:
-        # Audio fits with some speedup; effective lands exactly at the cap.
-        # Return the cap as a literal to avoid FP drift past it.
-        return needed, max_effective
-    # Audio doesn't fit even at max speedup; caller will see effective > cap
-    # and trigger shorten-and-retry. We DO return the math here (not the cap)
-    # because the value carries meaningful "how badly does this overshoot"
-    # information for the log line.
-    return max_atempo, raw_seconds / max_atempo
+# Motion prompt for a PASTED (manual) image. The planner can't see the operator's
+# photo, so a scene-specific motion would mismatch it — a universal, gentle
+# cinematic push-in is the safe default. Generated shots use the planner's own
+# scene-matched motion. Plan ``_plans/2026-06-22-simple-motion-tab.md``.
+MANUAL_IMAGE_MOTION = (
+    "Subtle, natural movement with a slow, gentle cinematic camera push-in."
+)
 
 
 def _slug(row_num: int, job_id: str | None = None) -> str:
@@ -203,18 +146,22 @@ class _Costs:
         )
 
 
-async def process_cartoon_row(
-    row: CartoonRow,
+async def process_simple_motion_row(
+    row: SimpleMotionRow,
     clients: PipelineClients,
     *,
     job_id: str | None = None,
 ) -> RowResult:
-    """Run the cartoon pipeline for one row. Returns a RowResult. Never raises."""
+    """Run the simple-motion pipeline for one row. Returns a RowResult. Never raises."""
     set_context(batch_id=job_id, row_num=row.row_num)
     t0 = time.monotonic()
     costs = _Costs()
     slug = _slug(row.row_num, job_id)
     aspect = normalize_aspect_ratio(row.aspect_ratio)
+    manual_for_shot = [
+        (row.manual_image_1 or "").strip(),
+        (row.manual_image_2 or "").strip(),
+    ]
     metadata: dict[str, Any] = {
         "row_num": row.row_num,
         "country": row.country,
@@ -223,9 +170,11 @@ async def process_cartoon_row(
         "aspect_ratio": row.aspect_ratio,
         "voice_over": row.voice_over,
         "zapcap": row.zapcap,
-        "tab": "cartoon",
-        "num_ideas": CARTOON_NUM_IDEAS,
-        "num_shots": CARTOON_NUM_SHOTS,
+        "tab": "simple_motion",
+        "num_ideas": SM_NUM_IDEAS,
+        "num_shots": SM_NUM_SHOTS,
+        "manual_image_1": bool(manual_for_shot[0]),
+        "manual_image_2": bool(manual_for_shot[1]),
     }
     zapcap_failed = False
 
@@ -236,7 +185,9 @@ async def process_cartoon_row(
         aspect=row.aspect_ratio,
         zapcap=row.zapcap,
         vo=row.voice_over,
-        tab="cartoon",
+        tab="simple_motion",
+        manual_image_1=bool(manual_for_shot[0]),
+        manual_image_2=bool(manual_for_shot[1]),
     )
 
     try:
@@ -255,8 +206,7 @@ async def process_cartoon_row(
             lang = await detect_language(clients.openai, article_body)
             costs.language += lang.cost_usd
             # Safety net: a wrong/transient scrape can return wrong-language
-            # content; prefer the operator's explicit market (Country / URL
-            # locale) when it conflicts with detection (chat 2026-06-17).
+            # content; prefer the operator's explicit market on conflict.
             lang = reconcile_language(
                 lang, article_url=row.article_url, country=row.country
             )
@@ -270,6 +220,9 @@ async def process_cartoon_row(
             metadata["safety_matched"] = safety.matched
             metadata["safety_keyword"] = safety.matched_keyword
 
+            # Same planner as cartoon, but with the realistic prompt (photographic
+            # scenes, not cartoon scenes) and ONE idea. The article tells the
+            # story (voiceover); blank shots reuse the scene descriptions.
             plan = await generate_cartoon_plan(
                 clients.openai,
                 article_body=article_body,
@@ -278,10 +231,12 @@ async def process_cartoon_row(
                 language=lang.language,
                 script_pattern=row.script_pattern,
                 open_comments=analysis,
-                num_ideas=CARTOON_NUM_IDEAS,
-                num_shots=CARTOON_NUM_SHOTS,
+                num_ideas=SM_NUM_IDEAS,
+                num_shots=SM_NUM_SHOTS,
                 settings_store=clients.settings_store,
                 safety=safety,
+                planner_prompt_key=SETTING_SIMPLE_MOTION_PLANNER_PROMPT,
+                planner_prompt_default=SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT,
             )
             costs.plan += plan.cost_usd
             metadata["language"] = lang.language
@@ -291,18 +246,10 @@ async def process_cartoon_row(
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 
-        # ─── CTA overlay setup (Yoav 2026-06-08) ─────────────────────────
-        # When the row's CTA column is set to Yes, every generated cartoon
-        # video gets a yellow CTA pill overlaid at the bottom. CTA text:
-        #   * operator's CTA Text column if non-empty
-        #   * else per-language "Read More" fallback (matches simple_x4 default)
-        # The overlay PNG is rendered ONCE per row (same text on all ideas),
-        # uploaded to storage, then composited onto each stitched cartoon
-        # video via Rendi. When ``CTA = No``, no overlay step runs and the
-        # row behaves exactly like the legacy cartoon path.
+        # ─── CTA overlay setup (mirrors cartoon) ─────────────────────────
         cta_overlay_url: str | None = None
         cta_text_used: str = ""
-        cta_setup_error: str | None = None        # surfaced into row.error
+        cta_setup_error: str | None = None
         if row.cta_enabled:
             cta_text_used = (row.cta_text.strip() or
                              default_cta_for_language(lang.language))
@@ -323,13 +270,9 @@ async def process_cartoon_row(
                 metadata["cta_enabled"] = True
                 metadata["cta_text_used"] = cta_text_used[:80]
             except Exception as e:
-                # Overlay render/upload failure: ship videos WITHOUT the CTA
-                # rather than killing the whole row. Loud log AND surface to
-                # row.error so the operator sees it in the sidebar without
-                # digging through HF Space logs.
                 cta_setup_error = str(e)[:200]
                 _log.error(
-                    "cartoon_cta_overlay_failed_skipped",
+                    "simple_motion_cta_overlay_failed_skipped",
                     error=cta_setup_error, cta_text=cta_text_used[:80],
                 )
                 metadata["cta_enabled"] = False
@@ -337,14 +280,7 @@ async def process_cartoon_row(
         else:
             metadata["cta_enabled"] = False
 
-        # ─── Stage 3+4: build each idea into a finished video (concurrently) ───
-
-        # Per-idea exception messages — collected so a row that fails
-        # entirely surfaces the ACTUAL ffmpeg/kie/seedance error in its
-        # error field (operators can see it in the sidebar) instead of
-        # the unhelpful generic "no usable videos produced for any idea".
-        # Also captures the CTA-overlay failures (non-fatal, video ships
-        # without the pill) so we can diagnose those without HF Logs.
+        # ─── Stage 3+4: build the single video ───
         idea_failure_messages: list[str] = []
         cta_overlay_errors: list[str] = []
 
@@ -352,19 +288,13 @@ async def process_cartoon_row(
             """Build one stitched, voiced, optionally-captioned video. None on failure."""
             nonlocal zapcap_failed
             try:
-                # 4a. Voiceover (optional). Hard-cap design: video is ALWAYS
-                # TARGET_VIDEO_SECONDS (8.0s), two equal 4s Seedance clips. If
-                # the synthesized VO measures effectively longer than
-                # MAX_EFFECTIVE_VO_SECONDS, shorten the line and re-TTS ONCE;
-                # if that still doesn't fit, drop the idea so the OTHER idea
-                # can still ship. The audio is never truncated mid-word.
+                # 4a. Voiceover (optional). Flat 8.0s video, two 4s clips. If the
+                # synthesized VO measures longer than MAX_EFFECTIVE_VO_SECONDS,
+                # shorten + re-TTS once; if it still overshoots, drop the idea.
                 vo_url: str | None = None
-                seedance_durations: list[int] = [SEEDANCE_DURATION_SHORT] * CARTOON_NUM_SHOTS
-                per_clip_seconds: list[float] = [float(SEEDANCE_DURATION_SHORT)] * CARTOON_NUM_SHOTS
+                seedance_durations: list[int] = [SEEDANCE_DURATION_SHORT] * SM_NUM_SHOTS
+                per_clip_seconds: list[float] = [float(SEEDANCE_DURATION_SHORT)] * SM_NUM_SHOTS
                 target_video_seconds = TARGET_VIDEO_SECONDS
-                # Per-row playback speed for the VO. SPEECH_ATEMPO is the
-                # default for the silent path (no audio); when there's a VO
-                # we replace it with compute_atempo's per-row pick.
                 vo_atempo = SPEECH_ATEMPO
 
                 if row.voice_over:
@@ -376,10 +306,6 @@ async def process_cartoon_row(
                         country=row.country,
                     )
                     costs.tts += tts.cost_usd
-                    # Pick the lowest atempo (>=1.0) that still lets the raw
-                    # audio fit in the 7.5s effective window. Short VOs play
-                    # at natural speed and fill more of the 8s video; long
-                    # VOs get just enough speedup to fit.
                     vo_atempo, effective = compute_atempo(tts.duration_seconds)
                     original_effective = effective
                     shortened = False
@@ -390,7 +316,7 @@ async def process_cartoon_row(
                             CARTOON_TARGET_WORDS - VO_SHORTEN_STEP,
                         )
                         _log.warning(
-                            "cartoon_vo_too_long_shortening",
+                            "simple_motion_vo_too_long_shortening",
                             idea=idx + 1,
                             original_words=len(final_text.split()),
                             original_effective=round(effective, 3),
@@ -404,13 +330,9 @@ async def process_cartoon_row(
                         )
                         costs.plan += shorten_result.cost_usd
 
-                        # The shortener's defensive fallbacks (bad JSON, empty
-                        # response, not-actually-shorter) return the original
-                        # text. There's no point re-TTSing the same string —
-                        # drop the idea now.
                         if shorten_result.voiceover == final_text:
                             _log.error(
-                                "cartoon_vo_shortener_no_change_dropped",
+                                "simple_motion_vo_shortener_no_change_dropped",
                                 idea=idx + 1,
                                 original_effective=round(effective, 3),
                             )
@@ -429,9 +351,6 @@ async def process_cartoon_row(
                             country=row.country,
                         )
                         costs.tts += tts.cost_usd
-                        # Allow up to 1.5x on the retry to rescue borderline
-                        # overshoots that the default 1.3x cap would drop.
-                        # See SPEECH_ATEMPO_RETRY_MAX docstring for context.
                         vo_atempo, effective = compute_atempo(
                             tts.duration_seconds,
                             max_atempo=SPEECH_ATEMPO_RETRY_MAX,
@@ -439,11 +358,8 @@ async def process_cartoon_row(
                         shortened = True
 
                         if effective > MAX_EFFECTIVE_VO_SECONDS:
-                            # Shortened TTS still overshoots. Don't truncate
-                            # the audio; drop this idea so the OTHER idea
-                            # ships clean. Row only fails if BOTH ideas drop.
                             _log.error(
-                                "cartoon_vo_too_long_after_retry_dropped",
+                                "simple_motion_vo_too_long_after_retry_dropped",
                                 idea=idx + 1,
                                 original_effective=round(original_effective, 3),
                                 retry_effective=round(effective, 3),
@@ -465,7 +381,7 @@ async def process_cartoon_row(
                     vo_url = vo_up.url
 
                     _log.info(
-                        "cartoon_vo_sized",
+                        "simple_motion_vo_sized",
                         idea=idx + 1,
                         vo_words=len(final_text.split()),
                         vo_raw_seconds=round(tts.duration_seconds, 3),
@@ -475,17 +391,49 @@ async def process_cartoon_row(
                             target_video_seconds - effective, 3
                         ),
                         target_video_seconds=target_video_seconds,
-                        per_clip_seconds=[round(p, 3) for p in per_clip_seconds],
-                        seedance_durations=list(seedance_durations),
                         shortened=shortened,
                         fits=True,
                     )
 
-                # 4b. Scene images — shot 1 from text, shots 2+ chained on shot 1.
+                # 4b. Shot images. Each shot is EITHER a pasted manual image
+                # (used as-is — downloaded + re-uploaded so the URL is stable +
+                # Rendi-reachable) OR generated in REALISTIC_STYLE. A generated
+                # shot 2 chains on shot 1 (image-to-image) so it matches its
+                # neighbour, even when shot 1 is the operator's own photo.
                 image_urls: list[str] = []
+                image_sources: list[str] = []
+                shot_motions: list[str] = []
                 for s, shot in enumerate(idea.shots):
-                    is_chained = s > 0
-                    prompt = image_prompt_for_shot(shot.scene, is_chained=is_chained)
+                    manual = manual_for_shot[s] if s < len(manual_for_shot) else ""
+                    if manual:
+                        try:
+                            raw = await download_image(manual, timeout=60.0)
+                            up = await clients.storage.upload_bytes(
+                                raw,
+                                key=f"bulkvid/simple_motion_images/{slug}/idea{idx + 1}_shot{s + 1}.png",
+                                content_type="image/png",
+                            )
+                            costs.storage += up.cost_usd
+                            image_urls.append(up.url)
+                            image_sources.append("manual")
+                            shot_motions.append(MANUAL_IMAGE_MOTION)
+                            continue
+                        except Exception as e:
+                            if not image_urls:
+                                raise    # first shot must succeed
+                            _log.warning(
+                                "simple_motion_manual_image_failed_held",
+                                idea=idx + 1, shot=s + 1, error=str(e)[:200],
+                            )
+                            image_urls.append(image_urls[-1])    # hold previous
+                            image_sources.append("held")
+                            shot_motions.append(MANUAL_IMAGE_MOTION)
+                            continue
+
+                    is_chained = s > 0 and bool(image_urls)
+                    prompt = image_prompt_for_shot(
+                        shot.scene, is_chained=is_chained, style=REALISTIC_STYLE
+                    )
                     try:
                         if is_chained:
                             url, cost = await nano_banana_2_image_to_image(
@@ -498,31 +446,34 @@ async def process_cartoon_row(
                             )
                         costs.image_gen += cost
                         image_urls.append(url)
+                        image_sources.append("generated")
+                        shot_motions.append(shot.motion)
                     except Exception as e:
                         if not image_urls:
                             raise    # first shot must succeed
                         _log.warning(
-                            "cartoon_shot_image_failed_held",
+                            "simple_motion_shot_image_failed_held",
                             idea=idx + 1, shot=s + 1, error=str(e)[:200],
                         )
                         image_urls.append(image_urls[-1])    # hold previous frame
+                        image_sources.append("held")
+                        shot_motions.append(shot.motion)
+
+                metadata["image_sources"] = image_sources
 
                 # 4c. Animate each image (concurrently). A failed clip holds a
-                # neighbour so the concat still has NUM_SHOTS clips in order.
-                # ``seedance_durations[s]`` is 4s for every shot except the last
-                # when long_audio is True — that last shot gets the 8s tier so
-                # the concat has room to fit the full VO + dwell.
+                # neighbour so the concat still has SM_NUM_SHOTS clips in order.
                 async def _animate(s: int, image_url: str) -> tuple[int, str | None]:
                     try:
                         clip_url, cost = await seedance_image_to_video(
-                            clients.kie, image_url, idea.shots[s].motion, aspect,
+                            clients.kie, image_url, shot_motions[s], aspect,
                             duration=seedance_durations[s], resolution=SEEDANCE_RESOLUTION,
                         )
                         costs.seedance += cost
                         return s, clip_url
                     except Exception as e:
                         _log.warning(
-                            "cartoon_shot_animate_failed",
+                            "simple_motion_shot_animate_failed",
                             idea=idx + 1, shot=s + 1, error=str(e)[:200],
                         )
                         return s, None
@@ -532,8 +483,7 @@ async def process_cartoon_row(
                 )
                 clip_by_shot = {s: url for s, url in animated}
                 # Fill gaps with the nearest successful clip: forward pass holds
-                # the previous good clip, then a backward pass covers leading gaps
-                # (a failed FIRST shot). If any clip succeeded, all slots fill.
+                # the previous good clip, then a backward pass covers leading gaps.
                 ordered: list[str | None] = [clip_by_shot.get(s) for s in range(len(image_urls))]
                 last_good: str | None = None
                 for s in range(len(ordered)):
@@ -549,18 +499,16 @@ async def process_cartoon_row(
                         ordered[s] = next_good
                 clip_urls = [c for c in ordered if c]
                 if not clip_urls:
-                    _log.error("cartoon_idea_no_clips", idea=idx + 1)
+                    _log.error("simple_motion_idea_no_clips", idea=idx + 1)
                     idea_failure_messages.append(
                         f"idea {idx + 1}: no Seedance clips produced "
                         f"for any of {len(image_urls)} shots"
                     )
                     return None
 
-                # 4d. Stitch + overlay VO. ``per_clip_seconds`` is uniform
-                # [4.0, 4.0] and ``total_video_seconds`` is the flat 8.0s
-                # ceiling — see the constants. By construction the VO that
-                # reaches this step is <= MAX_EFFECTIVE_VO_SECONDS, so the
-                # concat never truncates audio.
+                # 4d. Stitch + overlay VO. Uniform [4.0, 4.0] clips trimmed into
+                # the flat 8.0s ceiling; the VO that reaches here is
+                # <= MAX_EFFECTIVE_VO_SECONDS, so the concat never truncates audio.
                 stitched = await clients.rendi.concat_clips_with_audio(
                     clip_urls,
                     vo_url,
@@ -573,16 +521,8 @@ async def process_cartoon_row(
                 costs.rendi += stitched.cost_usd
                 cleanup_command_ids: list[str] = [stitched.command_id]
 
-                # 4d.5. Optional CTA overlay (Yoav 2026-06-08). When the
-                # row's CTA column is Yes, composite the pre-rendered yellow
-                # pill PNG onto the stitched video via Rendi ffmpeg overlay.
-                # The PNG was rendered + uploaded once per row at the top of
-                # process_cartoon_row; reused across both ideas.
-                #
-                # NON-FATAL: an overlay failure falls back to the stitched
-                # video WITHOUT the CTA pill. Loud log so the operator can
-                # spot it. Matches the ZapCap-keep-original pattern below —
-                # one new step never tanks an otherwise-good row.
+                # 4d.5. Optional CTA overlay (mirrors cartoon). NON-FATAL — an
+                # overlay failure ships the video WITHOUT the pill.
                 video_url_for_persist = stitched.url
                 if cta_overlay_url:
                     try:
@@ -598,7 +538,7 @@ async def process_cartoon_row(
                         err_msg = str(cta_err)[:300]
                         cta_overlay_errors.append(f"idea {idx + 1}: {err_msg}")
                         _log.error(
-                            "cartoon_cta_overlay_failed_kept_original",
+                            "simple_motion_cta_overlay_failed_kept_original",
                             idea=idx + 1, error=err_msg,
                         )
 
@@ -613,10 +553,9 @@ async def process_cartoon_row(
                 final_url = up.url
                 await clients.rendi.cleanup_commands(cleanup_command_ids)
 
-                # 4f. Optional ZapCap. When the CTA pill is on, push the
-                # caption position higher (top=30) so it doesn't cover the
-                # pill at the bottom; matches the simple_x4 templated-cell
-                # behavior. On failure keep the uncaptioned video.
+                # 4f. Optional ZapCap. When the CTA pill is on, push the caption
+                # higher (top=30) so it doesn't cover the pill. On failure keep
+                # the uncaptioned video.
                 if row.zapcap and clients.zapcap is not None:
                     try:
                         zapcap_opts: ZapCapRenderOptions | None = None
@@ -644,7 +583,7 @@ async def process_cartoon_row(
                     except Exception as e:
                         zapcap_failed = True
                         _log.error(
-                            "cartoon_zapcap_failed_kept_original",
+                            "simple_motion_zapcap_failed_kept_original",
                             idea=idx + 1, error=str(e)[:200],
                         )
 
@@ -652,7 +591,7 @@ async def process_cartoon_row(
             except Exception as e:
                 err_msg = str(e)[:300]
                 idea_failure_messages.append(f"idea {idx + 1}: {err_msg}")
-                _log.error("cartoon_idea_failed", idea=idx + 1, error=err_msg)
+                _log.error("simple_motion_idea_failed", idea=idx + 1, error=err_msg)
                 return None
 
         results = await asyncio.gather(
@@ -660,17 +599,11 @@ async def process_cartoon_row(
         )
         video_urls = [u for u in results if u]
 
-        # Surface CTA-overlay failures even when the row itself succeeded —
-        # without this, a row that shipped videos but lost the CTA pill is
-        # indistinguishable from a row that intentionally ran with CTA off.
         if cta_overlay_errors:
             metadata["cta_overlay_errors"] = cta_overlay_errors
             metadata["cta_overlay_applied"] = False
 
         if not video_urls:
-            # Detailed failure message: surfaces the ACTUAL per-idea errors
-            # so the operator can debug from the sidebar (no need to dig
-            # through HF Space logs for the ffmpeg/kie/seedance stderr).
             detail = (
                 " | ".join(idea_failure_messages)
                 if idea_failure_messages
@@ -678,18 +611,12 @@ async def process_cartoon_row(
             )
             return _fail(
                 row, STATUS_VIDEO_ASSEMBLY_FAILED,
-                f"no usable videos produced for any idea — {detail}",
+                f"no usable videos produced — {detail}",
                 t0, costs, metadata,
             )
 
         metadata["videos_produced"] = len(video_urls)
 
-        # Build a sidebar-visible CTA warning when the row otherwise
-        # succeeded but the operator's CTA pill didn't actually land on
-        # one or more videos. Without this, a row that intentionally ran
-        # with CTA off and a row that ran with CTA on but quietly lost
-        # the pill look identical from the sidebar. Truncated at 1000
-        # chars to match the RowResult.error budget (see _fail()).
         cta_warning_parts: list[str] = []
         if cta_setup_error:
             cta_warning_parts.append(
@@ -721,7 +648,7 @@ async def process_cartoon_row(
 
 
 def _ok(
-    row: CartoonRow,
+    row: SimpleMotionRow,
     video_urls: list[str],
     t0: float,
     costs: _Costs,
@@ -752,7 +679,7 @@ def _ok(
 
 
 def _fail(
-    row: CartoonRow,
+    row: SimpleMotionRow,
     status: str,
     error: str,
     t0: float,

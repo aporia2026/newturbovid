@@ -112,7 +112,76 @@ For EACH idea return:
 
 HARD RULES:
 1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all vehicles, products, and signage as plain and unbranded — no logos, badges, or readable license plates.
-2. Within one idea, keep ONE recurring main character and describe them IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
+2. Pick a main character whose age, gender, ethnicity, and look FIT this article's topic, vertical, and target country, and vary the character across different videos. Do NOT default to the same generic person every time — in particular, avoid always using a young woman with short dark hair and glasses. Then describe that ONE character IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
+3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus. Do not ask for words or numbers.
+4. Keep it tasteful and brand-safe.
+
+Return STRICT JSON only, shaped exactly like:
+{{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
+
+
+# ── yt-cartoon engaging planner prompt (Yoav 2026-06-17) ─────────────────────
+#
+# The yt-cartoon tab's "engaging" Tone uses this instead of the calm prompt
+# above. Same placeholders, same JSON shape, same hard brand-safety rules — the
+# ONLY difference is the voiceover voice: punchy, hook-first, scroll-stopping,
+# but fenced in by an explicit compliance block so it stays shippable on paid
+# native (Taboola/Outbrain) AND YouTube Shorts. The council's loudest warning
+# was that "clickable" and "no fake urgency / no fear-mongering" pull the model
+# in opposite directions on the same sentence — so the tension is resolved HERE,
+# inside the prompt, not left to chance. Plan: ``_plans/2026-06-17-yt-cartoon-tab.md``.
+YT_CARTOON_ENGAGING_PROMPT_DEFAULT = """You are a sharp short-form ad writer making PUNCHY, scroll-stopping animated cartoon videos from a news article. You write the visuals and a fast, lively voiceover that makes people stop scrolling and tap "Read More".
+
+Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate short video told in exactly {num_shots} shots.
+
+For EACH idea return:
+- voiceover: an energetic spoken script in {language}, about {target_words} words ({min_words}-{max_words}), written as 1-3 short, punchy sentences and paced fast. Use enough words to roughly fill that length — do not stop short and leave dead air. OPEN WITH A HOOK in the first few words — a curiosity gap, a direct "you", a sharp question, or one surprising-but-true detail pulled straight from the article. Use snappy, everyday spoken language and keep the energy up the whole way through. Build curiosity that tapping "Read More" would satisfy. The script MUST end on a COMPLETE THOUGHT — a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition. End on a strong, conclusive word — a vivid noun or an action verb — so it lands, not trails off.
+- style_direction: a short delivery hint — fast, upbeat, energetic, conversational.
+- shots: an array of exactly {num_shots} shots, each with:
+    * scene: a vivid description of ONE cartoon scene (subject, setting, framing). Vertical composition.
+    * motion: how that scene animates (lively but natural movements and dynamic camera moves).
+
+COMPLIANCE — these are paid ads; the hook must be punchy but MUST NOT cross these lines:
+- NO health, medical, or weight-loss claims, cures, or "doctors hate this" framing.
+- NO guaranteed money, income, savings, or returns claims, and no "get rich" promises.
+- NO fake urgency ("act now", "today only", "limited time", "before it's gone").
+- NO fear-mongering, scare tactics, or shock-bait ("you won't believe", "this one weird trick", "what happens next will shock you", "shocking", "miracle").
+- NO absolute promises or sensational superlatives ("the best ever", "guaranteed", "instantly").
+- FACT-FAITHFUL: use ONLY facts the article actually supports. Never invent statistics, prices, names, quotes, or outcomes. Curiosity comes from REAL, specific detail — not made-up claims.
+
+HARD RULES (same as the calm style):
+1. Use GENERIC, SYMBOLIC characters and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (say 'a compact car', NOT 'a Volkswagen'). All vehicles, products, and signage are plain and unbranded — no logos, badges, or readable license plates.
+2. Pick a main character whose age, gender, ethnicity, and look genuinely FIT this article's topic, vertical, and target country, and make different videos use clearly DIFFERENT characters. Do NOT default to the same generic person every time — in particular, do NOT keep using a young woman with short dark hair and glasses unless the topic truly calls for it. Then describe that ONE chosen character IDENTICALLY across the shots (same age, hair, clothing) so the shots feel continuous.
+3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus.
+4. Keep it tasteful and brand-safe.
+
+Return STRICT JSON only, shaped exactly like:
+{{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
+
+
+# ── simple-motion planner prompt (Yoav 2026-06-22) ───────────────────────────
+#
+# The simple-motion tab animates SUPER-REALISTIC photographs, not cartoons. It
+# reuses the cartoon planner (same JSON shape, same placeholders, same hard
+# brand-safety + complete-sentence rules) but the scene descriptions must read as
+# real, photographic scenes — otherwise the planner's "cartoon scene" wording
+# fights ``REALISTIC_STYLE`` in the image prompt. ``num_ideas`` is 1 and
+# ``num_shots`` is 2 for this tab (one 8s video, two 4s shots). Plan:
+# ``_plans/2026-06-22-simple-motion-tab.md``.
+SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT = """You are a creative director making SHORT, realistic, live-action-style social videos from a news article. You plan believable PHOTOGRAPHIC scenes and a tight voiceover.
+
+Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate ~6-7 second video told in exactly {num_shots} shots.
+
+For EACH idea return:
+- voiceover: ONE short spoken line in {language}, about {target_words} words ({min_words}-{max_words}), natural and engaging, readable in ~6-7 seconds. MUST be a COMPLETE THOUGHT that ends in a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition — finish the sentence. The final word should feel CONCLUSIVE — a strong noun or an action verb that lands the thought. AVOID ending on a bare adjective ("independent", "smart", "ready", "different") or an abstract noun that begs a follow-up — the line must feel finished on first listen.
+- style_direction: a short delivery hint for the voice actor.
+- shots: an array of exactly {num_shots} shots, each with:
+    * scene: a vivid description of ONE realistic, photographic scene (real-looking person or setting, subject, framing, lighting). Vertical composition. Describe it as a real photo or live footage — NOT a cartoon, illustration, or animation.
+    * motion: how that scene should gently animate (small, natural movements and subtle, cinematic camera moves).
+
+HARD RULES:
+1. Use GENERIC, ordinary people and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all vehicles, products, and signage as plain and unbranded — no logos, badges, or readable license plates.
+2. Pick a main subject whose age, gender, ethnicity, and look FIT this article's topic, vertical, and target country, and vary the subject across different videos. Do NOT default to the same generic person every time. Then describe that ONE subject IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
 3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus. Do not ask for words or numbers.
 4. Keep it tasteful and brand-safe.
 
@@ -214,6 +283,10 @@ SETTING_SCRIPT_SYSTEM_PROMPT = "script_system_prompt"
 SETTING_SIMPLE_SCRIPT_PROMPT = "simple_script_prompt"
 SETTING_SIMPLE_X4_SCRIPT_PROMPT = "simple_x4_script_prompt"
 SETTING_CARTOON_PLANNER_PROMPT = "cartoon_planner_prompt"
+# yt-cartoon "engaging" Tone planner prompt (Yoav 2026-06-17).
+SETTING_YT_CARTOON_ENGAGING_PROMPT = "yt_cartoon_engaging_planner_prompt"
+# simple-motion realistic planner prompt (Yoav 2026-06-22).
+SETTING_SIMPLE_MOTION_PLANNER_PROMPT = "simple_motion_planner_prompt"
 SETTING_SENSITIVE_APPAREL_RULES = "sensitive_apparel_rules"
 SETTING_SENSITIVE_APPAREL_KEYWORDS = "sensitive_apparel_keywords"
 
@@ -224,6 +297,12 @@ SETTING_ROW_TIMEOUT_SIMPLE = "row_timeout_simple_seconds"
 SETTING_ROW_TIMEOUT_IMAGE_VO = "row_timeout_image_vo_seconds"
 SETTING_ROW_TIMEOUT_4IMAGES = "row_timeout_4images_seconds"
 SETTING_ROW_TIMEOUT_CARTOON = "row_timeout_cartoon_seconds"
+# yt-cartoon reuses cartoon's multi-shot pipeline but can run longer (up to 5
+# shots on the 20s bucket), so it gets its own (larger-headroom) timeout key.
+SETTING_ROW_TIMEOUT_YT_CARTOON = "row_timeout_yt_cartoon_seconds"
+# simple-motion runs cartoon's pipeline but with ONE idea (1 video, ≤2 generated
+# images) — same multi-shot ceiling as cartoon is plenty of headroom.
+SETTING_ROW_TIMEOUT_SIMPLE_MOTION = "row_timeout_simple_motion_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -276,6 +355,34 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "videos (voiceover + scene descriptions). Use {language}, "
             "{num_ideas}, {num_shots}, {target_words}, {min_words}, and "
             "{max_words} as placeholders."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_YT_CARTOON_ENGAGING_PROMPT,
+        label="yt-cartoon: engaging planner prompt",
+        default=YT_CARTOON_ENGAGING_PROMPT_DEFAULT,
+        multiline=True,
+        description=(
+            "System prompt for the yt-cartoon tab when a row's Tone is "
+            "'engaging' (or blank — engaging is this tab's default). Punchy, "
+            "hook-first narration fenced by an ad-compliance block. A Tone of "
+            "'calm' falls back to the Cartoon planner prompt above. Same "
+            "{language}, {num_ideas}, {num_shots}, {target_words}, "
+            "{min_words}, {max_words} placeholders."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_SIMPLE_MOTION_PLANNER_PROMPT,
+        label="simple-motion: planner prompt",
+        default=SIMPLE_MOTION_PLANNER_PROMPT_DEFAULT,
+        multiline=True,
+        description=(
+            "System prompt for the simple-motion tab — plans SUPER-REALISTIC "
+            "photographic scenes + an article-driven voiceover (not cartoons). "
+            "Same {language}, {num_ideas}, {num_shots}, {target_words}, "
+            "{min_words}, {max_words} placeholders as the Cartoon prompt. The "
+            "tab generates only the images a row leaves blank; pasted images "
+            "(columns D/E) are animated as-is."
         ),
     ),
     SettingDef(
@@ -340,6 +447,28 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
         description=(
             "Hard wall-clock budget for a Cartoon-tab row (planner + multi-"
             "shot). Env BULKVID_ROW_TIMEOUT_SECONDS_CARTOON overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_YT_CARTOON,
+        label="Row timeout: yt-cartoon (seconds)",
+        default="1500",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a yt-cartoon-tab row (planner + up to "
+            "5 shots on the 20s bucket). Larger than Cartoon's headroom. Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_YT_CARTOON overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
+        label="Row timeout: simple-motion (seconds)",
+        default="1200",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a simple-motion-tab row (planner + 2 "
+            "shots, image-gen and/or manual-image re-upload). Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_SIMPLE_MOTION overrides."
         ),
     ),
     SettingDef(

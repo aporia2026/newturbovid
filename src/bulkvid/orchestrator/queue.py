@@ -36,9 +36,11 @@ from bulkvid.models.row import (
     FourImagesVO2Row,
     ImageVORow,
     RowResult,
+    SimpleMotionRow,
     SimpleRow,
     SimpleX4Row,
     TextOnImgRow,
+    YtCartoonRow,
 )
 from bulkvid.orchestrator import db as _db
 
@@ -65,7 +67,9 @@ ROW_FAILED = "failed"
 TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
+TAB_SIMPLE_MOTION = "simple_motion"
 TAB_CARTOON = "cartoon"
+TAB_YT_CARTOON = "yt_cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
 TAB_TEXT_ON_IMG = "text_on_img"
 TAB_AVATAR = "avatar"
@@ -78,17 +82,20 @@ TAB_AVATAR = "avatar"
 IDEMPOTENCY_TTL_SECONDS = 86_400
 
 
-# ── Web-path DB resilience (Turso flap hardening) ───────────────────────────
+# ── DB resilience (Turso flap hardening) — shared by web AND worker ──────────
 #
-# The submit/poll endpoints talk to Turso (remote libSQL) over HTTPS — every
-# statement is a network round-trip that can flap. The WORKER side already
-# survives this (hard ``asyncio.wait_for`` timeout + broad ``except`` + retry
-# buffer, runner.py); the web path historically did not, so a single flap
-# during ``enqueue`` bubbled as a bare HTTP 500 and a wedged connection stayed
-# wedged until the process restarted. ``JobQueue._run_db`` mirrors the worker's
-# discipline on the web path: time-box each call, and on ANY failure throw the
-# connection away, open a fresh one, and retry before giving up with a 503.
-# Plan ``_plans/2026-06-17-submit-500s-turso-resilience.md``.
+# Every statement is an HTTPS round-trip to Turso (remote libSQL) that can flap;
+# Hrana streams also expire after ~10s idle and the libsql client does not
+# auto-recover. ``JobQueue._run_db`` is the single place that survives this:
+# time-box each call, and on ANY failure throw the connection away, open a
+# fresh one, back off, and retry before giving up. The submit/poll endpoints
+# route through it (a flap during ``enqueue`` becomes a 503 the Apps Script
+# retries, not a bare HTTP 500 — Plan
+# ``_plans/2026-06-17-submit-500s-turso-resilience.md``), and so does the
+# worker hot loop — ``claim_next_row`` / ``record_result`` /
+# ``recover_orphaned_rows`` — so a wedged worker self-heals instead of
+# spinning forever on a dead connection (Plan
+# ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md``).
 #
 # 15 s is loose enough to absorb a slow Turso roundtrip (cold-start spikes
 # ~5-10 s) and tight enough to beat the Apps Script's 30 s UrlFetch cap. All
@@ -223,7 +230,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -247,15 +254,19 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
 
 def _payload_to_row(
     payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**data)
     if tab == TAB_SIMPLE:
         return SimpleRow(**data)
+    if tab == TAB_SIMPLE_MOTION:
+        return SimpleMotionRow(**data)
     if tab == TAB_CARTOON:
         return CartoonRow(**data)
+    if tab == TAB_YT_CARTOON:
+        return YtCartoonRow(**data)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(data)
     if tab == TAB_TEXT_ON_IMG:
@@ -1190,24 +1201,31 @@ class JobQueue:
         return job_id
 
     async def claim_next_row(self) -> QueuedRow | None:
-        # Routed through ``_run_db`` (timeout + lock + discard-and-reconnect
-        # + retry) so a Turso Hrana stream eviction on the WORKER connection
-        # self-heals instead of wedging the queue. Without this, the worker's
-        # main loop polled a dead stream forever — the web ``submit`` survived
-        # because the 2026-06-17 fix routed only the web path through
-        # ``_run_db``. The worker hole bricked job-61d63442da7e6b25 on
-        # 2026-06-24 (rows stuck "Starting.." for 25+ min, kill button dead).
-        # Plan ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        # Routed through ``_run_db`` so the WORKER hot loop self-heals from an
+        # expired/dropped Turso (Hrana) stream exactly like the web path:
+        # time-box, discard-and-reconnect, retry. ``_run_db`` acquires
+        # ``self._lock`` itself, so this MUST NOT also wrap in
+        # ``async with self._lock`` — ``asyncio.Lock`` is not reentrant and a
+        # second acquire would deadlock the worker on its first claim. Before
+        # this fix the worker's main loop polled a dead stream forever (the
+        # web ``submit`` already survived because the 2026-06-17 fix routed
+        # only the web path through ``_run_db``); the worker hole bricked
+        # job-61d63442da7e6b25 on 2026-06-24 (rows stuck "Starting.." for
+        # 25+ min, kill button dead). Plans
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        # and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         return await self._run_db(self._claim_next_row_sync, op="claim_next_row")
 
     async def record_result(self, queue_id: int, result: RowResult) -> None:
-        # Same Hrana-stream resilience as ``claim_next_row``. Idempotent on
-        # retry by design — ``_record_result_sync`` UPDATEs by row id and
-        # short-circuits when the row is already terminal (queue.py:639). The
-        # runner's ``_pending_records`` drainer still wraps this for an
-        # outer retry budget, but in-band reconnect heals the common case
-        # before the drainer ever sees it. Plan
-        # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        # Same self-healing path as ``claim_next_row``; ``_run_db`` holds the
+        # lock, so do NOT re-lock here (non-reentrant). Idempotent on retry
+        # by design — ``_record_result_sync`` UPDATEs by row id and
+        # short-circuits when the row is already terminal (queue.py:639). On
+        # exhaustion ``_run_db`` raises ``QueueUnavailable``; the runner's
+        # ``_pending_records`` drainer catches that and buffers the result so
+        # nothing is dropped. Plans
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        # and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         await self._run_db(
             self._record_result_sync, queue_id, result, op="record_result"
         )
@@ -1289,11 +1307,13 @@ class JobQueue:
     async def recover_orphaned_rows(self) -> int:
         """Call on worker startup: rows stuck in PROCESSING are released.
 
-        Routed through ``_run_db`` so a stale Hrana stream from a previous
-        container's last writes (HF Spaces hot-restart) doesn't immediately
-        wedge the new worker's startup. Plan
-        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
-        """
+        Routed through ``_run_db`` (self-healing) so a Turso flap at boot —
+        or a stale Hrana stream left by a previous container's last writes on
+        HF Spaces hot-restart — reconnects and retries instead of failing the
+        worker before it can drain anything. ``_run_db`` takes the lock; no
+        second lock here (non-reentrant). Plans
+        ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``."""
         n = await self._run_db(
             self._recover_orphaned_rows_sync, op="recover_orphaned_rows"
         )
@@ -1304,15 +1324,19 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | CartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
         return FourImagesVO2Row(**payload)
     if tab == TAB_SIMPLE:
         return SimpleRow(**payload)
+    if tab == TAB_SIMPLE_MOTION:
+        return SimpleMotionRow(**payload)
     if tab == TAB_CARTOON:
         return CartoonRow(**payload)
+    if tab == TAB_YT_CARTOON:
+        return YtCartoonRow(**payload)
     if tab == TAB_SIMPLE_X4:
         return _hydrate_simple_x4(payload)
     if tab == TAB_TEXT_ON_IMG:

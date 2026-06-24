@@ -201,6 +201,87 @@ class CartoonRow:
 
 
 @dataclass
+class YtCartoonRow:
+    """yt-cartoon tab input row — engaging, variable-length cartoon videos.
+
+    A variable-geometry sibling of :class:`CartoonRow` (the flat-8s ``cartoon``
+    tab). Same article-driven, no-seed-image, multi-shot pipeline, PLUS four
+    operator knobs the new tab adds after ZapCap (sheet columns G-J):
+
+      * ``tone``         — ``Tone`` cell. Blank → engaging (this tab exists for
+        the new lively/clickable narration); an explicit calm-ish word opts
+        back into today's calm cartoon delivery. Resolved by
+        ``pipeline.yt_cartoon.normalize_tone``.
+      * ``cap_position`` — ``Cap Position`` relative-nudge cell shifting the
+        ZapCap caption height vs default.
+      * ``cta_position`` — ``CTA Position`` relative-nudge cell shifting the
+        CTA pill height vs default.
+      * ``vid_length``   — ``Vid Length`` cap cell (up to 10 / 15 / 20s). The
+        processor scales shots + voiceover to fill it and produces TWO videos
+        on the 10s bucket, ONE on 15s/20s. Resolved by
+        ``pipeline.yt_cartoon.plan_shots_for_length``.
+
+    Manual Image (D) is present in the sheet but ignored, exactly like cartoon.
+    The existing cartoon path is untouched — this is a separate row + processor
+    that REUSES the shared planner / TTS-sizing / CTA / ZapCap / Rendi helpers.
+    Plan: ``_plans/2026-06-17-yt-cartoon-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # CTA pill on/off (mirrors cartoon)
+    cta_text: str = ""                # operator text; empty = per-language default
+    # NEW yt-cartoon knobs — all blank = today's defaults.
+    tone: str = ""                    # "" | "engaging" | "calm"
+    cap_position: str = ""            # nudge label (e.g. "Higher")
+    cta_position: str = ""            # nudge label
+    vid_length: str = ""              # "" | "10" | "15" | "20" (or "up to 15s")
+
+
+@dataclass
+class SimpleMotionRow:
+    """simple-motion tab input row — animate super-realistic images.
+
+    A sibling of :class:`CartoonRow` (same article-driven planner / TTS-sizing /
+    CTA / ZapCap / Rendi pipeline) with two differences:
+
+      * Images are SUPER-REALISTIC photographs, not cartoons (the row processor
+        prepends ``REALISTIC_STYLE`` instead of ``CARTOON_STYLE`` and uses the
+        ``simple_motion_planner_prompt`` which describes photographic scenes).
+      * The operator can paste their OWN images. ``manual_image_1`` (sheet col D)
+        is shot 1; ``manual_image_2`` (col E) is shot 2. A blank cell is
+        auto-generated; a filled cell is animated as-is. So a row produces ONE
+        8-second video (two 4s shots stitched), written to Ready Video 1.
+
+    Same CTA columns as cartoon (Yoav 2026-06-08 pattern). The cartoon /
+    yt-cartoon orchestration is untouched — this is a separate row + processor
+    that REUSES the shared helpers. Plan:
+    ``_plans/2026-06-22-simple-motion-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_1: str               # col D — blank → generate; filled → as-is
+    manual_image_2: str               # col E — blank → generate; filled → as-is
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # mirrors cartoon — yellow pill at bottom
+    cta_text: str = ""                # operator text; empty = per-language default
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 

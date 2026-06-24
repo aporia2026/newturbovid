@@ -59,6 +59,17 @@ CARTOON_STYLE = (
     "colors, modern 2D animated-film look."
 )
 
+# Super-realistic look for the ``simple-motion`` tab. Passed to
+# ``image_prompt_for_shot(style=…)`` so generated shots come out as believable
+# photographs, NOT illustrations. The trailing "not an illustration, render, or
+# cartoon" is load-bearing — it keeps nano-banana-2 from drifting back toward the
+# stylised default. Plan ``_plans/2026-06-22-simple-motion-tab.md``.
+REALISTIC_STYLE = (
+    "Ultra-realistic photograph, true-to-life detail, natural lighting, "
+    "authentic colors and textures, shallow depth of field, shot on a "
+    "full-frame camera — photorealistic, not an illustration, render, or cartoon."
+)
+
 # Each voiceover targets ~5-6 seconds of speech, sized so that even at the slow
 # end of the Gemini TTS rate (~1.5 wps observed after the 1.3x speed-up), the
 # full line fits inside the cartoon row processor's hard 8.0s video ceiling
@@ -129,21 +140,31 @@ class ShortenResult:
 
 
 def _format_planner_prompt(
-    template: str, *, language: str, num_ideas: int, num_shots: int
+    template: str,
+    *,
+    language: str,
+    num_ideas: int,
+    num_shots: int,
+    target_words: int = CARTOON_TARGET_WORDS,
+    min_words: int = CARTOON_MIN_WORDS,
+    max_words: int = CARTOON_MAX_WORDS,
 ) -> str:
     """Substitute the planner's per-row placeholders into the admin template.
 
     Tolerant of unknown ``{...}`` tokens — admin edits may drop a placeholder
     or paste literal braces in examples. KeyError falls through to a one-by-one
     replacement that leaves unknown tokens as-is.
+
+    The ``*_words`` budgets default to the cartoon constants (so the cartoon
+    tab is byte-identical) but the yt-cartoon tab passes per-Vid-Length values.
     """
     vars: dict[str, object] = {
         "language": language or "the article language",
         "num_ideas": num_ideas,
         "num_shots": num_shots,
-        "target_words": CARTOON_TARGET_WORDS,
-        "min_words": CARTOON_MIN_WORDS,
-        "max_words": CARTOON_MAX_WORDS,
+        "target_words": target_words,
+        "min_words": min_words,
+        "max_words": max_words,
     }
     try:
         return template.format(**vars)
@@ -160,9 +181,25 @@ def _format_planner_prompt(
 
 
 def _user_message(
-    article_body: str, open_comments: OpenCommentsAnalysis
+    article_body: str,
+    open_comments: OpenCommentsAnalysis,
+    *,
+    vertical: str = "",
+    country: str = "",
 ) -> str:
     parts: list[str] = []
+    # Give the planner the topic + audience signal so it can pick a character
+    # that FITS this row instead of defaulting to the same generic person every
+    # time (the recurring glasses-woman bug, Yoav 2026-06-17). Empty values are
+    # omitted so cartoon callers that don't pass them are unaffected.
+    ctx_bits: list[str] = []
+    if vertical.strip():
+        ctx_bits.append(f"vertical/topic: {vertical.strip()}")
+    if country.strip():
+        ctx_bits.append(f"target country/market: {country.strip()}")
+    if ctx_bits:
+        parts.append("CONTEXT (pick characters + scenes that fit this audience): "
+                     + "; ".join(ctx_bits))
     if open_comments.tone_hints:
         parts.append("TONE_HINTS: " + "; ".join(open_comments.tone_hints))
     if open_comments.directives:
@@ -183,13 +220,19 @@ def _user_message(
     return "\n\n".join(parts)
 
 
-def image_prompt_for_shot(scene: str, *, is_chained: bool) -> str:
+def image_prompt_for_shot(
+    scene: str, *, is_chained: bool, style: str = CARTOON_STYLE
+) -> str:
     """Compose the full nano-banana-2 prompt for one shot.
 
-    Prepends the shared cartoon STYLE; for chained (shot 2+) shots, appends the
+    Prepends the given visual ``style``; for chained (shot 2+) shots, appends the
     consistency clause so the image-to-image step holds the character.
+
+    ``style`` defaults to ``CARTOON_STYLE`` so the cartoon / yt-cartoon callers
+    are byte-identical; the simple-motion tab passes ``REALISTIC_STYLE`` for
+    photographic shots.
     """
-    base = f"{CARTOON_STYLE} {scene.strip()} {NO_BRANDING}"
+    base = f"{style} {scene.strip()} {NO_BRANDING}"
     return f"{base} {CONSISTENCY_CLAUSE}" if is_chained else base
 
 
@@ -284,9 +327,16 @@ class _DroppedFragment:
 
 
 def _coerce_ideas(
-    raw_ideas: list[Any], num_ideas: int, num_shots: int
+    raw_ideas: list[Any],
+    num_ideas: int,
+    num_shots: int,
+    max_words: int = CARTOON_MAX_WORDS,
 ) -> tuple[list[CartoonIdea], list[_DroppedFragment]]:
     """Normalize parsed JSON into ``num_ideas`` ideas of ``num_shots`` shots.
+
+    ``max_words`` defaults to the cartoon cap so the cartoon tab is unchanged;
+    the yt-cartoon tab passes the larger per-Vid-Length cap so a longer
+    (e.g. ~30-word, 20s) voiceover isn't truncated down to a cartoon-length line.
 
     Returns ``(kept, fragments)``. ``kept`` is the list of ideas that passed
     every validation step. ``fragments`` is the list of ideas whose shots/style
@@ -331,13 +381,13 @@ def _coerce_ideas(
             )
             continue
         original_words = len(voiceover_raw.split())
-        voiceover = _enforce_word_cap(voiceover_raw, CARTOON_MAX_WORDS)
-        if original_words > CARTOON_MAX_WORDS:
+        voiceover = _enforce_word_cap(voiceover_raw, max_words)
+        if original_words > max_words:
             _log.warning(
                 "cartoon_voiceover_capped",
                 idea_index=raw_idx,
                 original_words=original_words,
-                max_words=CARTOON_MAX_WORDS,
+                max_words=max_words,
                 capped_words=len(voiceover.split()),
             )
 
@@ -473,6 +523,11 @@ async def generate_cartoon_plan(
     model: str = MODEL_SCRIPT_GEN,
     settings_store: SettingsStore | None = None,
     safety: SafetyContext = SAFE,
+    planner_prompt_key: str = SETTING_CARTOON_PLANNER_PROMPT,
+    planner_prompt_default: str = CARTOON_PLANNER_PROMPT_DEFAULT,
+    target_words: int = CARTOON_TARGET_WORDS,
+    min_words: int = CARTOON_MIN_WORDS,
+    max_words: int = CARTOON_MAX_WORDS,
 ) -> CartoonPlan:
     """Plan ``num_ideas`` cartoon videos from the article. Never raises.
 
@@ -482,12 +537,18 @@ async def generate_cartoon_plan(
     The planner system prompt is admin-editable via the ``cartoon_planner_prompt``
     setting; when ``safety.matched`` the sensitive-apparel block is appended
     so both the voiceover and the scene descriptions stay product-only.
+
+    ``planner_prompt_key`` / ``planner_prompt_default`` and the ``*_words``
+    budgets default to the cartoon values; the yt-cartoon tab overrides them to
+    select the engaging prompt and the per-Vid-Length word budget WITHOUT
+    forking this planner (so its hard-won coercion + fragment-recovery logic is
+    shared). Cartoon callers pass nothing, so cartoon behaviour is unchanged.
     """
-    template = CARTOON_PLANNER_PROMPT_DEFAULT
+    template = planner_prompt_default
     safety_block = ""
     if settings_store is not None:
         template = await settings_store.get(
-            SETTING_CARTOON_PLANNER_PROMPT, default=CARTOON_PLANNER_PROMPT_DEFAULT
+            planner_prompt_key, default=planner_prompt_default
         )
         if safety.matched:
             # No explicit default — let the store fall through to the
@@ -501,6 +562,9 @@ async def generate_cartoon_plan(
         language=language,
         num_ideas=num_ideas,
         num_shots=num_shots,
+        target_words=target_words,
+        min_words=min_words,
+        max_words=max_words,
     )
     # Blank script_pattern → ask the selector for a default template body.
     # Cartoon shares the same library as the script tabs (Yoav 2026-06-07,
@@ -528,7 +592,9 @@ async def generate_cartoon_plan(
             stage="cartoon_planner_prompt",
             matched_keyword=safety.matched_keyword,
         )
-    user = _user_message(article_body, open_comments)
+    user = _user_message(
+        article_body, open_comments, vertical=vertical, country=country
+    )
 
     _log.info(
         "cartoon_plan_submit",
@@ -560,7 +626,7 @@ async def generate_cartoon_plan(
     try:
         parsed = json.loads(result.text)
         ideas, fragments = _coerce_ideas(
-            parsed.get("ideas") or [], num_ideas, num_shots
+            parsed.get("ideas") or [], num_ideas, num_shots, max_words
         )
     except (json.JSONDecodeError, AttributeError, TypeError) as e:
         _log.error("cartoon_plan_parse_failed", error=str(e), raw_preview=result.text[:200])
@@ -580,7 +646,7 @@ async def generate_cartoon_plan(
                 client,
                 text=frag.voiceover_raw,
                 language=language,
-                target_words=CARTOON_TARGET_WORDS,
+                target_words=target_words,
             )
         except Exception as e:    # last-line defense — recovery is best-effort
             _log.error(

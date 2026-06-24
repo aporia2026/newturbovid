@@ -32,9 +32,11 @@ from bulkvid.models.row import (
     AvatarRow,
     FourImagesVO2Row,
     ImageVORow,
+    SimpleMotionRow,
     SimpleRow,
     SimpleX4Row,
     TextOnImgRow,
+    YtCartoonRow,
 )
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
@@ -44,8 +46,10 @@ from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
+    TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
     TAB_TEXT_ON_IMG,
+    TAB_YT_CARTOON,
     Job,
     JobQueue,
     QueueBusy,
@@ -119,6 +123,52 @@ class CartoonRowIn(BaseModel):
     cta_enabled: bool = False    # Yoav 2026-06-08 — Sheet column CTA Yes/No
     cta_text: str = ""           # operator text; empty → per-language fallback
     open_comments: str = ""
+
+
+class SimpleMotionRowIn(BaseModel):
+    """Wire shape for the ``simple-motion`` tab — CartoonRowIn plus two manual
+    image columns (D / E). A blank image cell is auto-generated (realistic
+    style); a filled cell is animated as-is. Manual image URLs are passed
+    through (same as the avatar / image_vo tabs); ``cta_text`` is bounded
+    server-side. Plan ``_plans/2026-06-22-simple-motion-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_1: str = ""     # col D — blank → generate; filled → as-is
+    manual_image_2: str = ""     # col E — blank → generate; filled → as-is
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
+class YtCartoonRowIn(BaseModel):
+    """Wire shape for the ``yt-cartoon`` tab — CartoonRowIn plus the four new
+    per-row knobs (Tone, Cap Position, CTA Position, Vid Length). The string
+    knobs are coerced/normalised defensively downstream
+    (``pipeline.yt_cartoon``), so a blank or garbage cell never 400s the batch."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+    # New yt-cartoon knobs — blank = today's defaults.
+    tone: str = ""
+    cap_position: str = ""
+    cta_position: str = ""
+    vid_length: str = ""
 
 
 class CardChoiceIn(BaseModel):
@@ -203,6 +253,10 @@ class SubmitJobIn(BaseModel):
     rows_simple: list[ImageVORowIn] | None = None
     # The cartoon tab generates animated videos from text (no seed image).
     rows_cartoon: list[CartoonRowIn] | None = None
+    # simple-motion: animate super-realistic images (manual D/E or generated).
+    rows_simple_motion: list[SimpleMotionRowIn] | None = None
+    # yt-cartoon: engaging, variable-length cartoon videos (plan 2026-06-17).
+    rows_yt_cartoon: list[YtCartoonRowIn] | None = None
     # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
     rows_simple_x4: list[SimpleX4RowIn] | None = None
     # paste text on img: manual image + center-overlay text (plan 2026-06-09).
@@ -342,6 +396,59 @@ def _build_text_on_img_row(r: TextOnImgRowIn) -> TextOnImgRow:
         aspect_ratio=r.aspect_ratio,
         script_pattern=r.script_pattern,
         open_comments=r.open_comments,
+    )
+
+
+def _build_simple_motion_row(r: SimpleMotionRowIn) -> SimpleMotionRow:
+    """Coerce a SimpleMotionRowIn into a SimpleMotionRow.
+
+    Server-side hardening: ``cta_text`` bounded at 80 chars (matches cartoon);
+    manual image URLs trimmed and passed through (the processor downloads + re-
+    uploads them, same as the avatar tab). Blank image cells stay blank so the
+    processor generates a realistic image for that shot.
+    """
+    return SimpleMotionRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_1=(r.manual_image_1 or "").strip(),
+        manual_image_2=(r.manual_image_2 or "").strip(),
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
+        open_comments=r.open_comments,
+    )
+
+
+def _build_yt_cartoon_row(r: YtCartoonRowIn) -> YtCartoonRow:
+    """Coerce a YtCartoonRowIn into a YtCartoonRow.
+
+    Server-side hardening: ``cta_text`` bounded at 80 chars (matches cartoon),
+    and the four knob strings trimmed + length-bounded so a forged payload
+    can't bloat them. Their SEMANTIC normalisation (tone registry, Vid Length
+    bucket, position nudges) happens once in the row processor's pure helpers —
+    passing the raw label through keeps a single source of truth for each map.
+    """
+    return YtCartoonRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        open_comments=r.open_comments,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
+        tone=(r.tone or "").strip()[:40],
+        cap_position=(r.cap_position or "").strip()[:40],
+        cta_position=(r.cta_position or "").strip()[:40],
+        vid_length=(r.vid_length or "").strip()[:40],
     )
 
 
@@ -611,6 +718,18 @@ async def submit_job(
         if not payload.rows_cartoon:
             raise HTTPException(400, "rows_cartoon is required for tab_type=cartoon")
         rows = [CartoonRow(**r.model_dump()) for r in payload.rows_cartoon]
+    elif payload.tab_type == TAB_SIMPLE_MOTION:
+        if not payload.rows_simple_motion:
+            raise HTTPException(
+                400, "rows_simple_motion is required for tab_type=simple_motion"
+            )
+        rows = [_build_simple_motion_row(r) for r in payload.rows_simple_motion]
+    elif payload.tab_type == TAB_YT_CARTOON:
+        if not payload.rows_yt_cartoon:
+            raise HTTPException(
+                400, "rows_yt_cartoon is required for tab_type=yt_cartoon"
+            )
+        rows = [_build_yt_cartoon_row(r) for r in payload.rows_yt_cartoon]
     elif payload.tab_type == TAB_SIMPLE_X4:
         if not payload.rows_simple_x4:
             raise HTTPException(
