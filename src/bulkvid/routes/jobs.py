@@ -75,6 +75,18 @@ _KILL_CALL_TIMEOUT_SECONDS = float(
     os.environ.get("BULKVID_KILL_CALL_TIMEOUT_SECONDS") or 10.0
 )
 
+# Hard timeout around every libsql roundtrip inside ``/jobs/poll``. The poll
+# fans out to 3–5 reads per cycle (list_jobs, list_rows-per-running-job,
+# eta_medians, user_queue_depth, oldest-pending-row-age). Without a bound, a
+# single stalled roundtrip pins the whole poll — the sidebar's "Loading…"
+# placeholder stays up forever and the user mistakes it for the kill button
+# being broken. 15 s is loose enough to absorb cold-start (~5 s) and a slow
+# read on top, tight enough that the Apps Script ``UrlFetch`` 30 s cap never
+# trips. Plan ``_plans/2026-06-14-fast-fail-kill-and-poll-timeout.md`` §B.
+_POLL_DB_CALL_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_POLL_DB_CALL_TIMEOUT_SECONDS") or 15.0
+)
+
 _log = get_logger("route.jobs")
 
 
@@ -884,16 +896,55 @@ async def poll_jobs(
         raise HTTPException(400, "too many log ids requested (max 50)")
 
     filter_email = None if identity.is_admin else identity.email
-    jobs = await queue.list_jobs(user_email=filter_email, limit=limit)
+    # ``list_jobs`` is the one mandatory DB call — without it the sidebar
+    # has nothing to render. A stalled libsql roundtrip here is the most
+    # common failure mode (the one the operator saw 2026-06-14 as
+    # "Loading… forever"), so a hard bound + 504 is the right shape: the
+    # sidebar's ``onFail`` keeps the last good ``_lastJobs`` on screen
+    # and shows "Reconnecting…" instead of a blank "Loading…". Plan
+    # ``_plans/2026-06-14-fast-fail-kill-and-poll-timeout.md`` §B.
+    try:
+        jobs = await asyncio.wait_for(
+            queue.list_jobs(user_email=filter_email, limit=limit),
+            timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as e:
+        _log.warning(
+            "poll_db_call_timeout",
+            call="list_jobs",
+            user_email=identity.email,
+            timeout_s=_POLL_DB_CALL_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            504,
+            "poll timed out — worker may be hung; restart the backend",
+        ) from e
     owned_job_ids = {j.job_id for j in jobs}
 
     # Per-row detail only for running jobs — matches the sidebar's existing
     # behavior (queued jobs show "waiting in queue", archive rows don't need
     # refresh). Cuts per-poll DB work when there's a long archive list.
+    # Per-job ``list_rows`` is best-effort: a single hung call drops THAT
+    # job's row breakdown but does not 504 the whole poll. The sidebar
+    # renders the job card with a collapsed row list, and the next cycle
+    # retries automatically.
     rows_by_job: dict[str, list[JobRowOut]] = {}
     for job in jobs:
         if job.status == JOB_RUNNING:
-            raw_rows = await queue.list_rows(job.job_id)
+            try:
+                raw_rows = await asyncio.wait_for(
+                    queue.list_rows(job.job_id),
+                    timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                _log.warning(
+                    "poll_db_call_timeout",
+                    call="list_rows",
+                    user_email=identity.email,
+                    job_id=job.job_id,
+                    timeout_s=_POLL_DB_CALL_TIMEOUT_SECONDS,
+                )
+                continue
             rows_by_job[job.job_id] = [
                 _row_to_out(job.job_id, r) for r in raw_rows
             ]
@@ -924,7 +975,18 @@ async def poll_jobs(
     # median is well-defined (≥10 samples) — the client handles that
     # filtering.
     try:
-        eta_medians = await queue.eta_medians()
+        eta_medians = await asyncio.wait_for(
+            queue.eta_medians(),
+            timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        _log.warning(
+            "poll_db_call_timeout",
+            call="eta_medians",
+            user_email=identity.email,
+            timeout_s=_POLL_DB_CALL_TIMEOUT_SECONDS,
+        )
+        eta_medians = {}
     except Exception as e:    # noqa: BLE001 — never let an ETA aggregate 500 a poll
         _log.warning("eta_medians_failed", err=str(e)[:200])
         eta_medians = {}
@@ -935,8 +997,9 @@ async def poll_jobs(
     # in that case rather than showing stale numbers.
     queue_status: QueueStatusOut | None = None
     try:
-        in_flight, queued, queued_per_tab = await queue.user_queue_depth(
-            user_email=filter_email,
+        in_flight, queued, queued_per_tab = await asyncio.wait_for(
+            queue.user_queue_depth(user_email=filter_email),
+            timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
         )
         settings = get_settings()
         max_concurrent = max(1, int(settings.BULKVID_MAX_CONCURRENT_ROWS))
@@ -972,9 +1035,20 @@ async def poll_jobs(
         stuck_queued_seconds: int | None = None
         if queued > 0 and in_flight == 0:
             try:
-                oldest_age = await queue.user_oldest_pending_row_age_seconds(
-                    user_email=filter_email,
+                oldest_age = await asyncio.wait_for(
+                    queue.user_oldest_pending_row_age_seconds(
+                        user_email=filter_email,
+                    ),
+                    timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
                 )
+            except TimeoutError:
+                _log.warning(
+                    "poll_db_call_timeout",
+                    call="user_oldest_pending_row_age_seconds",
+                    user_email=identity.email,
+                    timeout_s=_POLL_DB_CALL_TIMEOUT_SECONDS,
+                )
+                oldest_age = None
             except Exception as e:    # noqa: BLE001
                 _log.warning("stuck_queued_age_failed", err=str(e)[:200])
                 oldest_age = None
@@ -994,6 +1068,13 @@ async def poll_jobs(
             max_concurrent=max_concurrent,
             eta_seconds=eta_seconds,
             stuck_queued_seconds=stuck_queued_seconds,
+        )
+    except TimeoutError:
+        _log.warning(
+            "poll_db_call_timeout",
+            call="user_queue_depth",
+            user_email=identity.email,
+            timeout_s=_POLL_DB_CALL_TIMEOUT_SECONDS,
         )
     except Exception as e:    # noqa: BLE001 — never let queue-depth 500 a poll
         _log.warning("queue_status_failed", err=str(e)[:200])

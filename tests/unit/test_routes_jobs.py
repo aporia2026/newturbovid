@@ -1085,6 +1085,85 @@ def test_kill_all_jobs_returns_rows_aborted_field(client: TestClient) -> None:
     assert body["rows_aborted"] == 1
 
 
+# ── /jobs/poll timeouts (rule 18) ───────────────────────────────────────────
+# Plan: ``_plans/2026-06-14-fast-fail-kill-and-poll-timeout.md`` §B.
+# Without a per-call ``asyncio.wait_for`` bound, a stalled libsql roundtrip
+# pinned the poll until the Apps Script's 30 s ``UrlFetch`` cap fired, and
+# the sidebar sat on "Loading…" forever — which the operator mistook for the
+# kill button being broken. ``list_jobs`` is mandatory and 504s on timeout
+# so the sidebar's ``onFail`` shows "Reconnecting…"; the other four reads
+# (rows, eta_medians, queue_depth, oldest_pending_age) are best-effort and
+# drop their output silently rather than 504ing the whole poll.
+
+
+def test_poll_returns_504_when_list_jobs_times_out(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``list_jobs`` is the one mandatory poll call. A timeout there has to
+    surface as 504 with a diagnostic so the sidebar can flag the backend as
+    unhealthy instead of sitting on a blank loader."""
+    monkeypatch.setattr(jobs_routes, "_POLL_DB_CALL_TIMEOUT_SECONDS", 0.1)
+    _patch_queue_method_to_hang(app, on_method="list_jobs")
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 504
+    body = r.json()
+    assert "poll timed out" in body["detail"].lower()
+    assert "restart" in body["detail"].lower()
+
+
+def test_poll_returns_partial_when_user_queue_depth_times_out(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled ``user_queue_depth`` must NOT 504 the whole poll. The
+    sidebar still needs ``jobs`` to render; the queue-depth banner just
+    hides itself (``queue_status`` is null) until the next cycle."""
+    monkeypatch.setattr(jobs_routes, "_POLL_DB_CALL_TIMEOUT_SECONDS", 0.1)
+    # Need at least one job present so the poll exercises the queue-depth
+    # branch and the response contains something to assert against.
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    _patch_queue_method_to_hang(app, on_method="user_queue_depth")
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["jobs"]) == 1
+    assert body["queue_status"] is None
+
+
+def test_poll_returns_partial_when_eta_medians_times_out(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stalled ``eta_medians`` falls back to an empty dict — same graceful
+    degradation the existing try/except already provided, now tripped by
+    the timeout bound instead of a raised exception."""
+    monkeypatch.setattr(jobs_routes, "_POLL_DB_CALL_TIMEOUT_SECONDS", 0.1)
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    _patch_queue_method_to_hang(app, on_method="eta_medians")
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["jobs"]) == 1
+    assert body["eta_medians_by_tab"] == {}
+
+
+def test_poll_returns_partial_when_list_rows_times_out(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-job ``list_rows`` is best-effort. A stalled call drops THAT
+    job's row breakdown from ``rows_by_job`` but the rest of the poll
+    completes normally — the sidebar renders the job card without rows."""
+    monkeypatch.setattr(jobs_routes, "_POLL_DB_CALL_TIMEOUT_SECONDS", 0.1)
+    # Need a RUNNING job for ``list_rows`` to be invoked at all.
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    claimed = await_(app.state.queue.claim_next_row())
+    assert claimed is not None
+    _patch_queue_method_to_hang(app, on_method="list_rows")
+    r = client.get("/jobs/poll", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["jobs"]) == 1
+    assert body["rows_by_job"] == {}
+
+
 # ── Helper: run a coroutine from a sync test ────────────────────────────────
 
 

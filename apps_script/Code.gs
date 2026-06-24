@@ -1479,6 +1479,16 @@ function getJobLog(jobId, rowNum) {
 }
 
 
+// Kill calls bypass the default 3-attempt retry loop in ``_fetchJson``.
+// A 504 from the kill route already means "the backend tried for 10 s
+// and the libsql roundtrip is stalled" — retrying twice more (with the
+// default 600 ms + 1200 ms backoffs) stretches the user-visible wait
+// to ~75 s before the toast appears, which is indistinguishable from
+// "the button is broken." Fail fast and let the operator click again
+// or restart the backend. Plan
+// _plans/2026-06-14-fast-fail-kill-and-poll-timeout.md §A.
+const KILL_RETRY_OPTS = { maxAttempts: 1 };
+
 /** Called from Sidebar.html: kill ONE specific job. Other jobs keep running —
  *  killing one never cancels another. Also aborts pending/in-flight rows so
  *  the sidebar reflects the kill immediately (plan
@@ -1487,7 +1497,11 @@ function getJobLog(jobId, rowNum) {
 function killJob(jobId) {
   if (!jobId) return { ok: false, error: 'no job id' };
   try {
-    const r = _fetchJson('/jobs/' + encodeURIComponent(jobId) + '/kill', { method: 'post' });
+    const r = _fetchJson(
+      '/jobs/' + encodeURIComponent(jobId) + '/kill',
+      { method: 'post' },
+      KILL_RETRY_OPTS,
+    );
     return { ok: true, rows_aborted: (r && r.rows_aborted) || 0 };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
@@ -1501,7 +1515,7 @@ function killJob(jobId) {
  *  _plans/2026-06-14-stuck-processing-rows.md §B). */
 function killAllJobs() {
   try {
-    const r = _fetchJson('/jobs/kill-all', { method: 'post' });
+    const r = _fetchJson('/jobs/kill-all', { method: 'post' }, KILL_RETRY_OPTS);
     return {
       ok: true,
       killed: (r && r.killed) || 0,

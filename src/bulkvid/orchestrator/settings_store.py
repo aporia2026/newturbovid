@@ -20,13 +20,30 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypeVar
 
 from bulkvid.logging import get_logger
 from bulkvid.orchestrator import db as _db
 
 _log = get_logger("settings_store")
+
+# Return type preserved across the reconnect-retry wrapper.
+_T = TypeVar("_T")
+
+# How many tries inside ``_run_sync_with_reconnect_retry`` before propagating.
+# 2 = one fresh try after one reconnect, which heals a single Hrana stream
+# eviction. Persistent Turso outages still propagate so the row processor
+# surfaces a real failure instead of silently looping. Plan
+# ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+_SETTINGS_DB_MAX_ATTEMPTS = 2
+# Backoff after a discard-and-reconnect attempt. Short on purpose — the
+# common cause is a single stale stream id, and a fresh connection serves
+# it on the next try. A real outage propagates anyway after one cycle.
+_SETTINGS_DB_RECONNECT_BACKOFF_SECONDS = 0.5
 
 
 _SCHEMA = """
@@ -70,21 +87,17 @@ class SettingsStore:
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        # See ``JobQueue.__init__`` for the same backend-selection rationale.
-        # ``sync_url`` empty → plain sqlite3 (dev/tests); set → Turso via the
-        # libsql embedded replica.
-        self._conn = _db.connect(
-            self._db_path,
-            sync_url=sync_url,
-            auth_token=auth_token,
-            sync_interval_seconds=sync_interval_seconds,
-        )
-        try:
-            self._conn.row_factory = sqlite3.Row
-        except AttributeError:
-            _log.warning("row_factory_unsupported", note="dict-like row access disabled")
-        self._conn.executescript("PRAGMA journal_mode=WAL;")
-        self._conn.executescript(_SCHEMA)
+        # Connection params stashed so ``_reconnect_sync`` can rebuild a
+        # fresh connection after a Turso flap or Hrana stream eviction wedges
+        # the current one. ``_db.connect`` returns plain sqlite3 when
+        # ``sync_url`` is empty (dev/tests) and a libsql remote connection
+        # otherwise (prod). The reconnect path mirrors
+        # ``JobQueue._reconnect_sync`` (queue.py:340). See
+        # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        self._sync_url = sync_url
+        self._auth_token = auth_token
+        self._sync_interval_seconds = sync_interval_seconds
+        self._conn = self._open_connection()
         self._defaults: dict[str, str] = dict(defaults or {})
         self._cache: dict[str, str] = {}
         self._cache_loaded_at = 0.0
@@ -95,6 +108,95 @@ class SettingsStore:
             db_path=str(self._db_path),
             default_count=len(self._defaults),
         )
+
+    def _open_connection(self) -> object:
+        """Open and fully configure a settings DB connection.
+
+        Used at construction AND by ``_reconnect_sync`` — keeping the setup
+        in one place means a reconnected handle is configured identically
+        to the original (same row factory, same schema/index guarantees).
+        Mirrors ``JobQueue._open_connection`` (queue.py:296).
+        """
+        conn = _db.connect(
+            self._db_path,
+            sync_url=self._sync_url,
+            auth_token=self._auth_token,
+            sync_interval_seconds=self._sync_interval_seconds,
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+        except AttributeError:
+            _log.warning("row_factory_unsupported", note="dict-like row access disabled")
+        conn.executescript("PRAGMA journal_mode=WAL;")
+        conn.executescript(_SCHEMA)
+        return conn
+
+    def _reconnect_sync(self, *, reason: str) -> None:
+        """Throw away the current connection and open a fresh one.
+
+        Cheap-and-dumb on purpose: we never try to *heal* a half-dead libsql
+        socket, we replace it. ``self._conn`` is swapped to the new handle
+        first so the old one can be closed best-effort. If opening fails
+        (Turso fully down) the exception propagates and the caller counts
+        it as a failed attempt. Mirrors ``JobQueue._reconnect_sync``
+        (queue.py:340). Plan
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        """
+        old = self._conn
+        self._conn = self._open_connection()
+        with suppress(Exception):
+            old.close()
+        _log.warning("settings_store_db_reconnect", reason=reason)
+
+    def _run_sync_with_reconnect_retry(
+        self,
+        fn: Callable[[], _T],
+        *,
+        op: str,
+        attempts: int = _SETTINGS_DB_MAX_ATTEMPTS,
+        backoff_seconds: float = _SETTINGS_DB_RECONNECT_BACKOFF_SECONDS,
+    ) -> _T:
+        """Run a sync DB op; on failure discard-and-reconnect then retry.
+
+        Mirrors the discard-and-reconnect discipline from ``JobQueue._run_db``
+        (queue.py:1081) but synchronous — SettingsStore's callers already run
+        each DB op inside ``asyncio.to_thread`` and don't need a per-call
+        wall-clock timeout (the SELECTs here read a tiny table). On ANY
+        failure (libsql raises an undocumented grab-bag) we throw the
+        connection away, open a fresh one, back off, and retry. After
+        ``attempts`` failures the last exception propagates so the row
+        processor surfaces a real failure rather than silently looping.
+        Plan ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        """
+        last_exc: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return fn()
+            except Exception as e:    # libsql throws an undocumented grab-bag
+                last_exc = e
+                attempts_left = attempts - attempt - 1
+                _log.warning(
+                    "settings_store_db_call_retry",
+                    op=op,
+                    attempt=attempt + 1,
+                    of=attempts,
+                    reason=type(e).__name__,
+                    error=str(e)[:200],
+                    attempts_left=attempts_left,
+                )
+                if attempts_left <= 0:
+                    break
+                try:
+                    self._reconnect_sync(reason=f"{op}:{type(e).__name__}")
+                except Exception as re:    # reconnect may itself flap
+                    _log.warning(
+                        "settings_store_reconnect_failed",
+                        op=op,
+                        error=str(re)[:200],
+                    )
+                time.sleep(backoff_seconds)
+        assert last_exc is not None    # loop entered the except branch
+        raise last_exc
 
     # ── Sync helpers ────────────────────────────────────────────────────────
 
@@ -224,17 +326,17 @@ class SettingsStore:
         return self._cache
 
     def _load_sync_with_retry(self) -> dict[str, str]:
-        """``_load_sync`` with one cold-start retry. See ``_ensure_cache``."""
-        try:
-            return self._load_sync()
-        except Exception as e:    # broad: libSQL raises ValueError, sqlite3 raises OperationalError
-            _log.warning(
-                "settings_store_load_retry",
-                error=str(e)[:200],
-                error_type=type(e).__name__,
-            )
-            time.sleep(0.5)
-            return self._load_sync()
+        """``_load_sync`` with discard-and-reconnect retry. See ``_ensure_cache``.
+
+        Was originally a single retry against the SAME connection to absorb
+        a cold-start ``invalid token`` blip. That didn't help when the
+        underlying connection's Hrana stream was evicted server-side (Turso
+        recycles long-lived/idle streams) — the libsql client clung to the
+        dead stream id and every subsequent call 404'd. Now routes through
+        ``_run_sync_with_reconnect_retry`` so a stale stream id heals on the
+        retry. Plan ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        """
+        return self._run_sync_with_reconnect_retry(self._load_sync, op="load")
 
     async def get(self, key: str, default: str | None = None) -> str:
         """Return the stored value if present, else default, else the registered default."""
@@ -253,7 +355,15 @@ class SettingsStore:
         return merged
 
     async def set(self, key: str, value: str, updated_by: str) -> str | None:
-        old = await asyncio.to_thread(self._set_sync, key, value, updated_by)
+        # Reconnect-retry wrap mirrors ``_load_sync_with_retry`` — a Hrana
+        # stream eviction would otherwise brick admin saves (admin panel)
+        # the same way it bricked reads. Plan
+        # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        old = await asyncio.to_thread(
+            self._run_sync_with_reconnect_retry,
+            lambda: self._set_sync(key, value, updated_by),
+            op="set",
+        )
         # Invalidate cache so the next get reads fresh.
         async with self._lock:
             self._cache_loaded_at = 0.0
@@ -321,7 +431,15 @@ class SettingsStore:
     async def audit(
         self, key: str | None = None, limit: int = 50
     ) -> list[dict[str, str | None]]:
-        rows = await asyncio.to_thread(self._list_audit_sync, key, limit)
+        # Reconnect-retry wrap mirrors ``_load_sync_with_retry`` — the audit
+        # listing is the admin panel's main read; if its connection's Hrana
+        # stream is dead, the panel can't show history until restart. Plan
+        # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        rows = await asyncio.to_thread(
+            self._run_sync_with_reconnect_retry,
+            lambda: self._list_audit_sync(key, limit),
+            op="audit",
+        )
         return [
             {
                 "id": str(r["id"]),

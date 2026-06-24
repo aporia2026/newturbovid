@@ -236,3 +236,81 @@ def test_enqueue_large_batch_single_insert(queue: JobQueue) -> None:
     job_id = asyncio.run(_enqueue(queue, rows, "batch"))
     out = asyncio.run(queue.list_rows(job_id))
     assert sorted(r["row_num"] for r in out) == list(range(2, 52))
+
+
+# ── Worker-path Hrana stream resilience ──────────────────────────────────────
+
+
+def test_record_result_reconnects_after_stream_eviction(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for job-61d63442da7e6b25 (2026-06-24, screenshot 2).
+
+    The worker's libsql connection's Hrana stream got evicted server-side.
+    ``record_result`` was using a bare ``asyncio.to_thread`` against that
+    dead connection and bricked — every row stayed PROCESSING in the DB
+    forever, and the operator saw rows stuck "Starting.." for 25+ minutes.
+    The runner's ``_pending_records`` drainer kept retrying the same dead
+    connection (5-min per-entry budget then giveup), and ``kill_job`` was
+    also dead because IT went through the same wedged connection.
+
+    Fix: route ``record_result`` (and the other worker-side queue ops)
+    through ``_run_db`` so a stale Hrana stream id heals on retry — same
+    discipline the web ``submit`` path got on 2026-06-17. This test
+    simulates the pathology: ``_record_result_sync`` raises a stream-shaped
+    error once, then succeeds; the row ends DONE and ``_reconnect_sync``
+    fires between attempts. Plan
+    ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+    """
+    from bulkvid.models.row import STATUS_SUCCESS, RowResult
+
+    monkeypatch.setattr(
+        "bulkvid.orchestrator.queue._DB_RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0)
+    )
+
+    # Land one row, claim it so there's something to record against.
+    asyncio.run(_enqueue(queue, [_row(2)], "stream-eviction"))
+    claimed = asyncio.run(queue.claim_next_row())
+    assert claimed is not None
+
+    real_record = queue._record_result_sync
+    calls = {"n": 0}
+
+    def stream_dead_then_recover(queue_id: int, result: RowResult) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError(
+                'Hrana: `api error: `status=404 Not Found, body='
+                '{"error":"stream not found: 14edb5a7:1454bfd"}``'
+            )
+        real_record(queue_id, result)
+
+    reconnects = {"n": 0}
+    real_reconnect = queue._reconnect_sync
+
+    def spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+        real_reconnect(reason=reason)
+
+    monkeypatch.setattr(queue, "_record_result_sync", stream_dead_then_recover)
+    monkeypatch.setattr(queue, "_reconnect_sync", spy_reconnect)
+
+    asyncio.run(
+        queue.record_result(
+            claimed.id,
+            RowResult(
+                row_num=claimed.row_num,
+                status=STATUS_SUCCESS,
+                video_urls=["https://example.com/v1.mp4"],
+                cost_usd=0.01,
+            ),
+        )
+    )
+
+    assert calls["n"] == 2          # failed once, recovered on retry
+    assert reconnects["n"] == 1     # connection swapped between attempts
+
+    # And the row actually landed as DONE — not stuck PROCESSING.
+    rows = asyncio.run(queue.list_rows(claimed.job_id))
+    assert len(rows) == 1
+    assert rows[0]["status"] == "done"

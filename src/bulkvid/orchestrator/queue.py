@@ -1206,15 +1206,26 @@ class JobQueue:
         # time-box, discard-and-reconnect, retry. ``_run_db`` acquires
         # ``self._lock`` itself, so this MUST NOT also wrap in
         # ``async with self._lock`` — ``asyncio.Lock`` is not reentrant and a
-        # second acquire would deadlock the worker on its first claim. Plan
-        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1.
+        # second acquire would deadlock the worker on its first claim. Before
+        # this fix the worker's main loop polled a dead stream forever (the
+        # web ``submit`` already survived because the 2026-06-17 fix routed
+        # only the web path through ``_run_db``); the worker hole bricked
+        # job-61d63442da7e6b25 on 2026-06-24 (rows stuck "Starting.." for
+        # 25+ min, kill button dead). Plans
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        # and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         return await self._run_db(self._claim_next_row_sync, op="claim_next_row")
 
     async def record_result(self, queue_id: int, result: RowResult) -> None:
         # Same self-healing path as ``claim_next_row``; ``_run_db`` holds the
-        # lock, so do NOT re-lock here (non-reentrant). On exhaustion it raises
-        # ``QueueUnavailable``; the runner catches that and buffers the result
-        # onto its retry queue so nothing is dropped.
+        # lock, so do NOT re-lock here (non-reentrant). Idempotent on retry
+        # by design — ``_record_result_sync`` UPDATEs by row id and
+        # short-circuits when the row is already terminal (queue.py:639). On
+        # exhaustion ``_run_db`` raises ``QueueUnavailable``; the runner's
+        # ``_pending_records`` drainer catches that and buffers the result so
+        # nothing is dropped. Plans
+        # ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        # and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         await self._run_db(
             self._record_result_sync, queue_id, result, op="record_result"
         )
@@ -1262,11 +1273,14 @@ class JobQueue:
     async def kill_job(self, job_id: str) -> tuple[bool, int]:
         """Kill ``job_id`` AND abort its pending/processing rows.
 
-        Returns ``(jobs_killed_bool, rows_aborted_int)``. Plan
-        ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        Returns ``(jobs_killed_bool, rows_aborted_int)``. Routed through
+        ``_run_db`` so the kill path self-heals if the connection's Hrana
+        stream is dead — critical because kill is the operator's only
+        recovery action when rows are stuck PROCESSING. Plan
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §B and
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         """
-        async with self._lock:
-            return await asyncio.to_thread(self._kill_job_sync, job_id)
+        return await self._run_db(self._kill_job_sync, job_id, op="kill_job")
 
     async def kill_all_jobs(
         self, *, user_email: str | None = None
@@ -1276,12 +1290,12 @@ class JobQueue:
         ``(jobs_killed_count, rows_aborted_count)``. Backs the sidebar's
         "Stop all / Clear queue".
 
-        Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B and
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         """
-        async with self._lock:
-            n_jobs, n_rows = await asyncio.to_thread(
-                self._kill_all_sync, user_email=user_email,
-            )
+        n_jobs, n_rows = await self._run_db(
+            self._kill_all_sync, user_email=user_email, op="kill_all_jobs",
+        )
         _log.info(
             "kill_all_jobs",
             user_email=user_email or "ALL",
@@ -1293,9 +1307,13 @@ class JobQueue:
     async def recover_orphaned_rows(self) -> int:
         """Call on worker startup: rows stuck in PROCESSING are released.
 
-        Routed through ``_run_db`` (self-healing) so a Turso flap at boot
-        reconnects and retries instead of failing the worker before it can
-        drain anything. ``_run_db`` takes the lock; no second lock here."""
+        Routed through ``_run_db`` (self-healing) so a Turso flap at boot —
+        or a stale Hrana stream left by a previous container's last writes on
+        HF Spaces hot-restart — reconnects and retries instead of failing the
+        worker before it can drain anything. ``_run_db`` takes the lock; no
+        second lock here (non-reentrant). Plans
+        ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 1
+        and ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``."""
         n = await self._run_db(
             self._recover_orphaned_rows_sync, op="recover_orphaned_rows"
         )
