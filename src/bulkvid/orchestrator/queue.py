@@ -1190,12 +1190,27 @@ class JobQueue:
         return job_id
 
     async def claim_next_row(self) -> QueuedRow | None:
-        async with self._lock:
-            return await asyncio.to_thread(self._claim_next_row_sync)
+        # Routed through ``_run_db`` (timeout + lock + discard-and-reconnect
+        # + retry) so a Turso Hrana stream eviction on the WORKER connection
+        # self-heals instead of wedging the queue. Without this, the worker's
+        # main loop polled a dead stream forever — the web ``submit`` survived
+        # because the 2026-06-17 fix routed only the web path through
+        # ``_run_db``. The worker hole bricked job-61d63442da7e6b25 on
+        # 2026-06-24 (rows stuck "Starting.." for 25+ min, kill button dead).
+        # Plan ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        return await self._run_db(self._claim_next_row_sync, op="claim_next_row")
 
     async def record_result(self, queue_id: int, result: RowResult) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._record_result_sync, queue_id, result)
+        # Same Hrana-stream resilience as ``claim_next_row``. Idempotent on
+        # retry by design — ``_record_result_sync`` UPDATEs by row id and
+        # short-circuits when the row is already terminal (queue.py:639). The
+        # runner's ``_pending_records`` drainer still wraps this for an
+        # outer retry budget, but in-band reconnect heals the common case
+        # before the drainer ever sees it. Plan
+        # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        await self._run_db(
+            self._record_result_sync, queue_id, result, op="record_result"
+        )
 
     async def get_job(self, job_id: str) -> Job | None:
         return await self._run_db(self._get_job_sync, job_id, op="get_job")
@@ -1240,11 +1255,14 @@ class JobQueue:
     async def kill_job(self, job_id: str) -> tuple[bool, int]:
         """Kill ``job_id`` AND abort its pending/processing rows.
 
-        Returns ``(jobs_killed_bool, rows_aborted_int)``. Plan
-        ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        Returns ``(jobs_killed_bool, rows_aborted_int)``. Routed through
+        ``_run_db`` so the kill path self-heals if the connection's Hrana
+        stream is dead — critical because kill is the operator's only
+        recovery action when rows are stuck PROCESSING. Plan
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §B and
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         """
-        async with self._lock:
-            return await asyncio.to_thread(self._kill_job_sync, job_id)
+        return await self._run_db(self._kill_job_sync, job_id, op="kill_job")
 
     async def kill_all_jobs(
         self, *, user_email: str | None = None
@@ -1254,12 +1272,12 @@ class JobQueue:
         ``(jobs_killed_count, rows_aborted_count)``. Backs the sidebar's
         "Stop all / Clear queue".
 
-        Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+        Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B and
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
         """
-        async with self._lock:
-            n_jobs, n_rows = await asyncio.to_thread(
-                self._kill_all_sync, user_email=user_email,
-            )
+        n_jobs, n_rows = await self._run_db(
+            self._kill_all_sync, user_email=user_email, op="kill_all_jobs",
+        )
         _log.info(
             "kill_all_jobs",
             user_email=user_email or "ALL",
@@ -1269,9 +1287,16 @@ class JobQueue:
         return n_jobs, n_rows
 
     async def recover_orphaned_rows(self) -> int:
-        """Call on worker startup: rows stuck in PROCESSING are released."""
-        async with self._lock:
-            n = await asyncio.to_thread(self._recover_orphaned_rows_sync)
+        """Call on worker startup: rows stuck in PROCESSING are released.
+
+        Routed through ``_run_db`` so a stale Hrana stream from a previous
+        container's last writes (HF Spaces hot-restart) doesn't immediately
+        wedge the new worker's startup. Plan
+        ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+        """
+        n = await self._run_db(
+            self._recover_orphaned_rows_sync, op="recover_orphaned_rows"
+        )
         if n > 0:
             _log.warning("orphaned_rows_recovered", count=n)
         return n

@@ -137,6 +137,100 @@ async def test_ensure_cache_reraises_when_both_attempts_fail(store: SettingsStor
         await store.get("script_system_prompt")
 
 
+async def test_load_sync_reconnects_after_stream_eviction(
+    store: SettingsStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for job-61d63442da7e6b25 (2026-06-24).
+
+    Turso evicted the Hrana stream id our libsql client was holding; every
+    call against that connection 404'd with ``stream not found: <id>``. The
+    old ``_load_sync_with_retry`` slept 0.5 s and retried the SAME dead
+    connection — same id, same 404. Result: every row failed fast with
+    ``unhandled: Hrana: api error: status=404 Not Found, body={"error":
+    "stream not found: 14edb5a7:1454bfd"}`` until the container restarted.
+
+    Fix: discard-and-reconnect before retrying. This test simulates the
+    pathology — ``_load_sync`` raises a stream-shaped error the first time,
+    then succeeds — and asserts ``_reconnect_sync`` fires between the two
+    attempts so the second call runs against a fresh handle. Plan
+    ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
+    """
+    monkeypatch.setattr(
+        "bulkvid.orchestrator.settings_store._SETTINGS_DB_RECONNECT_BACKOFF_SECONDS",
+        0.0,
+    )
+
+    real_load = store._load_sync
+    call_count = {"n": 0}
+
+    def stream_dead_then_recover() -> dict[str, str]:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError(
+                'Hrana: `api error: `status=404 Not Found, body='
+                '{"error":"stream not found: 14edb5a7:1454bfd"}``'
+            )
+        return real_load()
+
+    store._load_sync = stream_dead_then_recover    # type: ignore[method-assign]
+
+    reconnects = {"n": 0}
+    real_reconnect = store._reconnect_sync
+
+    def spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+        real_reconnect(reason=reason)
+
+    store._reconnect_sync = spy_reconnect    # type: ignore[method-assign]
+
+    value = await store.get("script_system_prompt")
+    assert value == "default-prompt"     # registered default, table is empty
+    assert call_count["n"] == 2          # one failure + one retry
+    assert reconnects["n"] == 1          # connection swapped between attempts
+
+
+async def test_set_reconnects_after_stream_eviction(
+    store: SettingsStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Hrana stream death during an admin save (settings panel write) was
+    bricking the admin panel the same way reads got bricked — the user had
+    to wait for a redeploy to change a setting. Reconnect-on-failure means
+    the second attempt lands on a fresh stream. Plan
+    ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``."""
+    monkeypatch.setattr(
+        "bulkvid.orchestrator.settings_store._SETTINGS_DB_RECONNECT_BACKOFF_SECONDS",
+        0.0,
+    )
+
+    real_set = store._set_sync
+    call_count = {"n": 0}
+
+    def stream_dead_then_recover(key: str, value: str, updated_by: str) -> str | None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ValueError(
+                'Hrana: `api error: `status=404 Not Found, body='
+                '{"error":"stream not found: ab12:cd34"}``'
+            )
+        return real_set(key, value, updated_by)
+
+    store._set_sync = stream_dead_then_recover    # type: ignore[method-assign]
+
+    reconnects = {"n": 0}
+    real_reconnect = store._reconnect_sync
+
+    def spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+        real_reconnect(reason=reason)
+
+    store._reconnect_sync = spy_reconnect    # type: ignore[method-assign]
+
+    old = await store.set("kie_model", "post-reconnect", updated_by="regression")
+    assert old is None                  # first write of this key
+    assert call_count["n"] == 2         # one failure + one retry
+    assert reconnects["n"] == 1         # connection swapped between attempts
+
+
 async def test_load_sync_reads_by_index_not_by_column_name(
     store: SettingsStore,
 ) -> None:
