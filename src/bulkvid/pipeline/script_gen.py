@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from bulkvid.adapters.gemini_tts import LIVELY_VOICE_MENU_TEXT, normalize_voice
 from bulkvid.adapters.openai_client import MODEL_SCRIPT_GEN, OpenAIClient
 from bulkvid.logging import get_logger
 from bulkvid.orchestrator.runtime_settings import (
@@ -50,7 +51,13 @@ DEFAULT_TARGET_WORDS = 17
 MIN_WORDS = 12
 MAX_WORDS = 20
 ARTICLE_PROMPT_CHARS = 3_000
-DEFAULT_STYLE_DIRECTION = "Read warmly and clearly, like a friendly podcast host."
+# Engaging by default — the fallback delivery hint when the LLM doesn't return
+# one. Framed positively (no flat/slow/calm wording, which flattens the read).
+DEFAULT_STYLE_DIRECTION = (
+    "Read with bright, upbeat energy and a warm vocal smile, like a friendly host "
+    "genuinely excited to share this. Keep a lively, forward-moving pace with "
+    "punchy emphasis on the key words."
+)
 
 
 @dataclass
@@ -61,11 +68,19 @@ class ScriptResult:
     word_count: int
     cost_usd: float
     used_override: bool
+    # LLM-chosen TTS voice, validated against the Gemini voice pool. Empty when
+    # the OVERRIDE short-circuit fired or the model didn't name a usable voice —
+    # the TTS adapter then falls back to the livelier per-language default.
+    voice: str = ""
     # Filled when the blank-cell template selector picked a library entry.
     # Empty when the row had a non-blank script_pattern, the OVERRIDE
     # short-circuit fired, or the selector fell back to the literal default.
     # Surfaces in the sidebar so operators can see which seed got picked.
     chosen_template_id: str = ""
+    # True when a pinned OVERRIDE script is past the soft word cap. Never blocks
+    # the row — it just flags that a long pasted script will make a long video,
+    # so the operator isn't surprised. Always False for generated scripts.
+    override_oversize: bool = False
 
 
 # The full default lives in runtime_settings.py so the admin panel can edit it
@@ -113,6 +128,7 @@ def _format_system_prompt(
         target_words=target_words,
         min_words=MIN_WORDS,
         max_words=MAX_WORDS,
+        voice_menu=LIVELY_VOICE_MENU_TEXT,
     )
 
 
@@ -236,6 +252,7 @@ async def generate_script(
             "script_override_used",
             language=language,
             word_count=wc,
+            oversize=open_comments.override_oversize,
             cost_usd=0.0,
         )
         return ScriptResult(
@@ -245,6 +262,7 @@ async def generate_script(
             word_count=wc,
             cost_usd=0.0,
             used_override=True,
+            override_oversize=open_comments.override_oversize,
         )
 
     template = SYSTEM_PROMPT_TEMPLATE
@@ -351,6 +369,10 @@ async def generate_script(
 
     script = str(parsed.get("script") or "").strip()
     style = str(parsed.get("style_direction") or "").strip() or DEFAULT_STYLE_DIRECTION
+    # Validate the LLM's voice pick against the pool (case-insensitive). Unknown
+    # or absent → "" so the TTS adapter applies its livelier per-language
+    # default instead of a forced English voice.
+    voice = normalize_voice(parsed.get("voice"))
 
     if not script:
         # Model produced empty script. Fall back to a generic line so the row
@@ -365,6 +387,7 @@ async def generate_script(
         word_count=wc,
         cost_usd=result.cost_usd,
         style_chars=len(style),
+        voice=voice or "default",
     )
 
     return ScriptResult(
@@ -372,6 +395,7 @@ async def generate_script(
         style_direction=style,
         language=language,
         word_count=wc,
+        voice=voice,
         cost_usd=result.cost_usd,
         used_override=False,
         chosen_template_id=chosen_template_id,

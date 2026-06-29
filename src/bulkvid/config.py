@@ -106,6 +106,15 @@ class Settings(BaseSettings):
     VERTEX_AI_PROJECT_ID: str = "amit-tts"
     VERTEX_AI_LOCATION: str = "us-central1"
 
+    # Gemini TTS model (generate_content / speech_config surface). Defaults to
+    # Google's newest TTS model (public preview, 2026-04-15) — a drop-in on the
+    # same request shape as the older 2.5 preview. Config-driven so a preview
+    # model that misbehaves or whose quota shifts can be rolled back to
+    # ``gemini-2.5-flash-preview-tts`` (or escalated to ``gemini-2.5-pro-tts``
+    # for richer style adherence) without a redeploy. Plan:
+    # ``_plans/2026-06-22-engaging-auto-voiceovers-gemini-3.1-tts.md``.
+    BULKVID_GEMINI_TTS_MODEL: str = "gemini-3.1-flash-tts-preview"
+
     # Vertex AI / Gemini TTS uses a SEPARATE service account from storage
     # because storage and TTS often live in different GCP projects. Falls
     # back to the GOOGLE_* set when these are empty.

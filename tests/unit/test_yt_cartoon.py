@@ -154,6 +154,58 @@ def test_fit_video_to_vo_no_vo_keeps_full_bucket() -> None:
     assert per_clip == plan.per_clip_seconds
 
 
+# ── plan_pinned_shots (verbatim auto-fit — the Phase-2 risk area) ────────────
+
+
+def test_pinned_audio_drives_length_one_video() -> None:
+    # ~12s pinned script → ~12.5s video, always ONE video (never the cartoon
+    # tab's two), trims sum exactly to the total.
+    plan = yc.plan_pinned_shots(12.0)
+    assert plan.num_videos == 1
+    assert plan.target_seconds == 12.5
+    assert round(sum(plan.per_clip_seconds), 3) == 12.5
+    assert len(plan.per_clip_seconds) == plan.num_shots
+
+
+def test_pinned_shot_count_scales_and_is_bounded() -> None:
+    # Short → floor of 2 shots; long → capped at PINNED_MAX_SHOTS.
+    assert yc.plan_pinned_shots(1.0).num_shots == yc.PINNED_MIN_SHOTS == 2
+    assert yc.plan_pinned_shots(20.0).num_shots == 4
+    assert yc.plan_pinned_shots(30.0).num_shots == 6
+    assert yc.plan_pinned_shots(999.0).num_shots == yc.PINNED_MAX_SHOTS == 8
+
+
+def test_pinned_never_caps_audio_length() -> None:
+    # The video grows to the FULL audio length — capping it would truncate the
+    # operator's words, which "use this script" must never do. A 90s paste makes
+    # a ~90.5s video (flagged oversize upstream), NOT a clipped one.
+    plan = yc.plan_pinned_shots(90.0)
+    assert plan.target_seconds == 90.5
+    assert round(sum(plan.per_clip_seconds), 3) == 90.5
+
+
+def test_pinned_floors_tiny_audio() -> None:
+    # A blink-length VO still gets a sane MIN_VIDEO_SECONDS video.
+    assert yc.plan_pinned_shots(0.5).target_seconds == yc.MIN_VIDEO_SECONDS
+
+
+def test_pinned_seedance_durations_always_legal() -> None:
+    for vo in (0.5, 5.0, 12.0, 20.0, 30.0, 45.0, 90.0):
+        plan = yc.plan_pinned_shots(vo)
+        for d in plan.seedance_durations:
+            assert d in yc.SEEDANCE_LEGAL_DURATIONS
+        # Every clip's gen tier must actually COVER its trimmed length (no
+        # impossible "trim a 12s clip to 13s" gaps within the supported range).
+        for trimmed, tier in zip(plan.per_clip_seconds, plan.seedance_durations):
+            assert tier >= trimmed or tier == yc.SEEDANCE_LEGAL_DURATIONS[-1]
+
+
+def test_pinned_handles_zero_and_negative() -> None:
+    # Defensive: a 0 / negative measurement never raises, floors to MIN.
+    assert yc.plan_pinned_shots(0.0).target_seconds == yc.MIN_VIDEO_SECONDS
+    assert yc.plan_pinned_shots(-3.0).target_seconds == yc.MIN_VIDEO_SECONDS
+
+
 # ── Tone registry ────────────────────────────────────────────────────────────
 
 

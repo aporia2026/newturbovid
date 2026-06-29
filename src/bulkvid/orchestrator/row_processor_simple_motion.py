@@ -72,6 +72,11 @@ from bulkvid.models.row import (
     SimpleMotionRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.pinned_cartoon import (
+    PinnedShotSpec,
+    build_pinned_cartoon_video,
+    fold_pinned_costs,
+)
 from bulkvid.orchestrator.row_processor_cartoon import (
     IMAGE_RESOLUTION,
     MAX_EFFECTIVE_VO_SECONDS,
@@ -98,7 +103,7 @@ from bulkvid.pipeline.cartoon_prompt import (
 )
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
 from bulkvid.pipeline.language import detect_language, reconcile_language
-from bulkvid.pipeline.open_comments import classify_open_comments
+from bulkvid.pipeline.open_comments import OpenCommentsMode, classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
 
 _log = get_logger("row")
@@ -241,6 +246,17 @@ async def process_simple_motion_row(
             costs.plan += plan.cost_usd
             metadata["language"] = lang.language
             metadata["open_comments_mode"] = analysis.mode.value
+            # Pinned (verbatim) path: speak the operator's exact script over their
+            # OWN two images (fixed shots — never auto-add scenes we have no
+            # picture for), stretched to the script's length. The generate-
+            # narration path below is untouched.
+            is_pinned = (
+                analysis.mode is OpenCommentsMode.OVERRIDE
+                and bool(analysis.override_script)
+            )
+            metadata["script_used_override"] = is_pinned
+            if is_pinned:
+                metadata["script_override_oversize"] = analysis.override_oversize
             if plan.chosen_template_id:
                 metadata["chosen_template_id"] = plan.chosen_template_id
         except Exception as e:
@@ -594,10 +610,65 @@ async def process_simple_motion_row(
                 _log.error("simple_motion_idea_failed", idea=idx + 1, error=err_msg)
                 return None
 
-        results = await asyncio.gather(
-            *[_build_idea(i, idea) for i, idea in enumerate(plan.ideas)]
-        )
-        video_urls = [u for u in results if u]
+        if is_pinned:
+            # ONE video: the operator's exact script over their OWN two images
+            # (fixed shots), stretched to the script length. A blank image cell
+            # falls back to a generated REALISTIC_STYLE scene, exactly like the
+            # narration path. Manual shots animate with the gentle pan motion.
+            idea0 = plan.ideas[0]
+            zapcap_opts = (
+                ZapCapRenderOptions(
+                    subs=ZapCapSubsOptions(),
+                    style=ZapCapStyleOptions(top=30, font_size=36),
+                )
+                if cta_overlay_url
+                else None
+            )
+            shots: list[PinnedShotSpec] = []
+            for s in range(SM_NUM_SHOTS):
+                scene = idea0.shots[s].scene if s < len(idea0.shots) else ""
+                manual = manual_for_shot[s] if s < len(manual_for_shot) else ""
+                motion = (
+                    MANUAL_IMAGE_MOTION if manual
+                    else (idea0.shots[s].motion if s < len(idea0.shots)
+                          else MANUAL_IMAGE_MOTION)
+                )
+                shots.append(
+                    PinnedShotSpec(scene=scene, motion=motion, manual_image_url=manual)
+                )
+            pinned_res = await build_pinned_cartoon_video(
+                clients=clients,
+                slug=slug,
+                pinned_script=analysis.override_script or "",
+                style_direction=idea0.style_direction,
+                shots=shots,
+                language=lang.language,
+                country=row.country,
+                aspect=aspect,
+                voice_over=row.voice_over,
+                fixed_shots=True,
+                image_style=REALISTIC_STYLE,
+                cta_overlay_url=cta_overlay_url,
+                zapcap_enabled=bool(row.zapcap and clients.zapcap is not None),
+                zapcap_render_options=zapcap_opts,
+            )
+            fold_pinned_costs(costs, pinned_res)
+            if pinned_res.zapcap_failed:
+                zapcap_failed = True
+            metadata["pinned_video_seconds"] = round(pinned_res.video_seconds, 2)
+            metadata["pinned_num_shots"] = pinned_res.num_shots
+            if pinned_res.final_url:
+                video_urls = [pinned_res.final_url]
+            else:
+                video_urls = []
+                idea_failure_messages.append(
+                    pinned_res.error or "pinned build returned no video"
+                )
+        else:
+            results = await asyncio.gather(
+                *[_build_idea(i, idea) for i, idea in enumerate(plan.ideas)]
+            )
+            video_urls = [u for u in results if u]
 
         if cta_overlay_errors:
             metadata["cta_overlay_errors"] = cta_overlay_errors

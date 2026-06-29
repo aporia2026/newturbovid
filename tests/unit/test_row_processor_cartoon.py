@@ -749,3 +749,63 @@ async def test_cartoon_cta_overlay_failure_surfaces_to_row_error(monkeypatch) ->
     assert "rendi overlay boom" in result.error
     assert result.metadata.get("cta_overlay_errors")
     assert result.metadata.get("cta_overlay_applied") is False
+
+
+# ── Pinned (verbatim) script routing ─────────────────────────────────────────
+
+
+def _patch_pinned_kie(monkeypatch) -> dict:
+    """Patch the kie wrappers in the BUILDER's namespace (separate module from
+    the processor — patching ``rpc.*`` would miss the pinned path entirely)."""
+    import bulkvid.orchestrator.pinned_cartoon as pc
+
+    counters = {"t2i": 0, "i2i": 0, "seedance": 0}
+
+    async def _t2i(_kie, _p, _a, resolution="1K", **_):
+        counters["t2i"] += 1
+        return f"https://kie.test/t2i-{counters['t2i']}.png", 0.04
+
+    async def _i2i(_kie, _s, _p, _a, resolution="1K", **_):
+        counters["i2i"] += 1
+        return f"https://kie.test/i2i-{counters['i2i']}.png", 0.04
+
+    async def _seed(_kie, _img, _m, _a, duration=4, resolution="720p", **_):
+        counters["seedance"] += 1
+        return f"https://kie.test/clip-{counters['seedance']}.mp4", 0.07
+
+    monkeypatch.setattr(pc, "nano_banana_2_text_to_image", _t2i)
+    monkeypatch.setattr(pc, "nano_banana_2_image_to_image", _i2i)
+    monkeypatch.setattr(pc, "seedance_image_to_video", _seed)
+    return counters
+
+
+@respx.mock
+async def test_cartoon_pinned_script_makes_one_verbatim_video(monkeypatch) -> None:
+    """A pinned OVERRIDE makes ONE video (not CARTOON_NUM_IDEAS), speaks the
+    exact script (no shorten), at natural pace, and flags the override in
+    metadata."""
+    from bulkvid.pipeline.open_comments import OpenCommentsAnalysis, OpenCommentsMode
+
+    pinned = "Beslagautos in Nederland worden online geveild en getoond vandaag."
+
+    async def _classify_override(_client, _text):
+        return OpenCommentsAnalysis(
+            mode=OpenCommentsMode.OVERRIDE, raw_text=_text, override_script=pinned
+        )
+
+    monkeypatch.setattr(rpc, "classify_open_comments", _classify_override)
+    _patch_pinned_kie(monkeypatch)
+    _register_downloads()
+    clients = _build_clients()
+
+    result = await process_cartoon_row(_row(), clients, job_id="jp")
+
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 1                       # ONE, not two
+    assert result.metadata["script_used_override"] is True
+    assert result.metadata["pinned_num_shots"] >= 2
+    # Exactly one stitch, at natural (un-sped) pace.
+    assert len(clients.rendi.concat_calls) == 1
+    assert clients.rendi.concat_calls[0]["atempo"] == pytest.approx(1.0)
+    # The pinned script was the TTS input, verbatim and un-shortened.
+    assert clients.tts.last_texts == [pinned]

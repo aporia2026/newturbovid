@@ -18,6 +18,7 @@ Model: gpt-5.4-mini (cheap, fast, deterministic at temperature 0).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
@@ -44,6 +45,70 @@ class OpenCommentsAnalysis:
     directives: list[str] = field(default_factory=list)
     override_script: str | None = None
     cost_usd: float = 0.0
+    # True when an OVERRIDE script is longer than the soft cap. Never blocks the
+    # row — it's a visible "this will make a long video" flag for the operator
+    # (surfaced in row metadata) and a guardrail the cartoon auto-fit clamps to.
+    override_oversize: bool = False
+
+
+# Soft word cap for an operator-pinned script. We never truncate the operator's
+# copy (that would mangle approved ad text mid-sentence); past this we flag the
+# row so a 60-word paste doesn't silently ship a 30s+ "Short". ~60 words ≈ 30s
+# of speech at the observed Gemini TTS rate. Single source of truth shared by
+# the script tabs (script_gen) and the cartoon auto-fit.
+# Plan _plans/2026-06-29-pinned-script-open-comments-all-tabs.md.
+OVERRIDE_SOFT_MAX_WORDS = 60
+
+
+# Prefix markers that pin the cell as a verbatim script (the manager's
+# "use this script:" convention). Matched case-insensitively at the START of the
+# cell only — a marker mid-cell never triggers — longest first so "use this
+# script" wins over "use script". Every marker leads with the imperative "use"
+# on purpose: a bare "script:" prefix is ambiguous (operators write
+# "script should be upbeat" as a DIRECTIVE), so we require the explicit verb to
+# avoid hijacking notes. Stripping the marker BEFORE it reaches TTS is what keeps
+# it out of the spoken audio, and therefore out of ZapCap's transcription-based
+# captions. Plan _plans/2026-06-29-pinned-script-open-comments-all-tabs.md.
+_PINNED_SCRIPT_MARKERS: tuple[str, ...] = (
+    "use the following script",
+    "use this exact script",
+    "use this script",
+    "use the script",
+    "use script",
+)
+
+# Separators an operator (or their phone's autocorrect) might type between the
+# marker and the script: ascii + full-width colon, hyphen, en/em dash, equals.
+_MARKER_SEPARATORS = ":：-–—="  # noqa: RUF001 — ambiguous chars are intentional separators
+
+
+def detect_pinned_script(raw_text: str) -> str | None:
+    """Return the verbatim script when the cell starts with a pin marker.
+
+    Deterministic, no LLM call. Case-insensitive and prefix-only (a marker in
+    the middle of the cell never fires). Tolerant of what a lazy operator
+    actually types — extra spaces, ``USE THIS SCRIPT -``, a full-width
+    autocorrect colon. Returns the script with the marker and one trailing
+    separator stripped, or ``None`` when there's no marker or nothing usable is
+    left after it (so ``script:`` alone falls through, not an empty override).
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    for marker in _PINNED_SCRIPT_MARKERS:
+        if not lowered.startswith(marker):
+            continue
+        rest = text[len(marker):]
+        # The marker must be a whole token: the next char is a separator or
+        # whitespace, never a letter — so "scripture…" / "use scripts…" do not
+        # match "script" / "use script". A marker that is the entire cell
+        # (rest == "") has no script after it and is handled below.
+        if rest and not (rest[0].isspace() or rest[0] in _MARKER_SEPARATORS):
+            continue
+        rest = rest.lstrip().lstrip(_MARKER_SEPARATORS).strip()
+        return rest or None
+    return None
 
 
 SYSTEM_PROMPT = """You classify 'Open Comments' from a bulk video creative sheet.
@@ -74,6 +139,27 @@ Be precise. Tone hints are adjectives/short phrases. Directives are imperatives.
 Override is finished prose that could be spoken as a 10-second voiceover."""
 
 
+def _audit_override(analysis: OpenCommentsAnalysis, *, source: str) -> None:
+    """Emit the verbatim-override audit line (Yoav 2026-06-29 compliance call).
+
+    Records WHICH row pinned a verbatim script, a content hash, and the word
+    count, so a human can audit what shipped without storing the raw ad copy in
+    the clear. ``source`` is ``"marker"`` (explicit ``use this script:``) or
+    ``"auto"`` (LLM-detected bare paste). Row/batch context rides on the logger
+    via ``set_context``.
+    """
+    script = (analysis.override_script or "").strip()
+    digest = hashlib.sha256(script.encode("utf-8")).hexdigest()[:16]
+    _log.info(
+        "open_comments_override",
+        source=source,
+        script_words=len(script.split()),
+        script_chars=len(script),
+        script_sha256=digest,
+        oversize=analysis.override_oversize,
+    )
+
+
 async def classify_open_comments(
     client: OpenAIClient,
     raw_text: str,
@@ -90,6 +176,21 @@ async def classify_open_comments(
         return OpenCommentsAnalysis(
             mode=OpenCommentsMode.NONE, raw_text=""
         )
+
+    # Deterministic, zero-cost path: the operator pinned a verbatim script with
+    # an explicit "use this script:" marker. Short-circuit BEFORE the LLM —
+    # reliable, free, and immune to the classifier guessing wrong. Every tab
+    # (script + cartoon) inherits OVERRIDE from this one seam.
+    pinned = detect_pinned_script(text)
+    if pinned is not None:
+        analysis = OpenCommentsAnalysis(
+            mode=OpenCommentsMode.OVERRIDE,
+            raw_text=text,
+            override_script=pinned,
+            override_oversize=len(pinned.split()) > OVERRIDE_SOFT_MAX_WORDS,
+        )
+        _audit_override(analysis, source="marker")
+        return analysis
 
     _log.info("classify_submit", chars=len(text))
 
@@ -139,6 +240,15 @@ async def classify_open_comments(
         override_script=override,
         cost_usd=result.cost_usd,
     )
+
+    # A bare pasted script (no marker) the LLM tagged OVERRIDE still gets the
+    # same oversize flag + audit line as the marker path — one behaviour for
+    # both, per the "marker + auto-detect" decision.
+    if analysis.mode is OpenCommentsMode.OVERRIDE and analysis.override_script:
+        analysis.override_oversize = (
+            len(analysis.override_script.split()) > OVERRIDE_SOFT_MAX_WORDS
+        )
+        _audit_override(analysis, source="auto")
 
     _log.info(
         "classify_ok",

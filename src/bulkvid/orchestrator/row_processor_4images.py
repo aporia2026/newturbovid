@@ -204,6 +204,7 @@ async def process_4images_vo2_row(
             metadata["open_comments_mode"] = analysis.mode.value
             metadata["script_word_count"] = script.word_count
             metadata["script_used_override"] = script.used_override
+            metadata["script_override_oversize"] = script.override_oversize
             if script.chosen_template_id:
                 metadata["chosen_template_id"] = script.chosen_template_id
         except Exception as e:
@@ -216,6 +217,7 @@ async def process_4images_vo2_row(
                 tts = await clients.tts.synthesize(
                     text=script.script,
                     language=lang.language,
+                    voice=script.voice,
                     style_prompt=script.style_direction,
                     country=row.country,
                 )

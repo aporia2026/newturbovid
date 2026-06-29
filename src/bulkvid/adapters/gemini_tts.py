@@ -1,9 +1,11 @@
 """Gemini TTS adapter — Vertex AI text-to-speech with multilingual voices.
 
 Uses the official Google Gen AI Python SDK in Vertex AI mode (project
-``amit-tts``), targeting ``gemini-2.5-flash-preview-tts`` with
-``response_modalities=['audio']``. Voice is selected from a per-language
-pool; the response is raw 24 kHz 16-bit mono PCM, which we wrap into a WAV
+``amit-tts``), targeting ``gemini-3.1-flash-tts-preview`` by default (config-
+driven via ``BULKVID_GEMINI_TTS_MODEL``) with ``response_modalities=['audio']``.
+Voice is selected per row — the script LLM picks one to fit the vertical /
+article / vibe, validated against a curated lively pool with a per-language
+fallback. The response is raw 24 kHz 16-bit mono PCM, which we wrap into a WAV
 container in-memory (stdlib ``wave``).
 
 Auth uses application-default credentials from
@@ -76,9 +78,33 @@ GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS = 1.0
 
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
-# Verified plan §11 2026-06-02 (Vertex AI Gemini TTS). Refresh before release.
-# Placeholder rate; the real bill on the first deploy locks this in.
-COST_GEMINI_TTS_PER_CHAR_USD = 0.000_001    # ~$1 per million characters
+# gemini-3.1-flash-tts bills per TOKEN, not per character (verified 2026-06-22,
+# nemovideo.com + Vertex pricing): $1 / M input tokens, $20 / M output tokens,
+# with audio output metered at ~25 output tokens per second. Input text is
+# ~4 chars/token. So a 60s VO ≈ $0.03; our short clips ≈ well under a cent.
+# This is an ESTIMATE for the default Flash tier — the real Vertex bill is the
+# source of truth, and a different configured model (2.5-pro) costs more.
+# Plan ``_plans/2026-06-22-engaging-auto-voiceovers-gemini-3.1-tts.md``.
+COST_GEMINI_TTS_INPUT_USD_PER_MTOK = 1.0
+COST_GEMINI_TTS_OUTPUT_USD_PER_MTOK = 20.0
+GEMINI_TTS_OUTPUT_TOKENS_PER_SECOND = 25.0
+GEMINI_TTS_CHARS_PER_INPUT_TOKEN = 4.0
+
+
+def estimate_tts_cost_usd(character_count: int, duration_seconds: float) -> float:
+    """Estimate the Vertex bill for one synth (token-based Flash-tier pricing).
+
+    Input cost scales with the text length; output cost scales with the audio
+    duration (Gemini meters audio at a fixed tokens/second). Approximate by
+    design — see the pricing note above.
+    """
+    input_tokens = max(0.0, character_count) / GEMINI_TTS_CHARS_PER_INPUT_TOKEN
+    output_tokens = max(0.0, duration_seconds) * GEMINI_TTS_OUTPUT_TOKENS_PER_SECOND
+    cost = (
+        input_tokens / 1_000_000 * COST_GEMINI_TTS_INPUT_USD_PER_MTOK
+        + output_tokens / 1_000_000 * COST_GEMINI_TTS_OUTPUT_USD_PER_MTOK
+    )
+    return round(cost, 6)
 
 
 # ── Audio format constants (Gemini TTS returns 24kHz mono 16-bit PCM) ────────
@@ -88,32 +114,89 @@ GEMINI_TTS_SAMPLE_WIDTH_BYTES = 2
 
 
 # ── Voice catalog ────────────────────────────────────────────────────────────
-# Gemini 2.5 voices are multilingual — the model auto-detects the input text's
-# language and speaks it. The mapping here picks a voice with a tone that
-# suits each language; admin panel overrides this in Phase 5.
+# Gemini TTS voices are multilingual — the model auto-detects the input text's
+# language and speaks it. We curate a LIVELY subset of Google's 30 prebuilt
+# voices (the goal is "always engaging"), each with a short character hint.
+#
+# IMPORTANT: Google does NOT publish a voice→character table on its docs (as of
+# 2026-06-22, checked across three of their pages). These hints are the
+# community-reported AI Studio descriptors — treat them as a starting point and
+# CONFIRM BY EAR in AI Studio before relying on a specific pick. The hints feed
+# two things: the per-language default below, and the menu the script LLM picks
+# from (``LIVELY_VOICE_MENU_TEXT``).
+VOICE_CHARACTER: dict[str, str] = {
+    "Puck": "upbeat, energetic",
+    "Zephyr": "bright, breezy",
+    "Fenrir": "excitable, animated",
+    "Leda": "youthful, friendly",
+    "Aoede": "warm, easy-going",
+    "Laomedeia": "upbeat, lively",
+    "Autonoe": "bright, warm",
+    "Sadachbia": "lively, friendly",
+    "Charon": "clear, confident",
+    "Kore": "firm, confident",
+    "Orus": "grounded, steady",
+    "Callirrhoe": "relaxed, easy-going",
+}
 
-GEMINI_VOICE_POOL = (
-    "Kore", "Aoede", "Charon", "Fenrir", "Leda", "Orus", "Puck", "Zephyr",
-)
+# The validation set: any voice we accept as an override (LLM-chosen or sheet).
+GEMINI_VOICE_POOL = tuple(VOICE_CHARACTER)
 
-DEFAULT_VOICE = "Kore"
+# Engaging by default — Puck reads upbeat, which is the floor we want when the
+# LLM doesn't name a voice. (Was "Kore"/firm; the old neutral default fought
+# the new "always engaging" goal.)
+DEFAULT_VOICE = "Puck"
 
+# Per-language fallback, leaning lively. Used only when the script LLM doesn't
+# return a usable voice; the LLM's content-aware pick is preferred when present.
 VOICE_BY_LANGUAGE: dict[str, str] = {
-    "en": "Kore",
+    "en": "Puck",
     "he": "Aoede",
     "ar": "Charon",
     "fr": "Leda",
-    "es": "Puck",
+    "es": "Laomedeia",
     "de": "Zephyr",
-    "it": "Orus",
+    "it": "Autonoe",
     "pt": "Fenrir",
 }
 
+# Pre-rendered menu the script generator injects into its prompt so the LLM can
+# pick a voice that fits the row's vertical/article/vibe. Built once at import.
+LIVELY_VOICE_MENU_TEXT = "\n".join(
+    f"  - {name}: {hint}" for name, hint in VOICE_CHARACTER.items()
+)
+
+
+def normalize_voice(raw: str | None) -> str:
+    """Return the canonical pool voice matching ``raw`` (case-insensitive).
+
+    Returns "" when ``raw`` is blank or names no voice in the pool — callers
+    treat "" as "no usable choice, fall back to a default". Keeping this match
+    in one place lets the script generator validate the LLM's pick without
+    re-implementing (or bypassing) the language-aware fallback in ``pick_voice``.
+    """
+    if not raw:
+        return ""
+    # Coerce defensively — the script LLM occasionally emits a non-string voice
+    # (a number, null, a list). str() keeps a stray type from crashing the row;
+    # it just won't match a pool name and falls through to "".
+    wanted = str(raw).strip().lower()
+    for name in GEMINI_VOICE_POOL:
+        if name.lower() == wanted:
+            return name
+    return ""
+
 
 def pick_voice(language: str, override: str | None = None) -> str:
-    """Pick a Gemini voice for the given language."""
-    if override and override in GEMINI_VOICE_POOL:
-        return override
+    """Pick a Gemini voice for the given language.
+
+    ``override`` (an LLM- or sheet-chosen voice) wins when it's a known voice —
+    matched case-insensitively so "puck" resolves to "Puck". Anything unknown
+    or blank falls back to the livelier per-language default.
+    """
+    canonical = normalize_voice(override)
+    if canonical:
+        return canonical
     return VOICE_BY_LANGUAGE.get((language or "").lower(), DEFAULT_VOICE)
 
 
@@ -326,7 +409,7 @@ class GeminiTTSClient:
     can inject a fake (avoids hitting Vertex AI auth at import time).
     """
 
-    DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
+    DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
 
     def __init__(
         self,
@@ -489,7 +572,7 @@ class GeminiTTSClient:
         wav = wrap_pcm_to_wav(pcm)
         duration = pcm_duration_seconds(pcm)
         char_count = len(text)
-        cost = round(char_count * COST_GEMINI_TTS_PER_CHAR_USD, 6)
+        cost = estimate_tts_cost_usd(char_count, duration)
 
         _log.info(
             "tts_synthesize_ok",
@@ -545,6 +628,7 @@ def build_client_from_settings(settings: Settings | None = None) -> GeminiTTSCli
     return GeminiTTSClient(
         project=s.VERTEX_AI_PROJECT_ID,
         location=s.VERTEX_AI_LOCATION,
+        model=s.BULKVID_GEMINI_TTS_MODEL or GeminiTTSClient.DEFAULT_MODEL,
         credentials_info=build_vertex_credentials_info(s),
         max_concurrent=s.BULKVID_GEMINI_TTS_MAX_CONCURRENT,
         max_per_minute=s.BULKVID_GEMINI_TTS_MAX_PER_MINUTE,

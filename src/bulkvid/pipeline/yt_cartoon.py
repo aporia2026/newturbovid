@@ -206,6 +206,58 @@ def fit_video_to_vo(
     return total, per_clip
 
 
+# ── Pinned (verbatim) script auto-fit ────────────────────────────────────────
+
+# One fresh scene roughly every this many seconds when fitting animation to a
+# pinned script. ~5s keeps the picture moving without exploding the image /
+# Seedance call count on a long paste. Clamped by the min/max below.
+PINNED_SECONDS_PER_SHOT = 5.0
+PINNED_MIN_SHOTS = 2
+PINNED_MAX_SHOTS = 8
+
+
+def plan_pinned_shots(effective_vo_seconds: float) -> ShotPlan:
+    """Render geometry for ONE verbatim (pinned) script video — audio wins.
+
+    The operator handed us the exact words, so the AUDIO dictates the video
+    length: ``total = effective VO + dwell tail``, floored at
+    ``MIN_VIDEO_SECONDS``. There is deliberately NO upper cap on the video
+    length — capping it would truncate the operator's copy, which is the one
+    thing "use this script" must never do. The cap is on the SHOT COUNT
+    (``PINNED_MAX_SHOTS``), not the duration: a runaway paste holds a frame
+    longer per shot rather than dropping words. The oversize flag
+    (``OpenCommentsAnalysis.override_oversize``) is what warns the operator a
+    long paste makes a long video. Never raises.
+
+    Shot count scales with duration (one scene per ~5s), so a 12s script gets
+    ~2-3 shots and a 30s script gets ~6 — enough visual variety without a
+    runaway render bill. ``num_videos`` is always 1 (a fixed script makes one
+    video, never the cartoon tab's two). The ``*_words`` budgets are 0 because
+    the caller does not generate narration.
+    """
+    eff = max(0.0, effective_vo_seconds)
+    total = max(MIN_VIDEO_SECONDS, round(eff + VO_TAIL_SECONDS, 3))
+    num_shots = round(total / PINNED_SECONDS_PER_SHOT)
+    num_shots = max(PINNED_MIN_SHOTS, min(PINNED_MAX_SHOTS, num_shots))
+    per = round(total / num_shots, 3)
+    per_clip_seconds = [per] * num_shots
+    drift = round(total - sum(per_clip_seconds), 3)
+    per_clip_seconds[-1] = round(per_clip_seconds[-1] + drift, 3)
+    seedance_durations = [_smallest_legal_duration(d) for d in per_clip_seconds]
+    return ShotPlan(
+        bucket_seconds=round(total),
+        target_seconds=total,
+        num_shots=num_shots,
+        per_clip_seconds=per_clip_seconds,
+        seedance_durations=seedance_durations,
+        num_videos=1,
+        target_words=0,
+        min_words=0,
+        max_words=0,
+        max_effective_vo=round(total - VO_TAIL_SECONDS, 3),
+    )
+
+
 # ── Tone ─────────────────────────────────────────────────────────────────────
 
 TONE_ENGAGING = "engaging"
