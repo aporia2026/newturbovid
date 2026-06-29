@@ -189,8 +189,10 @@ def test_lively_voice_menu_lists_every_pool_voice() -> None:
         assert name in LIVELY_VOICE_MENU_TEXT
 
 
-def test_default_model_is_gemini_3_1_flash_tts() -> None:
-    assert GeminiTTSClient.DEFAULT_MODEL == "gemini-3.1-flash-tts-preview"
+def test_default_model_is_gemini_2_5_pro_tts() -> None:
+    # 3.1 preview returned no audio in prod (2026-06-29); the most advanced
+    # WORKING 2.5 TTS (Pro) is the default. Flip via BULKVID_GEMINI_TTS_MODEL.
+    assert GeminiTTSClient.DEFAULT_MODEL == "gemini-2.5-pro-preview-tts"
 
 
 # ── wrap_pcm_to_wav / pcm_duration_seconds ───────────────────────────────────

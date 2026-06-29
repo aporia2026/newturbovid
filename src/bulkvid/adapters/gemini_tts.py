@@ -1,8 +1,11 @@
 """Gemini TTS adapter — Vertex AI text-to-speech with multilingual voices.
 
 Uses the official Google Gen AI Python SDK in Vertex AI mode (project
-``amit-tts``), targeting ``gemini-3.1-flash-tts-preview`` by default (config-
+``amit-tts``), targeting ``gemini-2.5-pro-preview-tts`` by default (config-
 driven via ``BULKVID_GEMINI_TTS_MODEL``) with ``response_modalities=['audio']``.
+(The 3.1 preview returned no audio in production — see config.py — so the
+default is the most advanced WORKING 2.5 TTS; flip the env var to
+``gemini-2.5-flash-preview-tts`` to fall back, no redeploy.)
 Voice is selected per row — the script LLM picks one to fit the vertical /
 article / vibe, validated against a curated lively pool with a per-language
 fallback. The response is raw 24 kHz 16-bit mono PCM, which we wrap into a WAV
@@ -78,12 +81,13 @@ GEMINI_TTS_RPM_WAIT_LOG_THRESHOLD_SECONDS = 1.0
 
 
 # ── Pricing ──────────────────────────────────────────────────────────────────
-# gemini-3.1-flash-tts bills per TOKEN, not per character (verified 2026-06-22,
-# nemovideo.com + Vertex pricing): $1 / M input tokens, $20 / M output tokens,
-# with audio output metered at ~25 output tokens per second. Input text is
-# ~4 chars/token. So a 60s VO ≈ $0.03; our short clips ≈ well under a cent.
-# This is an ESTIMATE for the default Flash tier — the real Vertex bill is the
-# source of truth, and a different configured model (2.5-pro) costs more.
+# Gemini TTS bills per TOKEN, not per character: ~$1 / M input tokens,
+# ~$20 / M output tokens (Flash tier), audio metered at ~25 output tokens/sec,
+# input text ~4 chars/token. So a 60s VO ≈ $0.03 on Flash; our short clips ≈
+# well under a cent. These constants are a Flash-tier ESTIMATE; the real Vertex
+# bill is the source of truth. NOTE: the default is now the 2.5 PRO TTS model,
+# which costs more per token than Flash — so this estimate UNDER-counts the
+# actual spend. Revisit the constants (or drop to flash) if the bill matters.
 # Plan ``_plans/2026-06-22-engaging-auto-voiceovers-gemini-3.1-tts.md``.
 COST_GEMINI_TTS_INPUT_USD_PER_MTOK = 1.0
 COST_GEMINI_TTS_OUTPUT_USD_PER_MTOK = 20.0
@@ -409,7 +413,7 @@ class GeminiTTSClient:
     can inject a fake (avoids hitting Vertex AI auth at import time).
     """
 
-    DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
+    DEFAULT_MODEL = "gemini-2.5-pro-preview-tts"
 
     def __init__(
         self,
