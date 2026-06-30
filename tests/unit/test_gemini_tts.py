@@ -36,7 +36,6 @@ from bulkvid.adapters import gemini_tts as _gemini_tts_mod
 # instead so the scheduler actually advances other tasks.
 _real_sleep = asyncio.sleep
 from bulkvid.adapters.gemini_tts import (
-    COST_GEMINI_TTS_PER_CHAR_USD,
     DEFAULT_VOICE,
     GEMINI_TTS_CHANNELS,
     GEMINI_TTS_DEFAULT_MAX_CONCURRENT,
@@ -46,6 +45,8 @@ from bulkvid.adapters.gemini_tts import (
     GEMINI_TTS_SAMPLE_RATE_HZ,
     GEMINI_TTS_SAMPLE_WIDTH_BYTES,
     GEMINI_TTS_SEMAPHORE_WAIT_LOG_THRESHOLD_SECONDS,
+    GEMINI_VOICE_POOL,
+    LIVELY_VOICE_MENU_TEXT,
     VOICE_BY_LANGUAGE,
     GeminiTTSClient,
     GeminiTTSNoAudioError,
@@ -54,6 +55,8 @@ from bulkvid.adapters.gemini_tts import (
     GeminiTTSTimeoutError,
     _RpmLimiter,
     accent_directive,
+    estimate_tts_cost_usd,
+    normalize_voice,
     pcm_duration_seconds,
     pick_voice,
     wrap_pcm_to_wav,
@@ -143,6 +146,55 @@ def test_pick_voice_ignores_invalid_override() -> None:
     assert pick_voice("he", override="NotARealVoice") == VOICE_BY_LANGUAGE["he"]
 
 
+def test_pick_voice_override_is_case_insensitive() -> None:
+    # The LLM may return "puck" lower-cased; it resolves to the canonical name.
+    assert pick_voice("he", override="puck") == "Puck"
+    assert pick_voice("he", override="  ZEPHYR  ") == "Zephyr"
+
+
+def test_default_voice_and_language_map_are_in_pool() -> None:
+    # Every fallback must be a real, accepted voice — otherwise a fallback
+    # would itself be rejected downstream.
+    assert DEFAULT_VOICE in GEMINI_VOICE_POOL
+    for voice in VOICE_BY_LANGUAGE.values():
+        assert voice in GEMINI_VOICE_POOL
+
+
+# ── normalize_voice ──────────────────────────────────────────────────────────
+
+
+def test_normalize_voice_canonicalizes_known_names() -> None:
+    assert normalize_voice("Puck") == "Puck"
+    assert normalize_voice("puck") == "Puck"
+    assert normalize_voice("  charon ") == "Charon"
+
+
+def test_normalize_voice_returns_empty_for_unknown_or_blank() -> None:
+    # "" is the "no usable choice" sentinel — callers fall back to a default.
+    assert normalize_voice(None) == ""
+    assert normalize_voice("") == ""
+    assert normalize_voice("Sparkle") == ""
+
+
+def test_normalize_voice_tolerates_non_string() -> None:
+    # The LLM can emit a stray non-string voice; it must not crash the row.
+    assert normalize_voice(5) == ""        # type: ignore[arg-type]
+    assert normalize_voice(["Puck"]) == ""  # type: ignore[arg-type]
+
+
+def test_lively_voice_menu_lists_every_pool_voice() -> None:
+    # The menu the script LLM picks from must cover the whole accepted pool,
+    # so a model-chosen voice is always one we can resolve.
+    for name in GEMINI_VOICE_POOL:
+        assert name in LIVELY_VOICE_MENU_TEXT
+
+
+def test_default_model_is_gemini_2_5_pro_tts() -> None:
+    # 3.1 preview returned no audio in prod (2026-06-29); the most advanced
+    # WORKING 2.5 TTS (Pro) is the default. Flip via BULKVID_GEMINI_TTS_MODEL.
+    assert GeminiTTSClient.DEFAULT_MODEL == "gemini-2.5-pro-preview-tts"
+
+
 # ── wrap_pcm_to_wav / pcm_duration_seconds ───────────────────────────────────
 
 
@@ -200,8 +252,9 @@ async def test_synthesize_success_returns_full_result() -> None:
     assert result.character_count == len("Hello world this is a test")
     assert result.duration_seconds == pytest.approx(0.5)
     assert result.wav_bytes[:4] == b"RIFF"
-    # Cost = chars × per-char rate
-    expected_cost = round(len("Hello world this is a test") * COST_GEMINI_TTS_PER_CHAR_USD, 6)
+    # Token-based estimate: scales with text length (input) AND audio duration
+    # (output). The fake returns 0.5s of audio.
+    expected_cost = estimate_tts_cost_usd(len("Hello world this is a test"), 0.5)
     assert result.cost_usd == expected_cost
 
 
@@ -283,11 +336,17 @@ async def test_synthesize_honors_voice_override() -> None:
     assert result.voice == "Zephyr"
 
 
-# ── Cost constant sanity ─────────────────────────────────────────────────────
+# ── Cost estimate sanity ─────────────────────────────────────────────────────
 
 
-def test_cost_constant_positive() -> None:
-    assert COST_GEMINI_TTS_PER_CHAR_USD > 0
+def test_cost_estimate_zero_and_scales() -> None:
+    # Token-based: no text + no audio costs nothing; both longer text and
+    # longer audio cost strictly more.
+    assert estimate_tts_cost_usd(0, 0.0) == 0.0
+    base = estimate_tts_cost_usd(100, 5.0)
+    assert base > 0
+    assert estimate_tts_cost_usd(100, 60.0) > base    # longer audio → pricier
+    assert estimate_tts_cost_usd(500, 5.0) > base     # more text → pricier
 
 
 # ── Retry behavior ──────────────────────────────────────────────────────────

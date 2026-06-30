@@ -372,6 +372,7 @@ async def process_avatar_row(
             metadata["script_chars"] = len(script_result.script)
             metadata["script_word_count"] = script_result.word_count
             metadata["script_used_override"] = script_result.used_override
+            metadata["script_override_oversize"] = script_result.override_oversize
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 

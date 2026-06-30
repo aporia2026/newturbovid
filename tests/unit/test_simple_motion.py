@@ -419,6 +419,71 @@ async def test_dispatch_routes_to_simple_motion_processor(monkeypatch) -> None:
 # ── Settings registry ────────────────────────────────────────────────────────
 
 
+def _patch_pinned_kie(monkeypatch) -> dict:
+    """Patch kie in the pinned BUILDER's namespace (separate module)."""
+    import bulkvid.orchestrator.pinned_cartoon as pc
+
+    counters = {"t2i": 0, "i2i": 0, "seedance": 0}
+
+    async def _t2i(_kie, _p, _a, resolution="1K", **_):
+        counters["t2i"] += 1
+        return f"https://kie.test/t2i-{counters['t2i']}.png", 0.04
+
+    async def _i2i(_kie, _s, _p, _a, resolution="1K", **_):
+        counters["i2i"] += 1
+        return f"https://kie.test/i2i-{counters['i2i']}.png", 0.04
+
+    async def _seed(_kie, _img, _m, _a, duration=4, resolution="720p", **_):
+        counters["seedance"] += 1
+        return f"https://kie.test/clip-{counters['seedance']}.mp4", 0.07
+
+    monkeypatch.setattr(pc, "nano_banana_2_text_to_image", _t2i)
+    monkeypatch.setattr(pc, "nano_banana_2_image_to_image", _i2i)
+    monkeypatch.setattr(pc, "seedance_image_to_video", _seed)
+    return counters
+
+
+@respx.mock
+async def test_simple_motion_pinned_uses_manual_images_one_video(monkeypatch) -> None:
+    """A pinned OVERRIDE on simple-motion speaks the exact script over the
+    operator's OWN two images (fixed shots, no scene generation), producing one
+    video flagged as an override."""
+    from bulkvid.pipeline.open_comments import OpenCommentsAnalysis, OpenCommentsMode
+
+    pinned = "Speak these exact words over my two photos, please."
+
+    async def _classify_override(_client, _text):
+        return OpenCommentsAnalysis(
+            mode=OpenCommentsMode.OVERRIDE, raw_text=_text, override_script=pinned
+        )
+
+    monkeypatch.setattr(rpsm, "classify_open_comments", _classify_override)
+    counters = _patch_pinned_kie(monkeypatch)
+    respx.get(url__regex=r"https://r\.dev/.+\.mp4").mock(
+        return_value=httpx.Response(200, content=b"\x00mp4")
+    )
+    respx.get(url__regex=r"https://img\.test/.+").mock(
+        return_value=httpx.Response(200, content=b"\x00png")
+    )
+    clients = _build_clients()
+
+    result = await process_simple_motion_row(
+        _row(manual1="https://img.test/a.png", manual2="https://img.test/b.png"),
+        clients, job_id="jp",
+    )
+
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 1
+    assert result.metadata["script_used_override"] is True
+    assert result.metadata["pinned_num_shots"] == 2          # the operator's two shots
+    # Operator images used as-is — no scene generation at all.
+    assert counters["t2i"] == 0 and counters["i2i"] == 0
+    # The exact script was spoken once (no shorten path on the pinned builder).
+    assert clients.tts.calls == 1
+    # Manual images re-uploaded under the pinned key.
+    assert any("pinned_images" in k for k, _ in clients.storage.calls)
+
+
 def test_simple_motion_settings_registered() -> None:
     prompt = lookup(SETTING_SIMPLE_MOTION_PLANNER_PROMPT)
     timeout = lookup(SETTING_ROW_TIMEOUT_SIMPLE_MOTION)

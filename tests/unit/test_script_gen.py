@@ -107,6 +107,33 @@ async def test_override_mode_returns_user_script_without_llm_call() -> None:
     assert result.style_direction == DEFAULT_STYLE_DIRECTION
     assert result.cost_usd == 0.0
     assert result.word_count == len(override_text.split())
+    assert result.override_oversize is False    # short script, not flagged
+
+
+@respx.mock
+async def test_override_mode_propagates_oversize_flag() -> None:
+    # The classifier flags a too-long pinned script; generate_script must carry
+    # that flag onto the result (and still speak it verbatim, never truncate).
+    override_text = "word " * 70 + "the end."
+    open_comments = OpenCommentsAnalysis(
+        mode=OpenCommentsMode.OVERRIDE,
+        raw_text=override_text,
+        override_script=override_text,
+        override_oversize=True,
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await generate_script(
+            client,
+            article_body="ignored",
+            country="US",
+            vertical="tech",
+            language="en",
+            script_pattern="How To",
+            open_comments=open_comments,
+        )
+    assert result.used_override is True
+    assert result.override_oversize is True
+    assert result.script == override_text.strip()    # verbatim, not truncated
 
 
 @respx.mock
@@ -363,6 +390,64 @@ async def test_missing_style_direction_uses_default() -> None:
             open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
         )
     assert result.style_direction == DEFAULT_STYLE_DIRECTION
+
+
+# ── Voice selection ────────────────────────────────────────────────────────
+
+
+@respx.mock
+async def test_voice_is_parsed_and_validated() -> None:
+    # The script LLM picks a voice; it's canonicalized onto the pool.
+    respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_response(
+                json.dumps(
+                    {"script": "Bright news here.", "voice": "puck",
+                     "style_direction": "Upbeat and lively."}
+                )
+            ),
+        )
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await generate_script(
+            client,
+            article_body="x",
+            country="US",
+            vertical="tech",
+            language="en",
+            script_pattern="How To",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+        )
+    assert result.voice == "Puck"
+
+
+@respx.mock
+async def test_unknown_voice_normalizes_to_empty() -> None:
+    # An off-menu voice → "" so TTS applies its per-language default instead of
+    # forcing a bad name.
+    respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json=_chat_response(
+                json.dumps(
+                    {"script": "Bright news here.", "voice": "Sparkle",
+                     "style_direction": "Upbeat."}
+                )
+            ),
+        )
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        result = await generate_script(
+            client,
+            article_body="x",
+            country="US",
+            vertical="tech",
+            language="en",
+            script_pattern="How To",
+            open_comments=OpenCommentsAnalysis(mode=OpenCommentsMode.NONE, raw_text=""),
+        )
+    assert result.voice == ""
 
 
 # ── Word count + result type ───────────────────────────────────────────────

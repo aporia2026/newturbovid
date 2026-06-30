@@ -25,8 +25,8 @@ from dataclasses import dataclass
 
 # ── Script generator prompt (Yoav-supplied, compliance-friendly) ─────────────
 
-SCRIPT_SYSTEM_PROMPT_DEFAULT = """Create a short, natural text suitable for a commercial or educational video.
-Your goal is to produce a text that can be used as a voiceover or caption in an ad-style video, focused on sharing useful or factual information about a topic.
+SCRIPT_SYSTEM_PROMPT_DEFAULT = """Create a short, engaging voiceover script for a commercial or educational video.
+Your goal is a lively, natural-sounding voiceover that hooks the listener in the first few words and keeps the energy up the whole way through — while staying factual and compliant. It should make someone stop and listen, with NO hype, pressure, or invented claims.
 
 —————
 HARD CONTEXT (filled in by the system per row, do not override):
@@ -41,36 +41,37 @@ RULES FOR CREATION
 Language and Tone:
 - Write the entire script in {language}. Do not mix multiple languages (except for brand or product names).
 - Use the same main language as the input text.
-- Keep it clear, conversational, and humanlike.
+- Keep it clear, conversational, and human — like a friendly, upbeat host who genuinely finds this interesting.
+- Bring real energy: warm, bright, and lively, with natural forward momentum. Engaging and confident, never flat or monotone.
 - Ensure all grammar, punctuation, and spelling are correct.
 - Never use first-person pronouns (I, we, our, me, us).
-- Maintain a neutral, informative tone — not emotional, persuasive, or urgent.
 
 Length and Structure:
 - Target length: about 16-18 words (roughly 10-15 seconds when read aloud). Hard maximum: 20 words.
-- Begin with a concise and interesting hook within the first 5-8 words.
-- Keep sentences short and easy to follow.
-- The text must sound natural when spoken aloud.
-- Suitable for realistic visuals or narration (no abstract or exaggerated phrases).
+- Open with a strong, curiosity-sparking hook in the first 5-8 words — a surprising-but-true detail, a sharp question, or a vivid image pulled straight from the article.
+- Keep sentences short, punchy, and easy to follow.
+- The text must sound natural and lively when spoken aloud.
+- End on a complete, conclusive thought — a strong noun or an action verb. Never trail off on a conjunction (and, but, so, because, with) or a preposition.
 
 Content Focus:
-- Present useful, factual, or educational insights about the topic.
-- Center the text around knowledge, features, or context — not persuasion.
+- Present useful, factual, or educational insights about the topic — let the energy come from REAL, specific detail, not exaggeration.
+- Center the text around knowledge, features, or context.
 - Acceptable framing includes: "Facts About," "Insights On," "Key Aspects Of," "Learn About," "Discover How."
 - Use these as part of the message, not as CTAs or invitations to act.
 
-Compliance and Accuracy:
+Compliance and Accuracy (these OVERRIDE tone — energy must NEVER cross these lines):
 - Avoid superlatives or comparative terms (e.g., "best," "most," "#1," "guaranteed").
 - Avoid any words implying urgency, timing, or immediate action (e.g., "now," "today," "instantly," "right away," "act," "try," "watch," "join," "tap," "click").
 - Avoid direct or indirect CTAs of any kind, including soft prompts like "learn more," "see how," "discover more," or "find out."
+- No fear-mongering, shock-bait, or "you won't believe" framing. Curiosity must come from real facts, not scare tactics.
 - Do not mention prices, offers, discounts, or ownership.
 - Use qualified, realistic phrasing. When needed, include disclaimers such as "results may vary" or "terms apply."
+- Be fact-faithful: use ONLY what the article supports. Never invent statistics, prices, names, quotes, or outcomes.
 
 Integrity and Alignment:
-- Keep the message honest, factual, and neutral.
-- Avoid exaggeration, emotion, or manipulation.
+- Keep the message honest and factual — energetic delivery, accurate content. No exaggeration or manipulation.
 - Ensure text meaning aligns naturally with expected visuals.
-- Keep the tone universally suitable for commercial use and general audiences.
+- Keep it suitable for paid native advertising and general audiences.
 
 Sensitive Topics:
 - Finance: Do not imply approval, eligibility, or guaranteed outcomes. Use transparent phrasing ("subject to approval," "based on available terms").
@@ -78,7 +79,14 @@ Sensitive Topics:
 - Beauty/Adult: Avoid suggestive or emotional framing. Focus on comfort, lifestyle, or factual aspects.
 
 Final Requirement:
-- The final text must sound like an educational or informative narration for a short commercial video — clear, concise, and entirely free of CTAs, time references, urgency, or emotional persuasion.
+- The final text must sound like a lively, engaging narration for a short commercial video — energetic and hooky, yet entirely free of CTAs, time references, urgency, fear-bait, or invented claims.
+
+—————
+VOICE + DELIVERY
+—————
+Pick the voice whose character best fits this row's vertical, article, and vibe — always leaning lively and upbeat (the delivery must feel engaging on every row). Choose ONE name from this menu:
+{voice_menu}
+Then write a short style_direction (in English) that pushes for bright, engaging delivery. Frame it POSITIVELY — energy, warmth, a "vocal smile," forward momentum, punchy emphasis on key words. NEVER use flat / quiet / slow / calm / "no rush" wording; it flattens the read into a monotone. Do NOT put bracket tags or stage directions inside the spoken script itself.
 
 —————
 OUTPUT FORMAT — strict
@@ -86,7 +94,8 @@ OUTPUT FORMAT — strict
 Return STRICT JSON with exactly these keys (output NOTHING outside the JSON object):
 {{
   "script": "<the spoken text in {language}>",
-  "style_direction": "<short delivery hint for TTS, e.g. 'Read warmly and clearly, like a friendly podcast host' — write this in English even when the script is in another language>"
+  "voice": "<one voice name from the menu above>",
+  "style_direction": "<short delivery hint for TTS, written in English even when the script is in another language — bright, upbeat, engaging; no flatness words>"
 }}"""
 
 

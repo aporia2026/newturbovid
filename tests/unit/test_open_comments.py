@@ -22,9 +22,11 @@ import respx
 
 from bulkvid.adapters.openai_client import OpenAIClient
 from bulkvid.pipeline.open_comments import (
+    OVERRIDE_SOFT_MAX_WORDS,
     OpenCommentsAnalysis,
     OpenCommentsMode,
     classify_open_comments,
+    detect_pinned_script,
 )
 
 API_KEY = "sk-test"
@@ -238,3 +240,126 @@ def test_mode_enum_string_values() -> None:
     assert OpenCommentsMode.DIRECTIVE.value == "directive"
     assert OpenCommentsMode.OVERRIDE.value == "override"
     assert OpenCommentsMode.MIXED.value == "mixed"
+
+
+# ── Pinned-script marker — pure detector ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "cell, expected",
+    [
+        # The manager's exact convention.
+        ("use this script: Hello there friend.", "Hello there friend."),
+        # Case-insensitive.
+        ("USE THIS SCRIPT: Hello.", "Hello."),
+        # Tolerant of the spacing a lazy operator types.
+        ("  use this script:   Hello.  ", "Hello."),
+        # Hyphen / dash / equals separators.
+        ("use this script - Hello.", "Hello."),
+        ("USE THIS SCRIPT = Hello there.", "Hello there."),
+        # No separator at all, just a space.
+        ("use this script Hello.", "Hello."),
+        # Marker variants.
+        ("use script: Hello.", "Hello."),
+        ("use the script: Hello.", "Hello."),
+        ("use the following script: Hello.", "Hello."),
+        ("use this exact script: Hello.", "Hello."),
+        # Full-width autocorrect colon.
+        ("use this script：Hello.", "Hello."),  # noqa: RUF001 — testing the FW colon
+        # Internal separators are preserved; only the leading run is stripped.
+        ("use this script: A: B - C.", "A: B - C."),
+    ],
+)
+def test_detect_pinned_script_matches(cell: str, expected: str) -> None:
+    assert detect_pinned_script(cell) == expected
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "",
+        "   ",
+        "make it urgent and short",                      # no marker
+        "Beslagauto's in Nederland worden geveild.",     # bare paste, no marker
+        "please use this script: hi",                    # marker NOT at the start
+        "scripture reading for today",                   # token boundary, not a marker
+        "use scripts from the library",                  # token boundary, not "use script"
+        "script: be funny and upbeat",                   # bare "script" is NOT a marker
+        "use this script:",                              # marker only, nothing after
+        "use this script:    ",                          # marker + whitespace only
+    ],
+)
+def test_detect_pinned_script_no_match(cell: str) -> None:
+    assert detect_pinned_script(cell) is None
+
+
+# ── Pinned-script marker — classifier short-circuit ─────────────────────────
+
+
+@respx.mock
+async def test_marker_short_circuits_without_network_call() -> None:
+    # No respx route set; a network call would raise.
+    async with OpenAIClient(api_key=API_KEY) as client:
+        analysis = await classify_open_comments(
+            client, "use this script: Buy our generic widget today, folks."
+        )
+    assert analysis.mode is OpenCommentsMode.OVERRIDE
+    assert analysis.override_script == "Buy our generic widget today, folks."
+    assert analysis.cost_usd == 0.0          # deterministic path is free
+    assert analysis.override_oversize is False
+
+
+@respx.mock
+async def test_marker_oversize_flag_set() -> None:
+    long_script = ("word " * (OVERRIDE_SOFT_MAX_WORDS + 5)) + "end."
+    async with OpenAIClient(api_key=API_KEY) as client:
+        analysis = await classify_open_comments(
+            client, "use this script: " + long_script
+        )
+    assert analysis.mode is OpenCommentsMode.OVERRIDE
+    assert analysis.override_oversize is True
+
+
+@respx.mock
+async def test_bare_paste_still_uses_llm_auto_detect() -> None:
+    # A pasted script WITHOUT the marker must still reach the LLM auto-detect
+    # (the locked "marker + auto-detect" behaviour) — so the route IS hit.
+    script = (
+        "Looking for the best smartwatch this year? "
+        "Read on for our top three picks under two hundred dollars."
+    )
+    payload = {
+        "mode": "override",
+        "tone_hints": [],
+        "directives": [],
+        "override_script": script,
+    }
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=_chat_response(json.dumps(payload)))
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        analysis = await classify_open_comments(client, script)
+    assert route.called                       # the LLM path ran (not short-circuited)
+    assert analysis.mode is OpenCommentsMode.OVERRIDE
+    assert analysis.override_script == script
+    assert analysis.cost_usd > 0
+
+
+@respx.mock
+async def test_marker_mid_string_falls_through_to_llm() -> None:
+    # "use this script:" NOT at the start is not a pin; the LLM classifies it.
+    payload = {
+        "mode": "tone",
+        "tone_hints": ["casual"],
+        "directives": [],
+        "override_script": None,
+    }
+    route = respx.post(f"{BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json=_chat_response(json.dumps(payload)))
+    )
+    async with OpenAIClient(api_key=API_KEY) as client:
+        analysis = await classify_open_comments(
+            client, "make it casual, and please use this script: be warm"
+        )
+    assert route.called
+    assert analysis.mode is OpenCommentsMode.TONE

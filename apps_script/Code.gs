@@ -200,6 +200,7 @@ function onOpen() {
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
+    .addItem('Add "use this script" tips', 'applyOpenCommentsTips')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
 }
@@ -1245,6 +1246,62 @@ function applyYtCartoonDropdowns() {
       ? 'Applied to:\n\n• ' + updated.join('\n• ')
         + '\n\nAlso run "Update size dropdowns on all tabs" for the Change Size column.'
       : 'No yt-cartoon tab found. Name a tab "yt-cartoon" and re-run.',
+    ui.ButtonSet.OK
+  );
+}
+
+
+// ─── Open Comments verbatim-script tip ──────────────────────────────────────
+
+/** One-shot: add a header NOTE to the "Open Comments" column on every video tab
+ *  explaining the verbatim-script marker. The backend speaks an Open Comments
+ *  cell verbatim when it starts with "use this script:" (parsed server-side — no
+ *  sheet change is needed for the feature to work); this just makes the
+ *  convention DISCOVERABLE so a new operator doesn't have to be told. Skips the
+ *  text-on-img tab (it produces an image, no voiceover). Resolves the column BY
+ *  HEADER NAME and probes rows 1-2 like applySizeDropdowns, so it follows the
+ *  header wherever it sits. Idempotent — re-running rewrites the same note.
+ *  Plan _plans/2026-06-29-pinned-script-open-comments-all-tabs.md. */
+function applyOpenCommentsTips() {
+  const ui = SpreadsheetApp.getUi();
+  const note =
+    'Tip: to make the voiceover say your EXACT words, start this cell with:\n' +
+    '    use this script: <your script>\n\n' +
+    'It is then spoken verbatim, in any language, with no AI rewrite. Leave the\n' +
+    'marker off and the system writes the script from the article instead.\n' +
+    'Works on every video tab.';
+
+  const updated = [];
+  SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
+    if (_detectTabType(sheet) === TAB_TEXT_ON_IMG) return;    // no voiceover here
+    // Headers sit on row 1 everywhere except migrated simple_x4 tabs, where
+    // row 1 is the template-preview band and row 2 holds them (mirrors
+    // applySizeDropdowns).
+    var headerRow = 0;
+    var col = 0;
+    [1, 2].some(function (probe) {
+      if (sheet.getLastRow() < probe || sheet.getLastColumn() === 0) return false;
+      const headers = sheet.getRange(probe, 1, 1, sheet.getLastColumn()).getValues()[0];
+      for (var i = 0; i < headers.length; i++) {
+        const h = String(headers[i] || '').toLowerCase().trim();
+        if (h === 'open comments' || h === 'open comment') {
+          headerRow = probe;
+          col = i + 1;
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!col) return;    // tab has no Open Comments column — skip
+    sheet.getRange(headerRow, col).setNote(note);
+    updated.push(sheet.getName());
+  });
+
+  ui.alert(
+    'Open Comments tips added',
+    updated.length
+      ? 'The "use this script:" tip note was added to:\n\n• ' + updated.join('\n• ')
+      : 'No tab with an "Open Comments" column found.',
     ui.ButtonSet.OK
   );
 }
