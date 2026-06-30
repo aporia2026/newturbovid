@@ -17,6 +17,13 @@ dependencies = [
     # Async HTTP
     "aiohttp>=3.11",
     "httpx>=0.28",
+    # Browser TLS fingerprint impersonation. Used ONLY for Facebook /
+    # Instagram image downloads, where FB's edge rejects every Python
+    # TLS handshake regardless of User-Agent. ABI3 wheels cover Linux,
+    # macOS, and Windows on Python 3.10+; on the unlikely chance the
+    # wheel cannot load, http_download falls back to httpx silently.
+    # Plan: _plans/2026-06-30-facebook-tls-fingerprint.md.
+    "curl-cffi>=0.7",
 
     # Auth
     "python-jose[cryptography]>=3.3",
