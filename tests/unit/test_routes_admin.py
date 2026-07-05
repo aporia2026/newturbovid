@@ -202,3 +202,50 @@ def test_kill_returns_updated_status_badge(client: TestClient, app: FastAPI) -> 
 def test_kill_unknown_job_returns_404(client: TestClient) -> None:
     r = client.post("/admin/jobs/job-bogus/kill", headers=_basic("admin", "s3cret"))
     assert r.status_code == 404
+
+
+# ── Kill-attempt audit ───────────────────────────────────────────────────────
+# Plan: ``_plans/2026-07-05-kill-attempt-audit.md``. Admin kills leave the
+# same durable trail as sidebar kills, and /admin/kills renders it.
+
+
+def test_admin_kill_records_audit_row(client: TestClient, app: FastAPI) -> None:
+    import asyncio
+
+    job_id = asyncio.run(_seed_one_job(app))
+    r = client.post(f"/admin/jobs/{job_id}/kill", headers=_basic("admin", "s3cret"))
+    assert r.status_code == 200
+
+    attempts = asyncio.run(app.state.queue.list_kill_attempts())
+    assert len(attempts) == 1
+    a = attempts[0]
+    assert a.endpoint == "admin_kill_job"
+    assert a.job_id == job_id
+    assert a.user_email == "admin:admin"
+    assert a.outcome == "killed"
+
+
+def test_kill_audit_page_requires_auth(client: TestClient) -> None:
+    r = client.get("/admin/kills")
+    assert r.status_code == 401
+
+
+def test_kill_audit_page_renders_attempts(client: TestClient, app: FastAPI) -> None:
+    import asyncio
+
+    job_id = asyncio.run(_seed_one_job(app))
+    client.post(f"/admin/jobs/{job_id}/kill", headers=_basic("admin", "s3cret"))
+
+    r = client.get("/admin/kills", headers=_basic("admin", "s3cret"))
+    assert r.status_code == 200
+    body = r.text
+    assert "Kill attempts" in body
+    assert job_id in body
+    assert "admin_kill_job" in body
+    assert "killed" in body.lower()
+
+
+def test_kill_audit_page_empty_state(client: TestClient) -> None:
+    r = client.get("/admin/kills", headers=_basic("admin", "s3cret"))
+    assert r.status_code == 200
+    assert "No kill attempts recorded yet" in r.text

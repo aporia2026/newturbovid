@@ -81,6 +81,27 @@ TAB_AVATAR = "avatar"
 # are pruned opportunistically on every enqueue.
 IDEMPOTENCY_TTL_SECONDS = 86_400
 
+# Kill-attempt audit outcomes. Every kill POST that reaches the backend is
+# recorded durably (table ``kill_audit``) with one of these, so a "kill didn't
+# work" report can be answered from data — the 2026-07-05 incident left zero
+# server-side evidence because the only traces (job log file, container
+# stdout) were ephemeral on HF Spaces. Plan
+# ``_plans/2026-07-05-kill-attempt-audit.md``.
+KILL_OUTCOME_RECEIVED = "received"        # attempt logged; finalize never landed
+KILL_OUTCOME_KILLED = "killed"            # job(s) transitioned to killed
+KILL_OUTCOME_NO_ACTIVE_JOB = "no_active_job"    # nothing queued/running to kill
+KILL_OUTCOME_TIMEOUT = "timeout"          # kill DB call exceeded its budget → 504
+KILL_OUTCOME_QUEUE_BUSY = "queue_busy"    # QueueBusy / QueueUnavailable → 503
+KILL_OUTCOME_FORBIDDEN = "forbidden"      # ownership check failed → 403
+KILL_OUTCOME_NOT_FOUND = "not_found"      # unknown job_id → 404
+KILL_OUTCOME_ERROR = "error"              # any other unexpected failure
+
+# Audit retention. Kill attempts arrive tens-per-month; 90 days keeps every
+# investigation window alive while the table stays trivially small. Pruned
+# opportunistically on every record insert (same shape as the idempotency
+# prune above).
+KILL_AUDIT_TTL_SECONDS = 90 * 86_400
+
 
 # ── DB resilience (Turso flap hardening) — shared by web AND worker ──────────
 #
@@ -148,10 +169,22 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     PRIMARY KEY (user_email, key)
 );
 
+CREATE TABLE IF NOT EXISTS kill_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    endpoint     TEXT NOT NULL,
+    job_id       TEXT,
+    user_email   TEXT NOT NULL,
+    outcome      TEXT NOT NULL,
+    detail       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_row_queue_status      ON row_queue(status);
 CREATE INDEX IF NOT EXISTS idx_row_queue_job         ON row_queue(job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status           ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_idempotency_keys_ts   ON idempotency_keys(created_ts);
+CREATE INDEX IF NOT EXISTS idx_kill_audit_ts         ON kill_audit(created_ts);
 """
 
 
@@ -205,6 +238,17 @@ class QueuedRow:
     row_num: int
     payload: dict[str, Any]
     status: str
+
+
+@dataclass
+class KillAttempt:
+    id: int
+    ts: str
+    endpoint: str
+    job_id: str | None
+    user_email: str
+    outcome: str
+    detail: str | None
 
 
 def _now_iso() -> str:
@@ -1071,6 +1115,79 @@ class JobQueue:
             )
         return len(affected_ids)
 
+    def _record_kill_attempt_sync(
+        self, *, endpoint: str, job_id: str | None, user_email: str,
+    ) -> int:
+        """Insert a ``kill_audit`` row with ``outcome='received'`` and return
+        its id. Opportunistically prunes rows past ``KILL_AUDIT_TTL_SECONDS``
+        AFTER the insert (same shape as the idempotency prune in
+        ``_enqueue_sync`` — a slow prune never blocks the recording, and a
+        prune failure is non-fatal). Plan
+        ``_plans/2026-07-05-kill-attempt-audit.md`` §D.3."""
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO kill_audit "
+                "(ts, created_ts, endpoint, job_id, user_email, outcome) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    _now_iso(), time.time(), endpoint, job_id, user_email,
+                    KILL_OUTCOME_RECEIVED,
+                ),
+            )
+            # ``lastrowid`` is None on some libsql remote builds — fall back
+            # to SQLite's own last_insert_rowid() on the same connection.
+            rowid = cur.lastrowid
+            if not rowid:
+                row = self._conn.execute("SELECT last_insert_rowid()").fetchone()
+                rowid = row[0] if row is not None else 0
+            audit_id = int(rowid)
+        except sqlite3.OperationalError as e:
+            raise QueueBusy(str(e)) from e
+        try:
+            pruned = self._conn.execute(
+                "DELETE FROM kill_audit WHERE created_ts < ?",
+                (time.time() - KILL_AUDIT_TTL_SECONDS,),
+            ).rowcount
+            if pruned:
+                _log.debug("kill_audit_pruned", removed=pruned)
+        except sqlite3.OperationalError:
+            pass
+        return audit_id
+
+    def _finalize_kill_attempt_sync(
+        self, audit_id: int, *, outcome: str, detail: str | None,
+    ) -> None:
+        """Set the final ``outcome`` (+ optional ``detail``) on an audit row.
+        A row left at ``received`` means this write was lost — itself evidence
+        of a DB flap mid-kill, which is why record and finalize are two
+        separate writes instead of one insert at the end."""
+        try:
+            self._conn.execute(
+                "UPDATE kill_audit SET outcome = ?, detail = ? WHERE id = ?",
+                (outcome, detail, audit_id),
+            )
+        except sqlite3.OperationalError as e:
+            raise QueueBusy(str(e)) from e
+
+    def _list_kill_attempts_sync(self, *, limit: int) -> list[KillAttempt]:
+        cur = self._conn.execute(
+            "SELECT id, ts, endpoint, job_id, user_email, outcome, detail "
+            "FROM kill_audit ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            KillAttempt(
+                id=int(r["id"]),
+                ts=r["ts"],
+                endpoint=r["endpoint"],
+                job_id=r["job_id"],
+                user_email=r["user_email"],
+                outcome=r["outcome"],
+                detail=r["detail"],
+            )
+            for r in cur.fetchall()
+        ]
+
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
         with self._tx():
@@ -1303,6 +1420,50 @@ class JobQueue:
             rows_aborted=n_rows,
         )
         return n_jobs, n_rows
+
+    async def record_kill_attempt(
+        self, *, endpoint: str, job_id: str | None, user_email: str,
+    ) -> int:
+        """Durably record that a kill attempt reached the backend; returns the
+        audit row id for ``finalize_kill_attempt``. Callers (the kill routes)
+        treat this as best-effort — they bound it with their own timeout and
+        swallow failures so a flapping DB can never block the kill itself.
+        Plan ``_plans/2026-07-05-kill-attempt-audit.md`` §D.4."""
+        audit_id = await self._run_db(
+            self._record_kill_attempt_sync,
+            endpoint=endpoint,
+            job_id=job_id,
+            user_email=user_email,
+            op="record_kill_attempt",
+        )
+        _log.debug(
+            "kill_audit_recorded",
+            audit_id=audit_id,
+            endpoint=endpoint,
+            job_id=job_id,
+            user_email=user_email,
+        )
+        return audit_id
+
+    async def finalize_kill_attempt(
+        self, audit_id: int, *, outcome: str, detail: str | None = None,
+    ) -> None:
+        """Set the final outcome on a kill-audit row. Best-effort like
+        ``record_kill_attempt`` — a row left at ``received`` is itself
+        evidence (the finalize write was lost mid-flap)."""
+        await self._run_db(
+            self._finalize_kill_attempt_sync,
+            audit_id,
+            outcome=outcome,
+            detail=detail,
+            op="finalize_kill_attempt",
+        )
+
+    async def list_kill_attempts(self, *, limit: int = 100) -> list[KillAttempt]:
+        """Newest-first kill attempts for the admin audit page."""
+        return await self._run_db(
+            self._list_kill_attempts_sync, limit=limit, op="list_kill_attempts"
+        )
 
     async def recover_orphaned_rows(self) -> int:
         """Call on worker startup: rows stuck in PROCESSING are released.

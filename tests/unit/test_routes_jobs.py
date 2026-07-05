@@ -1233,3 +1233,154 @@ def test_submit_queue_unavailable_returns_503(
     assert r.headers.get("Retry-After") == "5"
     # The fixed message never leaks the underlying error.
     assert "turso" not in r.text.lower()
+
+
+# ── Kill-attempt audit (rule 18) ────────────────────────────────────────────
+# Plan: ``_plans/2026-07-05-kill-attempt-audit.md``. The 2026-07-05 incident
+# ("kill didn't work, 100 videos generated anyway") left ZERO server-side
+# evidence because the only traces were ephemeral. Every kill attempt that
+# reaches the backend must now leave a durable ``kill_audit`` row with its
+# outcome — and the audit itself must never block or fail the kill.
+
+
+def _audit_rows(app: FastAPI) -> list:
+    return await_(app.state.queue.list_kill_attempts())
+
+
+def test_kill_success_records_audit_row(app: FastAPI, client: TestClient) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+
+    attempts = _audit_rows(app)
+    assert len(attempts) == 1
+    a = attempts[0]
+    assert a.endpoint == "kill_job"
+    assert a.job_id == job_id
+    assert a.user_email == "bulk1@aporia.com"
+    assert a.outcome == "killed"
+    assert a.detail == "rows_aborted=1"
+
+
+def test_kill_of_finished_job_records_no_active_job(
+    app: FastAPI, client: TestClient,
+) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    # First kill settles the job; the second finds nothing active.
+    client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    assert r.json()["killed"] is False
+
+    attempts = _audit_rows(app)
+    assert [a.outcome for a in attempts] == ["no_active_job", "killed"]
+
+
+def test_kill_timeout_records_audit_outcome(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(jobs_routes, "_KILL_CALL_TIMEOUT_SECONDS", 0.1)
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    _patch_queue_method_to_hang(app, on_method="kill_job")
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 504
+
+    attempts = _audit_rows(app)
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "timeout"
+    assert "0.1" in (attempts[0].detail or "")
+
+
+def test_kill_queue_busy_records_audit_outcome(
+    app: FastAPI, client: TestClient,
+) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    _patch_queue_to_raise_queuebusy(app, on_method="kill_job")
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 503
+
+    attempts = _audit_rows(app)
+    assert attempts[0].outcome == "queue_busy"
+    assert "locked" in (attempts[0].detail or "")
+
+
+def test_kill_forbidden_records_audit_outcome(
+    app: FastAPI, client: TestClient,
+) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk2"))
+    assert r.status_code == 403
+
+    attempts = _audit_rows(app)
+    assert len(attempts) == 1
+    a = attempts[0]
+    assert a.outcome == "forbidden"
+    assert a.user_email == "bulk2@aporia.com"    # who TRIED, not who owns
+
+
+def test_kill_unknown_job_records_audit_outcome(
+    app: FastAPI, client: TestClient,
+) -> None:
+    r = client.post("/jobs/job-bogus/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 404
+
+    attempts = _audit_rows(app)
+    assert attempts[0].outcome == "not_found"
+    assert attempts[0].job_id == "job-bogus"
+
+
+def test_kill_all_records_audit_row_without_job_id(
+    app: FastAPI, client: TestClient,
+) -> None:
+    client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    r = client.post("/jobs/kill-all", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+
+    attempts = _audit_rows(app)
+    assert len(attempts) == 1
+    a = attempts[0]
+    assert a.endpoint == "kill_all_jobs"
+    assert a.job_id is None
+    assert a.outcome == "killed"
+    assert a.detail == "jobs=1 rows_aborted=1"
+
+
+def test_audit_record_failure_never_breaks_the_kill(
+    app: FastAPI, client: TestClient,
+) -> None:
+    """Bug-shape regression guard: the audit is best-effort by contract. A
+    dead audit write must not turn a working kill into a failure."""
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+
+    async def _raises(*_args, **_kwargs):
+        raise RuntimeError("audit table on fire (simulated)")
+
+    app.state.queue.record_kill_attempt = _raises
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    assert r.json()["killed"] is True
+
+
+def test_audit_finalize_failure_never_breaks_the_kill(
+    app: FastAPI, client: TestClient,
+) -> None:
+    r = client.post("/jobs", json=_image_vo_payload(), headers=_auth("tok-bulk1"))
+    job_id = r.json()["job_id"]
+
+    async def _raises(*_args, **_kwargs):
+        raise RuntimeError("audit table on fire (simulated)")
+
+    app.state.queue.finalize_kill_attempt = _raises
+    r = client.post(f"/jobs/{job_id}/kill", headers=_auth("tok-bulk1"))
+    assert r.status_code == 200
+    assert r.json()["killed"] is True
+    # The record write landed before finalize blew up — the row survives
+    # at ``received``, which is exactly the "finalize lost" evidence shape.
+    attempts = _audit_rows(app)
+    assert attempts[0].outcome == "received"

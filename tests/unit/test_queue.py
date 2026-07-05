@@ -15,6 +15,7 @@ Use a tmp_path DB per test; no shared state. Covers:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,9 @@ from bulkvid.orchestrator.queue import (
     JOB_KILLED,
     JOB_QUEUED,
     JOB_RUNNING,
+    KILL_AUDIT_TTL_SECONDS,
+    KILL_OUTCOME_KILLED,
+    KILL_OUTCOME_RECEIVED,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
@@ -651,3 +655,62 @@ def test_tx_rolls_back_on_exception(queue: JobQueue) -> None:
         "SELECT job_id FROM jobs WHERE job_id = ?", ("tx-rollback",)
     ).fetchall()
     assert rows == []                          # rolled back, never persisted
+
+
+# ── Kill-attempt audit ───────────────────────────────────────────────────────
+# Plan: ``_plans/2026-07-05-kill-attempt-audit.md``. Every kill attempt that
+# reaches the backend leaves a durable row; these cover the queue-level
+# record → finalize → list roundtrip and the opportunistic retention prune.
+
+
+async def test_kill_audit_record_finalize_list_roundtrip(queue: JobQueue) -> None:
+    audit_id = await queue.record_kill_attempt(
+        endpoint="kill_job", job_id="job-x", user_email="u@aporia.com",
+    )
+    assert audit_id > 0
+
+    attempts = await queue.list_kill_attempts()
+    assert len(attempts) == 1
+    a = attempts[0]
+    assert a.id == audit_id
+    assert a.endpoint == "kill_job"
+    assert a.job_id == "job-x"
+    assert a.user_email == "u@aporia.com"
+    assert a.outcome == KILL_OUTCOME_RECEIVED
+    assert a.detail is None
+
+    await queue.finalize_kill_attempt(
+        audit_id, outcome=KILL_OUTCOME_KILLED, detail="rows_aborted=3",
+    )
+    a = (await queue.list_kill_attempts())[0]
+    assert a.outcome == KILL_OUTCOME_KILLED
+    assert a.detail == "rows_aborted=3"
+
+
+async def test_kill_audit_list_is_newest_first(queue: JobQueue) -> None:
+    first = await queue.record_kill_attempt(
+        endpoint="kill_job", job_id="job-1", user_email="u@aporia.com",
+    )
+    second = await queue.record_kill_attempt(
+        endpoint="kill_all_jobs", job_id=None, user_email="u@aporia.com",
+    )
+    attempts = await queue.list_kill_attempts()
+    assert [a.id for a in attempts] == [second, first]
+    # kill-all attempts carry no job_id.
+    assert attempts[0].job_id is None
+
+
+async def test_kill_audit_prunes_rows_past_ttl(queue: JobQueue) -> None:
+    old_id = await queue.record_kill_attempt(
+        endpoint="kill_job", job_id="job-old", user_email="u@aporia.com",
+    )
+    # Age the row past the retention window; the next record prunes it.
+    queue._conn.execute(
+        "UPDATE kill_audit SET created_ts = ? WHERE id = ?",
+        (time.time() - KILL_AUDIT_TTL_SECONDS - 60, old_id),
+    )
+    fresh_id = await queue.record_kill_attempt(
+        endpoint="kill_job", job_id="job-new", user_email="u@aporia.com",
+    )
+    attempts = await queue.list_kill_attempts()
+    assert [a.id for a in attempts] == [fresh_id]

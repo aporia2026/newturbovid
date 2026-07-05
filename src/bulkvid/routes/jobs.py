@@ -41,6 +41,13 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     JOB_RUNNING,
+    KILL_OUTCOME_ERROR,
+    KILL_OUTCOME_FORBIDDEN,
+    KILL_OUTCOME_KILLED,
+    KILL_OUTCOME_NO_ACTIVE_JOB,
+    KILL_OUTCOME_NOT_FOUND,
+    KILL_OUTCOME_QUEUE_BUSY,
+    KILL_OUTCOME_TIMEOUT,
     TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
@@ -85,6 +92,15 @@ _KILL_CALL_TIMEOUT_SECONDS = float(
 # trips. Plan ``_plans/2026-06-14-fast-fail-kill-and-poll-timeout.md`` §B.
 _POLL_DB_CALL_TIMEOUT_SECONDS = float(
     os.environ.get("BULKVID_POLL_DB_CALL_TIMEOUT_SECONDS") or 15.0
+)
+
+# Hard timeout around each kill-audit write. The audit is best-effort by
+# contract — it exists to leave durable evidence of kill attempts (the
+# 2026-07-05 incident left none), but it must never delay or fail the kill
+# itself, so it gets a tighter bound than the kill call and every failure is
+# swallowed with a WARNING. Plan ``_plans/2026-07-05-kill-attempt-audit.md``.
+_KILL_AUDIT_DB_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_KILL_AUDIT_DB_TIMEOUT_SECONDS") or 5.0
 )
 
 _log = get_logger("route.jobs")
@@ -701,6 +717,60 @@ async def _require_owned_job(job_id: str, identity: Identity, queue: JobQueue) -
     return job
 
 
+async def _kill_audit_start(
+    queue: JobQueue, *, endpoint: str, job_id: str | None, user_email: str,
+) -> int | None:
+    """Durably record that a kill attempt reached the backend; returns the
+    audit row id, or ``None`` when the write failed. Best-effort by contract:
+    bounded by ``_KILL_AUDIT_DB_TIMEOUT_SECONDS`` and every failure swallowed,
+    so a flapping DB can never block or fail the kill itself. Plan
+    ``_plans/2026-07-05-kill-attempt-audit.md`` §D.4."""
+    try:
+        return await asyncio.wait_for(
+            queue.record_kill_attempt(
+                endpoint=endpoint, job_id=job_id, user_email=user_email
+            ),
+            timeout=_KILL_AUDIT_DB_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        _log.warning(
+            "kill_audit_write_failed",
+            stage="record",
+            endpoint=endpoint,
+            job_id=job_id,
+            user_email=user_email,
+            error=str(e)[:200],
+        )
+        return None
+
+
+async def _kill_audit_finish(
+    queue: JobQueue,
+    audit_id: int | None,
+    *,
+    outcome: str,
+    detail: str | None = None,
+) -> None:
+    """Best-effort finalize of a kill-audit row; no-op when the record write
+    already failed. A row left at ``received`` is itself evidence — the
+    finalize was lost mid-flap."""
+    if audit_id is None:
+        return
+    try:
+        await asyncio.wait_for(
+            queue.finalize_kill_attempt(audit_id, outcome=outcome, detail=detail),
+            timeout=_KILL_AUDIT_DB_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        _log.warning(
+            "kill_audit_write_failed",
+            stage="finalize",
+            audit_id=audit_id,
+            outcome=outcome,
+            error=str(e)[:200],
+        )
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
@@ -1200,8 +1270,13 @@ async def kill_all_jobs(
     """Clear the queue: kill all active jobs. Bulk users clear their own;
     admins clear everyone's. Pending and in-flight rows are aborted with
     a ``killed by user`` result so the sidebar reflects the kill
-    immediately. Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
+    immediately. Plan ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+    Every attempt — success or failure — leaves a durable ``kill_audit``
+    row (plan ``_plans/2026-07-05-kill-attempt-audit.md``)."""
     scope = None if identity.is_admin else identity.email
+    audit_id = await _kill_audit_start(
+        queue, endpoint="kill_all_jobs", job_id=None, user_email=identity.email
+    )
     try:
         killed, rows_aborted = await asyncio.wait_for(
             queue.kill_all_jobs(user_email=scope),
@@ -1214,6 +1289,10 @@ async def kill_all_jobs(
             user_email=identity.email,
             timeout_s=_KILL_CALL_TIMEOUT_SECONDS,
         )
+        await _kill_audit_finish(
+            queue, audit_id, outcome=KILL_OUTCOME_TIMEOUT,
+            detail=f"exceeded {_KILL_CALL_TIMEOUT_SECONDS}s",
+        )
         raise HTTPException(
             504,
             "kill timed out — worker may be hung; restart the backend",
@@ -1225,6 +1304,9 @@ async def kill_all_jobs(
             user_email=identity.email,
             original_error=str(e),
         )
+        await _kill_audit_finish(
+            queue, audit_id, outcome=KILL_OUTCOME_QUEUE_BUSY, detail=str(e)[:300]
+        )
         raise HTTPException(
             503, "queue temporarily busy", headers={"Retry-After": "5"}
         ) from e
@@ -1234,6 +1316,11 @@ async def kill_all_jobs(
         scope=scope or "ALL",
         killed=killed,
         rows_aborted=rows_aborted,
+    )
+    await _kill_audit_finish(
+        queue, audit_id,
+        outcome=KILL_OUTCOME_KILLED if killed else KILL_OUTCOME_NO_ACTIVE_JOB,
+        detail=f"jobs={killed} rows_aborted={rows_aborted}",
     )
     return {"killed": killed, "rows_aborted": rows_aborted}
 
@@ -1248,7 +1335,12 @@ async def kill_job(
     a hard 10 s timeout so a hung libsql roundtrip surfaces as a 504
     instead of pinning the request forever (the symptom the operator
     saw on 2026-06-14 as "doesn't let killing this process"). Plan
-    ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
+    ``_plans/2026-06-14-stuck-processing-rows.md`` §B. Every attempt —
+    success or failure — leaves a durable ``kill_audit`` row (plan
+    ``_plans/2026-07-05-kill-attempt-audit.md``)."""
+    audit_id = await _kill_audit_start(
+        queue, endpoint="kill_job", job_id=job_id, user_email=identity.email
+    )
     # Ownership check uses ``queue.get_job`` (another libsql call) —
     # wrap it in the same timeout so a hung Turso doesn't pin the
     # request before we even get to the kill itself.
@@ -1269,6 +1361,10 @@ async def kill_job(
             user_email=identity.email,
             timeout_s=_KILL_CALL_TIMEOUT_SECONDS,
         )
+        await _kill_audit_finish(
+            queue, audit_id, outcome=KILL_OUTCOME_TIMEOUT,
+            detail=f"exceeded {_KILL_CALL_TIMEOUT_SECONDS}s",
+        )
         raise HTTPException(
             504,
             "kill timed out — worker may be hung; restart the backend",
@@ -1280,14 +1376,34 @@ async def kill_job(
             user_email=identity.email,
             original_error=str(e),
         )
+        await _kill_audit_finish(
+            queue, audit_id, outcome=KILL_OUTCOME_QUEUE_BUSY, detail=str(e)[:300]
+        )
         raise HTTPException(
             503, "queue temporarily busy", headers={"Retry-After": "5"}
         ) from e
+    except HTTPException as e:
+        # 403/404 from the ownership check — still evidence worth keeping
+        # (e.g. "kill arrived under the wrong account" would show up here).
+        outcome = (
+            KILL_OUTCOME_FORBIDDEN if e.status_code == 403
+            else KILL_OUTCOME_NOT_FOUND if e.status_code == 404
+            else KILL_OUTCOME_ERROR
+        )
+        await _kill_audit_finish(
+            queue, audit_id, outcome=outcome, detail=str(e.detail)[:300]
+        )
+        raise
     _log.info(
         "job_kill",
         job_id=job_id,
         by=identity.email,
         killed=killed,
         rows_aborted=rows_aborted,
+    )
+    await _kill_audit_finish(
+        queue, audit_id,
+        outcome=KILL_OUTCOME_KILLED if killed else KILL_OUTCOME_NO_ACTIVE_JOB,
+        detail=f"rows_aborted={rows_aborted}",
     )
     return {"job_id": job_id, "killed": killed, "rows_aborted": rows_aborted}
