@@ -24,9 +24,15 @@ from fastapi.templating import Jinja2Templates
 
 from bulkvid.config import get_settings
 from bulkvid.logging import get_logger, read_job_log_lines
-from bulkvid.orchestrator.queue import JobQueue
+from bulkvid.orchestrator.queue import (
+    KILL_OUTCOME_ERROR,
+    KILL_OUTCOME_KILLED,
+    KILL_OUTCOME_NO_ACTIVE_JOB,
+    JobQueue,
+)
 from bulkvid.orchestrator.runtime_settings import SETTINGS_REGISTRY, lookup
 from bulkvid.orchestrator.settings_store import SettingsStore
+from bulkvid.routes.jobs import _kill_audit_finish, _kill_audit_start
 
 _log = get_logger("admin")
 
@@ -115,12 +121,27 @@ async def kill_job(
     _user: str = Depends(_check_admin),
 ) -> HTMLResponse:
     queue = _get_queue(request)
-    killed, rows_aborted = await queue.kill_job(job_id)
+    audit_id = await _kill_audit_start(
+        queue, endpoint="admin_kill_job", job_id=job_id,
+        user_email=f"admin:{_user}",
+    )
+    try:
+        killed, rows_aborted = await queue.kill_job(job_id)
+    except Exception as e:
+        await _kill_audit_finish(
+            queue, audit_id, outcome=KILL_OUTCOME_ERROR, detail=str(e)[:300]
+        )
+        raise
     _log.info(
         "admin_kill_job",
         job_id=job_id,
         killed=killed,
         rows_aborted=rows_aborted,
+    )
+    await _kill_audit_finish(
+        queue, audit_id,
+        outcome=KILL_OUTCOME_KILLED if killed else KILL_OUTCOME_NO_ACTIVE_JOB,
+        detail=f"rows_aborted={rows_aborted}",
     )
     job = await queue.get_job(job_id)
     if job is None:
@@ -128,6 +149,21 @@ async def kill_job(
     # HTMX swaps just the status badge.
     return templates.TemplateResponse(
         request, "_status_badge.html", {"job": job}
+    )
+
+
+@router.get("/kills", response_class=HTMLResponse)
+async def kill_audit_page(
+    request: Request,
+    _user: str = Depends(_check_admin),
+) -> HTMLResponse:
+    """Durable log of every kill attempt that reached the backend — the
+    forensics surface for "the kill button didn't work" reports. Plan
+    ``_plans/2026-07-05-kill-attempt-audit.md`` §D.5."""
+    queue = _get_queue(request)
+    attempts = await queue.list_kill_attempts(limit=100)
+    return templates.TemplateResponse(
+        request, "kill_audit.html", {"attempts": attempts}
     )
 
 

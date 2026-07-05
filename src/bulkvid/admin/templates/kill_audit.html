@@ -1,0 +1,52 @@
+{% extends "_base.html" %}
+
+{% block title %}Kill audit · TurboVid Admin{% endblock %}
+
+{% block content %}
+<h2 style="margin-top:0">Kill attempts</h2>
+<p class="label" style="margin-top:-8px">
+  Every kill request that reached the backend, newest first. A failure outcome
+  here means the request arrived and failed server-side; a report of a dead
+  kill button with <em>no</em> row here means the request never left the
+  client. Rows older than 90 days are pruned.
+</p>
+{% if not attempts %}
+  <div class="empty">No kill attempts recorded yet.</div>
+{% else %}
+  {% set outcome_badge = {
+    'killed': 'completed',
+    'no_active_job': 'queued',
+    'received': 'processing',
+  } %}
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Endpoint</th>
+        <th>Job</th>
+        <th>By</th>
+        <th>Outcome</th>
+        <th>Detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in attempts %}
+      <tr>
+        <td>{{ a.ts }}</td>
+        <td>{{ a.endpoint }}</td>
+        <td>
+          {% if a.job_id %}
+            <a class="job-id" href="/admin/jobs/{{ a.job_id }}">{{ a.job_id }}</a>
+          {% else %}
+            <span class="label">all</span>
+          {% endif %}
+        </td>
+        <td>{{ a.user_email }}</td>
+        <td><span class="badge badge-{{ outcome_badge.get(a.outcome, 'failed') }}">{{ a.outcome }}</span></td>
+        <td class="label">{{ a.detail or '' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}
