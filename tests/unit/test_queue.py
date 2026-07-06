@@ -117,6 +117,28 @@ async def test_enqueue_creates_queued_job_and_pending_rows(queue: JobQueue) -> N
     assert job.user_email == "yoav@aporia.com"
 
 
+async def test_count_active_queue_tracks_pending_and_processing(
+    queue: JobQueue,
+) -> None:
+    """``count_active_queue`` reports (pending, processing) across active jobs —
+    the signal the runner heartbeat uses to tell an empty queue apart from a
+    stranded-in-PENDING wedge. Plan
+    ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2."""
+    assert await queue.count_active_queue() == (0, 0)
+
+    await queue.enqueue(
+        user_email="yoav@aporia.com",
+        sheet_id="sheet-A",
+        worksheet="Image-VO",
+        tab_type=TAB_IMAGE_VO,
+        rows=[_img_row(2), _img_row(3), _img_row(4)],
+    )
+    assert await queue.count_active_queue() == (3, 0)
+
+    await queue.claim_next_row()    # one row -> PROCESSING, job -> RUNNING
+    assert await queue.count_active_queue() == (2, 1)
+
+
 # ── claim_next_row + job transition ─────────────────────────────────────────
 
 

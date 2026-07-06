@@ -174,6 +174,29 @@ _WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES = int(
 # logs; ``autorestart`` relaunches it regardless of the code.
 _WATCHDOG_EXIT_CODE = 1
 
+# Hard-wedge backstop — Plan ``_plans/2026-07-06-stuck-runs-worker-wedge.md``
+# §Fix 3, gated per the council review. The conservative watchdog above only
+# fires when nothing is in flight or buffered, so a worker wedged MID-BATCH (DB
+# pool exhausted while rows are in flight) never self-heals — an operator had to
+# restart by hand. This second, higher threshold force-exits UNCONDITIONALLY
+# after a long run of continuous claim failures, on the reasoning that if claims
+# have failed for ~10+ min straight the in-flight rows cannot be progressing
+# either (same dead pool / unreachable Turso), so a restart beats an indefinite
+# wedge. The cost is bounded but real: ``recover_orphaned_rows`` re-runs those
+# in-flight rows on boot (duplicate paid spend on a handful of rows) — which is
+# why it is OPT-IN (disabled by default) and should stay off until the
+# DB-executor isolation (§Fix 1) is proven insufficient AND, ideally, idempotent
+# KIE-resume makes the re-run free. Deploy-order: never enable before §Fix 1
+# ships, or a transient flap on the old shared pool false-positive-restarts
+# mid-batch. Both env-tunable.
+_WATCHDOG_HARD_ENABLED = (
+    os.environ.get("BULKVID_WORKER_HARD_WATCHDOG_ENABLED") or ""
+).strip().lower() in ("1", "true", "yes", "on")
+_WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES = int(
+    os.environ.get("BULKVID_WORKER_HARD_WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES")
+    or 20
+)
+
 
 # Heartbeat cadence: number of consecutive empty polls before the runner
 # emits a heartbeat. With the default ``poll_idle_seconds=1.0`` this is
@@ -282,6 +305,25 @@ def _parse_positive_float(raw: str) -> float | None:
     except ValueError:
         return None
     return v if v > 0 else None
+
+
+def _process_rss_mb() -> float | None:
+    """Current resident-set size in MB (Linux ``/proc/self/status``), or None.
+
+    Cheap (one small file read) and stdlib-only. Surfaced in the heartbeat so a
+    memory-pressure wedge / OOM approach is visible in the logs at a glance —
+    the council review flagged ~20 concurrent in-RAM MP4s on a small box as a
+    prime "freezes-until-restart" suspect. Returns None on non-Linux (dev) or
+    any read error. Plan ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2.
+    """
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return round(float(line.split()[1]) / 1024.0, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 @dataclass
@@ -562,10 +604,28 @@ class BatchRunner:
         interpreter cleanup so a wedged process can't hang on the way out. Plan
         ``_plans/2026-06-22-worker-turso-reconnect-and-watchdog.md`` §Prong 2.
         """
+        failures = self._consecutive_claim_failures
+        # Opt-in hard backstop FIRST — ignores the in-flight/buffered gate. A
+        # worker wedged mid-batch for ~10+ min straight isn't progressing, so a
+        # restart (re-running a handful of in-flight rows) beats an indefinite
+        # stall. Disabled by default; see ``_WATCHDOG_HARD_*``.
         if (
-            self._consecutive_claim_failures
-            < _WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES
+            _WATCHDOG_HARD_ENABLED
+            and failures >= _WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES
         ):
+            _log.error(
+                "runner_watchdog_hard_exit",
+                consecutive_claim_failures=failures,
+                threshold=_WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES,
+                in_flight=self.in_flight_count,
+                pending_records=self.pending_records_count,
+                note=(
+                    "worker wedged past the hard threshold; forcing restart "
+                    "even with work in flight — in-flight rows will be re-run"
+                ),
+            )
+            os._exit(_WATCHDOG_EXIT_CODE)
+        if failures < _WATCHDOG_MAX_CONSECUTIVE_CLAIM_FAILURES:
             return
         if self.in_flight_count != 0 or self.pending_records_count != 0:
             # Something to lose — keep spinning (and keep trying to reconnect)
@@ -598,10 +658,26 @@ class BatchRunner:
             if elapsed >= threshold:
                 stuck.append(meta)
 
+        # Queue depth distinguishes a "rows stranded in PENDING" wedge from a
+        # genuinely empty queue — both otherwise read ``idle=True in_flight=0``.
+        # Best-effort: a failed count (Turso flap) must not sink the heartbeat,
+        # so fall back to a ``-1`` sentinel ("unknown"). Plan §Fix 2.
+        pending = -1
+        processing = -1
+        try:
+            pending, processing = await self._queue.count_active_queue()
+        except Exception as e:    # noqa: BLE001 — heartbeat is observational
+            _log.warning(
+                "runner_heartbeat_depth_failed", error=str(e)[:200]
+            )
+
         _log.info(
             "runner_heartbeat",
             idle=idle,
             in_flight=len(self._in_flight),
+            pending=pending,
+            processing=processing,
+            rss_mb=_process_rss_mb(),
             stuck_count=len(stuck),
             poll_idle_seconds=self._poll_idle,
         )

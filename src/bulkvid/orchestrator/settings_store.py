@@ -319,7 +319,7 @@ class SettingsStore:
                 # The retry path almost always succeeds — a short backoff
                 # is enough. Re-raise only if both attempts fail so the
                 # row processor still surfaces a real failure.
-                self._cache = await asyncio.to_thread(
+                self._cache = await _db.run_db_call(
                     self._load_sync_with_retry
                 )
                 self._cache_loaded_at = time.monotonic()
@@ -359,7 +359,7 @@ class SettingsStore:
         # stream eviction would otherwise brick admin saves (admin panel)
         # the same way it bricked reads. Plan
         # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
-        old = await asyncio.to_thread(
+        old = await _db.run_db_call(
             self._run_sync_with_reconnect_retry,
             lambda: self._set_sync(key, value, updated_by),
             op="set",
@@ -435,7 +435,7 @@ class SettingsStore:
         # listing is the admin panel's main read; if its connection's Hrana
         # stream is dead, the panel can't show history until restart. Plan
         # ``_plans/2026-06-24-libsql-hrana-stream-resilience.md``.
-        rows = await asyncio.to_thread(
+        rows = await _db.run_db_call(
             self._run_sync_with_reconnect_retry,
             lambda: self._list_audit_sync(key, limit),
             op="audit",

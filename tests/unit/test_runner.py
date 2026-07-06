@@ -455,11 +455,22 @@ async def test_heartbeat_flags_stuck_in_flight_rows(
         except BaseException:    # noqa: BLE001 — best-effort task cleanup
             pass
 
-    # Heartbeat summary fired with stuck_count=1.
-    fake_log.info.assert_any_call(
-        "runner_heartbeat", idle=True, in_flight=1, stuck_count=1,
-        poll_idle_seconds=runner._poll_idle,
-    )
+    # Heartbeat summary fired with stuck_count=1 plus the queue-depth fields.
+    # ``rss_mb`` is platform-dependent (float on Linux, None off /proc), so we
+    # assert its presence, not its value.
+    heartbeat_calls = [
+        c for c in fake_log.info.call_args_list
+        if c.args and c.args[0] == "runner_heartbeat"
+    ]
+    assert heartbeat_calls, "expected a runner_heartbeat info line"
+    hb = heartbeat_calls[0].kwargs
+    assert hb["idle"] is True
+    assert hb["in_flight"] == 1
+    assert hb["stuck_count"] == 1
+    assert hb["pending"] == 0
+    assert hb["processing"] == 0
+    assert hb["poll_idle_seconds"] == runner._poll_idle
+    assert "rss_mb" in hb
     # Stuck-row line carries the row identity.
     warning_calls = [c for c in fake_log.warning.call_args_list]
     assert warning_calls, "expected a runner_heartbeat_stuck warning"
@@ -959,6 +970,82 @@ def test_watchdog_does_not_exit_when_records_buffered(
     runner._maybe_watchdog_exit()
 
     assert exits == []
+
+
+async def test_hard_watchdog_exits_with_rows_in_flight_when_enabled(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPT-IN hard backstop: once enabled and past the hard threshold, the
+    watchdog force-exits EVEN with a row in flight — a worker wedged for that
+    long isn't progressing, so a restart beats an indefinite stall. Plan
+    ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 3."""
+    import time
+
+    monkeypatch.setattr(runner_mod, "_WATCHDOG_HARD_ENABLED", True)
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES", 3
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=2)
+    runner._consecutive_claim_failures = 3
+
+    async def _block() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_block())
+    runner._in_flight[task] = runner_mod._RowMeta(
+        start_monotonic=time.monotonic(),
+        queued_id=1, job_id="j", row_num=1, tab="image_vo",
+    )
+    try:
+        runner._maybe_watchdog_exit()
+        assert exits == [runner_mod._WATCHDOG_EXIT_CODE]
+    finally:
+        task.cancel()
+        try:
+            await task
+        except BaseException:    # noqa: BLE001 — best-effort cleanup
+            pass
+
+
+async def test_hard_watchdog_disabled_by_default_keeps_wedged_worker(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the hard backstop OFF (the default), a wedge with a row in flight
+    must NOT force-exit however high the failure counter climbs — the opt-in
+    gate is what protects paid in-flight work from a false-positive restart."""
+    import time
+
+    # Do not touch _WATCHDOG_HARD_ENABLED — it defaults False.
+    assert runner_mod._WATCHDOG_HARD_ENABLED is False
+    monkeypatch.setattr(
+        runner_mod, "_WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES", 3
+    )
+    exits: list[int] = []
+    monkeypatch.setattr(runner_mod.os, "_exit", lambda code: exits.append(code))
+
+    runner = BatchRunner(queue, _make_dummy_clients(), max_concurrent=2)
+    runner._consecutive_claim_failures = 9999
+
+    async def _block() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_block())
+    runner._in_flight[task] = runner_mod._RowMeta(
+        start_monotonic=time.monotonic(),
+        queued_id=1, job_id="j", row_num=1, tab="image_vo",
+    )
+    try:
+        runner._maybe_watchdog_exit()
+        assert exits == []    # opt-in gate off -> never kills in-flight work
+    finally:
+        task.cancel()
+        try:
+            await task
+        except BaseException:    # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 async def test_watchdog_counter_resets_on_successful_claim(

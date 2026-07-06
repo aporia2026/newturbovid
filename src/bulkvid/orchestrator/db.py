@@ -46,13 +46,91 @@ Plan: ``_plans/2026-06-04-migrate-to-hf-spaces-turso.md``.
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import os
 import sqlite3
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from bulkvid.logging import get_logger
 
 _log = get_logger("db")
+
+
+# ── Dedicated DB thread pool ─────────────────────────────────────────────────
+#
+# Every remote-libsql statement is a blocking HTTPS round-trip run via a worker
+# thread. When Turso flaps, that call can wedge UNCANCELLABLY inside the libsql
+# client: ``asyncio.wait_for`` abandons the awaiting coroutine at its timeout,
+# but the underlying thread keeps running and is never reclaimed. A single
+# failed ``_run_db`` cycle (time-box + reconnect, several attempts) can leak a
+# handful of such threads.
+#
+# If those DB calls run on the *default* asyncio executor (sized
+# ``min(32, cpu+4)`` ≈ 6 on a 2-vCPU box — the pool ALSO used by CPU/render
+# ``to_thread`` work), a burst of leaked DB threads exhausts it and every later
+# ``to_thread`` — DB claims, Pillow renders, everything — queues forever. That
+# is the "stuck 30+ min, nothing happens" wedge (Plan
+# ``_plans/2026-07-06-stuck-runs-worker-wedge.md``; libsql-uncancellable-thread
+# root cause per the council review).
+#
+# Routing ALL DB work through a dedicated, larger, bounded pool (a) isolates DB
+# I/O from CPU/render so a Turso flap can never starve rendering (and vice
+# versa), and (b) gives many failed-flap cycles of headroom before the DB pool
+# itself exhausts — at which point ``claim_next_row`` fails cleanly and the
+# runner's liveness watchdog can act. It does NOT stop the leak (only a
+# transport-level deadline / async libsql client does that — the deferred real
+# fix); it contains the blast radius. Size is memory-neutral: concurrent
+# per-row MP4 buffering is capped by the runner's row semaphore, not by DB
+# thread count. Env-tunable for a per-deploy tune without a code change.
+_DB_EXECUTOR_DEFAULT_THREADS = 16
+_db_executor: ThreadPoolExecutor | None = None
+
+
+def _db_executor_size() -> int:
+    raw = os.environ.get("BULKVID_DB_EXECUTOR_THREADS")
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+    return _DB_EXECUTOR_DEFAULT_THREADS
+
+
+def get_db_executor() -> ThreadPoolExecutor:
+    """Return the process-wide dedicated DB thread pool, creating it on first use.
+
+    Lazily created so importing this module has no side effects. Called from a
+    single event loop per process (web OR worker), so the check-then-assign
+    below has no ``await`` and cannot race."""
+    global _db_executor
+    if _db_executor is None:
+        size = _db_executor_size()
+        _db_executor = ThreadPoolExecutor(
+            max_workers=size, thread_name_prefix="bulkvid-db"
+        )
+        _log.info("db_executor_init", max_workers=size)
+    return _db_executor
+
+
+async def run_db_call[**P, R](
+    fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+) -> R:
+    """Run a blocking DB helper on the dedicated DB pool (not the default one).
+
+    Drop-in for ``asyncio.to_thread(fn, *args, **kwargs)`` — same signature and
+    inference (``ParamSpec`` ties the args to ``fn``) — that keeps DB I/O off
+    the shared CPU/render executor. ``functools.partial`` carries the kwargs
+    because ``run_in_executor`` takes only positional args."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        get_db_executor(), functools.partial(fn, *args, **kwargs)
+    )
 
 
 # Backend names — surfaced in boot logs so a deploy can be sanity-checked
@@ -329,7 +407,7 @@ def connect(
     # don't want to force every dev to have a Rust toolchain. The Linux
     # Docker container has the wheel; local devs without it stay on
     # sqlite3 mode by leaving BULKVID_DB_URL empty.
-    import libsql    # type: ignore[import-not-found]
+    import libsql  # type: ignore[import-not-found]
 
     _log.info(
         "db_backend",

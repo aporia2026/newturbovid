@@ -271,7 +271,11 @@ async def process_simple_motion_row(
                              default_cta_for_language(lang.language))
             try:
                 overlay_w, overlay_h = dimensions_for_ratio(row.aspect_ratio)
-                overlay_bytes = render_cartoon_cta_overlay_bytes(
+                # Off the event loop: this Pillow/raqm render is CPU-bound and,
+                # run inline under high row concurrency, blocks EVERY other
+                # row's async I/O for its duration. Plan §Fix 5.
+                overlay_bytes = await asyncio.to_thread(
+                    render_cartoon_cta_overlay_bytes,
                     cta_text_used,
                     canvas_width=overlay_w,
                     canvas_height=overlay_h,
