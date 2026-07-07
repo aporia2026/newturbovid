@@ -67,6 +67,18 @@ const SIZE_DROPDOWN_OPTIONS = [
   '9:16', '4:5', '1:1', '16:9', '4:3', '3:4', '5:4', '2:3', '3:2', '21:9',
 ];
 
+// The animated tabs render through the Seedance video model, which accepts a
+// STRICTER set of sizes than the image tabs (no 2:3 / 3:2 / 4:5 / 5:4). Sending
+// an unsupported ratio used to fail the whole video ("no Seedance clips
+// produced"); the backend now snaps any other ratio to the nearest supported
+// one, and these tabs get a curated Change Size dropdown + a header note so the
+// operator sees the active model and its sizes at pick time. Keep
+// SEEDANCE_SIZE_OPTIONS in sync with SEEDANCE_ALLOWED_ASPECT_RATIOS in
+// src/bulkvid/adapters/kie.py.
+const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON];
+const ACTIVE_VIDEO_MODEL_LABEL = 'Seedance 1.5 Pro';
+const SEEDANCE_SIZE_OPTIONS = ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'];
+
 // yt-cartoon dropdown options (2026-06-17). Tone toggles the narration style;
 // Cap/CTA Position nudge the caption + CTA pill height relative to default;
 // Vid Length caps the video at 10/15/20s. Backend coerces these defensively,
@@ -195,6 +207,7 @@ function onOpen() {
     .addItem('Generate all unprocessed', 'generateAllUnprocessed')
     .addSeparator()
     .addItem('Show job status sidebar', 'showJobsSidebar')
+    .addItem('Active models & sizes…', 'showActiveModels')
     .addItem('Pick avatar for current row…', 'pickAvatarForCurrentRow')
     .addSeparator()
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
@@ -1144,19 +1157,39 @@ function migrateSimpleX4Columns() {
 /** One-shot: (re)apply the Change Size dropdown on EVERY tab that has a
  *  "Change Size" (or "Aspect Ratio") column. Idempotent — re-running just
  *  rewrites the same validation, so it doubles as the upgrade path whenever
- *  SIZE_DROPDOWN_OPTIONS grows (4:3 added per chat 2026-06-10).
+ *  the option lists grow (4:3 added per chat 2026-06-10).
  *
- *  Non-strict on purpose: the backend also accepts typed WxH pixel values,
- *  and a strict rule would wipe any cell holding one. */
+ *  Tab-aware: the animated tabs (SEEDANCE_VIDEO_TABS) render through Seedance,
+ *  which supports a stricter size set, so they get SEEDANCE_SIZE_OPTIONS plus a
+ *  header note naming the active model; every other tab keeps the full
+ *  SIZE_DROPDOWN_OPTIONS. Non-strict on both: the backend accepts typed WxH
+ *  pixels and snaps any unsupported ratio, so a strict rule would wipe a valid
+ *  free-typed cell. */
 function applySizeDropdowns() {
   const ui = SpreadsheetApp.getUi();
-  const validation = SpreadsheetApp.newDataValidation()
+
+  const imageValidation = SpreadsheetApp.newDataValidation()
     .requireValueInList(SIZE_DROPDOWN_OPTIONS, true)
     .setAllowInvalid(true)
     .setHelpText('Pick a ratio, or type WxH pixels (e.g. 1080x1350).')
     .build();
+  const seedanceValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(SEEDANCE_SIZE_OPTIONS, true)
+    .setAllowInvalid(true)
+    .setHelpText(
+      ACTIVE_VIDEO_MODEL_LABEL + ' supports ' + SEEDANCE_SIZE_OPTIONS.join(', ')
+      + '. Any other ratio auto-snaps to the closest one.'
+    )
+    .build();
+  const seedanceNote =
+    '🎬 Video model: ' + ACTIVE_VIDEO_MODEL_LABEL + '\n' +
+    'Supported sizes: ' + SEEDANCE_SIZE_OPTIONS.join(' · ') + '\n\n' +
+    'Pick one of these, or type WxH pixels (e.g. 1080x1920). Any other ratio\n' +
+    '(2:3, 3:2, 4:5…) auto-snaps to the closest supported size, so the video\n' +
+    'still renders.';
 
-  const updated = [];
+  const updatedVideo = [];
+  const updatedImage = [];
   SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
     // Headers sit on row 1 everywhere except migrated simple_x4 tabs,
     // where row 1 is the template-preview band and row 2 holds them.
@@ -1180,19 +1213,88 @@ function applySizeDropdowns() {
     const firstData = headerRow + 1;
     const maxRow = sheet.getMaxRows();
     if (maxRow < firstData) return;
+
+    const isSeedanceTab = SEEDANCE_VIDEO_TABS.indexOf(_detectTabType(sheet)) !== -1;
     sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
-      .setDataValidation(validation);
-    updated.push(sheet.getName());
+      .setDataValidation(isSeedanceTab ? seedanceValidation : imageValidation);
+    if (isSeedanceTab) {
+      // Name the active model right where the size is picked. Set only on video
+      // tabs — never clobber an operator's own note on the image tabs.
+      sheet.getRange(headerRow, col).setNote(seedanceNote);
+      updatedVideo.push(sheet.getName());
+    } else {
+      updatedImage.push(sheet.getName());
+    }
   });
 
+  const parts = [];
+  if (updatedVideo.length) {
+    parts.push(
+      ACTIVE_VIDEO_MODEL_LABEL + ' sizes (' + SEEDANCE_SIZE_OPTIONS.join(', ')
+      + ') + model note applied to:\n• ' + updatedVideo.join('\n• ')
+    );
+  }
+  if (updatedImage.length) {
+    parts.push(
+      'Image-tab sizes (' + SIZE_DROPDOWN_OPTIONS.join(', ') + ') applied to:\n• '
+      + updatedImage.join('\n• ')
+    );
+  }
   ui.alert(
     'Size dropdowns updated',
-    updated.length
-      ? 'Options (' + SIZE_DROPDOWN_OPTIONS.join(', ') + ') applied to:\n\n• '
-        + updated.join('\n• ')
-      : 'No tabs with a "Change Size" column found.',
+    parts.length ? parts.join('\n\n') : 'No tabs with a "Change Size" column found.',
     ui.ButtonSet.OK
   );
+}
+
+
+/** Modal: a clean, at-a-glance reference of which model each tab runs and the
+ *  sizes it supports. Reads the same option constants the dropdowns use, so it
+ *  can never drift from what the sheet actually enforces. Pure info — no writes. */
+function showActiveModels() {
+  function chips(sizes) {
+    return sizes.map(function (s) {
+      return '<span class="chip">' + s + '</span>';
+    }).join('');
+  }
+
+  const html =
+    '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8"><style>' +
+    '*{box-sizing:border-box}' +
+    'body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;' +
+    'color:#1b2733;background:#fff;font-size:13px;line-height:1.5}' +
+    '.wrap{padding:18px 20px 20px}' +
+    'h1{margin:0 0 2px;font-size:16px;font-weight:600}' +
+    '.sub{margin:0 0 16px;color:#6b7684;font-size:12px}' +
+    '.card{border:1px solid #e3e8ee;border-radius:10px;padding:13px 15px;margin-bottom:11px}' +
+    '.card.video{border-left:3px solid #2f6bff}' +
+    '.card.image{border-left:3px solid #12b886}' +
+    '.top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:9px}' +
+    '.tabs{font-weight:600}' +
+    '.model{color:#6b7684;font-size:12px;white-space:nowrap}' +
+    '.model b{color:#1b2733}' +
+    '.chips{display:flex;flex-wrap:wrap;gap:6px}' +
+    '.chip{display:inline-block;padding:2px 8px;border-radius:6px;background:#f1f4f8;' +
+    'font-variant-numeric:tabular-nums;font-size:12px}' +
+    '.foot{margin:14px 0 0;color:#6b7684;font-size:12px}' +
+    '.foot b{color:#1b2733}' +
+    '</style></head><body><div class="wrap">' +
+    '<h1>Active models &amp; sizes</h1>' +
+    '<p class="sub">Which model each tab runs, and the sizes it accepts.</p>' +
+    '<div class="card video"><div class="top">' +
+    '<span class="tabs">cartoon · yt-cartoon · simple-motion</span>' +
+    '<span class="model">animated video · <b>' + ACTIVE_VIDEO_MODEL_LABEL + '</b></span>' +
+    '</div><div class="chips">' + chips(SEEDANCE_SIZE_OPTIONS) + '</div></div>' +
+    '<div class="card image"><div class="top">' +
+    '<span class="tabs">image tabs</span>' +
+    '<span class="model">still image · <b>wider size set</b></span>' +
+    '</div><div class="chips">' + chips(SIZE_DROPDOWN_OPTIONS) + '<span class="chip">WxH px</span></div></div>' +
+    '<p class="foot">On the video tabs, any other ratio (2:3, 3:2, 4:5…) <b>auto-snaps</b> ' +
+    'to the closest supported size, so the video still renders.</p>' +
+    '</div></body></html>';
+
+  const out = HtmlService.createHtmlOutput(html).setWidth(430).setHeight(350);
+  SpreadsheetApp.getUi().showModalDialog(out, 'Active models & sizes');
 }
 
 
