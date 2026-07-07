@@ -50,6 +50,8 @@ import asyncio
 import functools
 import os
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -118,6 +120,79 @@ def get_db_executor() -> ThreadPoolExecutor:
     return _db_executor
 
 
+# ── DB-pool wedge tracking (Plan 2026-07-07 §Phase 1) ────────────────────────
+#
+# The dedicated pool above isolates DB I/O, but it does NOT stop the leak: a
+# libsql call that wedges on a dead socket is uncancellable, so its thread never
+# returns and ``asyncio.wait_for`` only abandons the awaiting coroutine. Enough
+# leaked threads (~pool_size) and the pool is 100% dead — the web submit hang /
+# worker stall that only a container restart fixes.
+#
+# We can't cancel the thread, so we make the wedge OBSERVABLE and let a plain
+# watchdog thread + supervisord ``autorestart`` recover (``db_watchdog.py``).
+# Each executor body records its start in ``_inflight`` on entry and clears it on
+# exit. Only *running* bodies hold an entry (queued-but-unstarted submissions
+# don't), so ``_inflight`` is bounded by ``pool_size`` and never grows unbounded.
+# A body still present after ``_DB_WEDGE_SECONDS`` is almost certainly wedged (a
+# healthy remote statement returns in well under a second). ``db_pool_stats``
+# reports how many threads are wedged right now.
+#
+# This is deliberately NOT the "swap in a fresh pool" self-healer the council
+# rejected: abandoned pools still pin their wedged threads/sockets and, under a
+# sustained flap, unbounded pool churn OOMs a small box. Detection + a clean
+# process restart is bounded and safe. The real cure (a transport-level deadline
+# via the async libsql/hrana client) is Phase 2.
+_DB_WEDGE_SECONDS = float(os.environ.get("BULKVID_DB_WEDGE_SECONDS") or 60.0)
+
+_inflight_lock = threading.Lock()
+_inflight: dict[int, float] = {}    # call_id -> start (time.monotonic)
+_call_seq = 0
+
+
+def _next_call_id() -> int:
+    global _call_seq
+    with _inflight_lock:
+        _call_seq += 1
+        return _call_seq
+
+
+def _tracked_call[**P, R](
+    call_id: int, fn: Callable[P, R], args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> R:
+    """Executor body: record start/finish around ``fn`` so a wedged (never-
+    returning) call leaves a durable entry the watchdog can see. Runs INSIDE the
+    DB thread. The ``finally`` clears the entry on any normal return/raise; only
+    a thread wedged forever keeps its entry, which is exactly the signal we
+    want."""
+    start = time.monotonic()
+    with _inflight_lock:
+        _inflight[call_id] = start
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        with _inflight_lock:
+            _inflight.pop(call_id, None)
+
+
+def db_pool_stats() -> dict[str, int]:
+    """Snapshot the dedicated DB pool's live health for the watchdog + logs.
+
+    ``running`` = executor bodies currently in ``fn`` (≤ ``pool_size``).
+    ``wedged``  = of those, how many have been running longer than
+    ``_DB_WEDGE_SECONDS`` (presumed stuck on a dead libsql socket).
+    ``pool_size`` = configured max threads. When ``wedged == pool_size`` the pool
+    can no longer serve any DB call — the wedge state the watchdog restarts on."""
+    now = time.monotonic()
+    with _inflight_lock:
+        starts = list(_inflight.values())
+    wedged = sum(1 for s in starts if (now - s) >= _DB_WEDGE_SECONDS)
+    return {
+        "pool_size": _db_executor_size(),
+        "running": len(starts),
+        "wedged": wedged,
+    }
+
+
 async def run_db_call[**P, R](
     fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs
 ) -> R:
@@ -125,11 +200,14 @@ async def run_db_call[**P, R](
 
     Drop-in for ``asyncio.to_thread(fn, *args, **kwargs)`` — same signature and
     inference (``ParamSpec`` ties the args to ``fn``) — that keeps DB I/O off
-    the shared CPU/render executor. ``functools.partial`` carries the kwargs
-    because ``run_in_executor`` takes only positional args."""
+    the shared CPU/render executor. Wrapped in ``_tracked_call`` so the DB-pool
+    wedge watchdog can see stuck threads. ``functools.partial`` carries the
+    kwargs because ``run_in_executor`` takes only positional args."""
     loop = asyncio.get_running_loop()
+    call_id = _next_call_id()
     return await loop.run_in_executor(
-        get_db_executor(), functools.partial(fn, *args, **kwargs)
+        get_db_executor(),
+        functools.partial(_tracked_call, call_id, fn, args, kwargs),
     )
 
 
