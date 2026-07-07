@@ -26,6 +26,7 @@ from bulkvid import __version__
 from bulkvid.auth import build_verifier_from_settings
 from bulkvid.config import get_settings
 from bulkvid.logging import configure_logging, get_logger
+from bulkvid.orchestrator.db_watchdog import start_db_wedge_watchdog
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_SCRIPT_SYSTEM_PROMPT,
@@ -100,6 +101,11 @@ def _build_state(app: FastAPI) -> None:
         bulk_team_count=len(settings.bulk_team_emails),
         admin_count=len(settings.admin_emails),
     )
+    # Force a clean restart if the shared DB pool wedges on uncancellable libsql
+    # calls (the web submit-hang that only an HF restart used to fix). Idempotent
+    # + daemon-thread, so the idempotency-guarded double call above is harmless.
+    # Plan ``_plans/2026-07-07-db-wedge-permanent-fix.md`` §Phase 1.
+    start_db_wedge_watchdog("web")
 
 
 @asynccontextmanager

@@ -31,6 +31,7 @@ from bulkvid.adapters.sheets import SheetsClient
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import configure_logging, get_logger
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.db_watchdog import start_db_wedge_watchdog
 from bulkvid.orchestrator.queue import JobQueue
 from bulkvid.orchestrator.runner import BatchRunner
 from bulkvid.orchestrator.runtime_settings import (
@@ -181,6 +182,12 @@ async def run() -> None:
         sheet_writer_configured=bool(settings.SHEETS_SERVICE_ACCOUNT_FILE),
         kill_switch=bool(settings.BULKVID_KILL_SWITCH),
     )
+
+    # Force a clean restart if the shared DB pool wedges on uncancellable libsql
+    # calls (the mid-batch stall that only an HF restart used to fix). Covers the
+    # gap the claim-failure watchdog can't — a wedge while rows are in flight.
+    # Plan ``_plans/2026-07-07-db-wedge-permanent-fix.md`` §Phase 1.
+    start_db_wedge_watchdog("worker")
 
     # ── Wire shutdown signals ───────────────────────────────────────────
     def _handle_signal(*_: Any) -> None:

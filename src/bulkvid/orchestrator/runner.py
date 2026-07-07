@@ -42,6 +42,7 @@ from bulkvid.models.row import (
     YtCartoonRow,
 )
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.orchestrator.db import db_pool_stats
 from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
@@ -671,6 +672,11 @@ class BatchRunner:
                 "runner_heartbeat_depth_failed", error=str(e)[:200]
             )
 
+        # DB-pool health: ``db_wedged`` climbing toward ``db_pool`` is the
+        # restart-predictor the old logs lacked — it's what the wedge watchdog
+        # acts on. Cheap in-memory snapshot, no DB call. Plan 2026-07-07 §Phase 1.
+        db_stats = db_pool_stats()
+
         _log.info(
             "runner_heartbeat",
             idle=idle,
@@ -679,6 +685,9 @@ class BatchRunner:
             processing=processing,
             rss_mb=_process_rss_mb(),
             stuck_count=len(stuck),
+            db_running=db_stats["running"],
+            db_wedged=db_stats["wedged"],
+            db_pool=db_stats["pool_size"],
             poll_idle_seconds=self._poll_idle,
         )
         for meta in stuck:
