@@ -53,6 +53,25 @@ MODEL_GPT_IMAGE_2 = "gpt-image-2-image-to-image"
 MODEL_RECRAFT_UPSCALE = "recraft/crisp-upscale"
 MODEL_SEEDANCE_PRO = "bytedance/seedance-1.5-pro"
 
+# Seedance 1.5 Pro accepts ONLY these aspect ratios (verified on kie.ai
+# 2026-07-07). A value outside the set is rejected at SUBMIT with HTTP 200 +
+# body ``{"code": 500, "msg": "aspect_ratio is not within the range of allowed
+# options"}``. Crucially this is a STRICT SUBSET of the image models' / Rendi's
+# valid ratios (``rendi.VALID_RATIO_STRINGS`` also allows 2:3, 3:2, 4:5, 5:4):
+# nano-banana happily generates a 2:3 image, so the images succeed and ONLY the
+# Seedance video submit dies — surfacing as the row's "no Seedance clips
+# produced for any of N shots". Every caller's aspect is clamped to the nearest
+# entry here at the wrapper boundary so no tab can trip the rejection.
+SEEDANCE_ALLOWED_ASPECT_RATIOS: dict[str, float] = {
+    "9:16": 9 / 16,
+    "3:4": 3 / 4,
+    "1:1": 1.0,
+    "4:3": 4 / 3,
+    "16:9": 16 / 9,
+    "21:9": 21 / 9,
+}
+SEEDANCE_DEFAULT_ASPECT_RATIO = "9:16"
+
 
 # ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -671,6 +690,47 @@ async def nano_banana_2_image_to_image(
     return urls[0], _nano_banana_2_cost(resolution)
 
 
+def _aspect_to_float(aspect: str) -> float | None:
+    """Parse ``"W:H"`` (ratio) or ``"WxH"`` (pixels) into a numeric ratio.
+
+    Returns None for empty / unparseable / non-positive input. Tolerates the
+    Sheets leading-zero cast (``"09:16"``) since ``float`` ignores it.
+    """
+    s = (aspect or "").strip().lower()
+    for sep in (":", "x"):
+        if sep in s:
+            left, _, right = s.partition(sep)
+            try:
+                w, h = float(left), float(right)
+            except ValueError:
+                return None
+            if w <= 0 or h <= 0:
+                return None
+            return w / h
+    return None
+
+
+def nearest_seedance_aspect_ratio(aspect: str) -> str:
+    """Snap any aspect string to the nearest Seedance-allowed ratio.
+
+    An operator-picked ``2:3`` (or a native-probed ``1080x1620``) is valid for
+    the image models but rejected by Seedance at submit. Returns the allowed
+    ratio numerically closest to the input; passes an already-allowed value
+    through unchanged; falls back to ``SEEDANCE_DEFAULT_ASPECT_RATIO`` when the
+    input can't be parsed. See ``SEEDANCE_ALLOWED_ASPECT_RATIOS``.
+    """
+    s = (aspect or "").strip()
+    if s in SEEDANCE_ALLOWED_ASPECT_RATIOS:
+        return s
+    target = _aspect_to_float(s)
+    if target is None:
+        return SEEDANCE_DEFAULT_ASPECT_RATIO
+    return min(
+        SEEDANCE_ALLOWED_ASPECT_RATIOS,
+        key=lambda r: abs(SEEDANCE_ALLOWED_ASPECT_RATIOS[r] - target),
+    )
+
+
 async def seedance_image_to_video(
     client: KieClient,
     image_url: str,
@@ -700,10 +760,20 @@ async def seedance_image_to_video(
     immediate retry just hits cooled keys), ``KieTaskFailedError`` and other
     ``KieError`` (a resubmit would only repeat a deterministic failure).
     """
+    # Clamp to a Seedance-allowed ratio (2:3 / 3:2 / 4:5 / WxH would be rejected
+    # at submit — the "no Seedance clips produced" bug). Loud when it changes so
+    # an operator picking an unsupported size sees WHY the video shape shifted.
+    seedance_aspect = nearest_seedance_aspect_ratio(aspect_ratio)
+    if seedance_aspect != aspect_ratio:
+        _log.info(
+            "seedance_aspect_clamped",
+            requested=aspect_ratio,
+            used=seedance_aspect,
+        )
     input_params: dict[str, Any] = {
         "prompt": prompt,
         "input_urls": [image_url],
-        "aspect_ratio": aspect_ratio,
+        "aspect_ratio": seedance_aspect,
         "resolution": resolution,
         "duration": str(duration),
     }

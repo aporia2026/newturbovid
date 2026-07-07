@@ -33,6 +33,7 @@ from bulkvid.adapters.kie import (
     MODEL_NANO_BANANA_EDIT,
     MODEL_RECRAFT_UPSCALE,
     MODEL_SEEDANCE_PRO,
+    SEEDANCE_DEFAULT_ASPECT_RATIO,
     KieAuthError,
     KieClient,
     KiePool,
@@ -46,6 +47,7 @@ from bulkvid.adapters.kie import (
     nano_banana_2_image_to_image,
     nano_banana_2_text_to_image,
     nano_banana_edit,
+    nearest_seedance_aspect_ratio,
     recraft_crisp_upscale,
     seedance_image_to_video,
 )
@@ -784,6 +786,66 @@ async def test_seedance_does_not_resubmit_on_task_failure() -> None:
                 max_attempts=2, delay_seconds=0.0, retries=1,
             )
     assert submits["n"] == 1    # no resubmit on a deterministic failure
+
+
+# ── Seedance aspect-ratio clamp (the real "no clips" bug: 2:3 rejected) ──────
+
+
+def test_nearest_seedance_aspect_ratio_snaps_disallowed() -> None:
+    # 2:3 (0.667) is closer to 3:4 (0.75) than to 9:16 (0.5625).
+    assert nearest_seedance_aspect_ratio("2:3") == "3:4"
+    # 3:2 (1.5) is closer to 4:3 (1.333) than to 16:9 (1.778).
+    assert nearest_seedance_aspect_ratio("3:2") == "4:3"
+    # 4:5 (0.8) is closer to 3:4 (0.75) than to 1:1.
+    assert nearest_seedance_aspect_ratio("4:5") == "3:4"
+
+
+def test_nearest_seedance_aspect_ratio_passes_allowed_through() -> None:
+    for allowed in ("9:16", "3:4", "1:1", "4:3", "16:9", "21:9"):
+        assert nearest_seedance_aspect_ratio(allowed) == allowed
+
+
+def test_nearest_seedance_aspect_ratio_handles_pixels_and_garbage() -> None:
+    # Native-probed pixels: 1080x1620 = 0.667 -> 3:4.
+    assert nearest_seedance_aspect_ratio("1080x1620") == "3:4"
+    # 1920x1080 = 1.778 -> 16:9 (exact match numerically).
+    assert nearest_seedance_aspect_ratio("1920x1080") == "16:9"
+    # Sheets leading-zero cast still parses.
+    assert nearest_seedance_aspect_ratio("09:16") == "9:16"
+    # Unparseable -> safe default, never a crash.
+    assert nearest_seedance_aspect_ratio("") == SEEDANCE_DEFAULT_ASPECT_RATIO
+    assert nearest_seedance_aspect_ratio("portrait") == SEEDANCE_DEFAULT_ASPECT_RATIO
+    assert nearest_seedance_aspect_ratio("0:0") == SEEDANCE_DEFAULT_ASPECT_RATIO
+
+
+@respx.mock
+async def test_seedance_clamps_disallowed_aspect_before_submit() -> None:
+    # The bug: the row's 2:3 flowed straight to Seedance and was rejected at
+    # submit ("aspect_ratio is not within the range of allowed options"). The
+    # wrapper must send 3:4 instead so the clip is actually produced.
+    captured = _capture_submit_then_succeed("https://cdn/clip.mp4")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, _cost = await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="2:3", duration=4, resolution="720p",
+            max_attempts=2, delay_seconds=0.0,
+        )
+    assert url == "https://cdn/clip.mp4"
+    assert captured[0]["input"]["aspect_ratio"] == "3:4"    # NOT "2:3"
+
+
+@respx.mock
+async def test_seedance_leaves_allowed_aspect_untouched() -> None:
+    captured = _capture_submit_then_succeed("https://cdn/clip.mp4")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=4, resolution="720p",
+            max_attempts=2, delay_seconds=0.0,
+        )
+    assert captured[0]["input"]["aspect_ratio"] == "9:16"
 
 
 # ── Sanity on the model names + cost constants (catch accidental renames) ────
