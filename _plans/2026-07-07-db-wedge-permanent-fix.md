@@ -171,9 +171,53 @@ No user-facing sheet settings — this is infra.
 - Phase 1 and Phase 2 are separate PRs. Watch one full flap cycle after Phase 1
   before starting Phase 2.
 
+## Phase 2 spike findings (2026-07-07)
+
+The gating question — "can we get a real transport deadline?" — turned up a hard
+constraint that changes the recommendation:
+
+- The **maintained** `libsql` (libsql-python, what we run) is **sync-only**
+  (DB-API 2.0, Rust/PyO3). No async API, no remote timeout, no `interrupt()`.
+  Confirmed via Context7.
+- The **only** native-async Python client is the separate **`libsql-client`**
+  (hrana) — but its last release is **0.3.1, May 2024**, classifiers Python
+  **3.7–3.12**. Prod runs **Python 3.14**. Putting the critical DB path on a
+  2-year-abandoned dependency on an unsupported Python is a rule-13 red flag.
+- Migration *surface* is NOT the blocker: a background-event-loop bridge
+  (`run_coroutine_threadsafe(coro, bg_loop).result(timeout)` inside
+  `_LibsqlConn`) keeps the sync interface, so the 116 (queue) + 18 (settings)
+  call sites stay untouched — only `db.py` changes. The blocker is the *client*.
+
+### Refined options (pick one)
+
+1. **Async `libsql-client` via bg-loop bridge** — genuinely cancellable,
+   contained to db.py. CON: abandoned dep on unsupported Python. Risk: HIGH.
+2. **Killable subprocess for DB I/O** — SIGKILL a wedged call for real
+   cancellation, keeps the maintained sync client. CON: per-call IPC,
+   connection re-establish on kill, more moving parts. Risk: MEDIUM.
+3. **Local timeout-enforcing proxy** (HTTPS_PROXY → idle-close) — no code
+   migration. CON: depends on Rust libsql/reqwest honoring proxy env
+   (unverified), new process on the small box. Risk: MEDIUM.
+4. **Stop at Phase 1, measure** — the watchdog already turns the wedge from a
+   manual restart into an automatic ~70s one, which solves the stated pain. Only
+   pursue 1–3 if wedges prove frequent. Risk: NONE (live).
+
+### Reframe (the higher-value follow-up)
+
+Phase 1's only real downside is the **bounded duplicate paid-API spend** when the
+auto-restart re-drives in-flight rows. **Idempotent KIE-resume** (persist the KIE
+task id, resume-poll on boot) removes that cost entirely — making the watchdog
+"free to fire" and Phase 1 genuinely sufficient. This may beat a risky transport
+migration on value-per-risk. The council's Expansionist flagged the same.
+
+**Recommendation:** Option 4 now (measure Phase 1 in prod); if wedges are
+frequent, do **idempotent resume** before any transport migration; and only if a
+transport fix is still needed, prefer Option 2 (killable subprocess, maintained
+client) over the abandoned async dep.
+
 ## Open questions
 
 - HF box RAM and whether it is OOM-killing (pull the Space metrics at a stall) —
   confirms the OOM critique and sizes the watchdog thresholds.
-- Does the async hrana client expose an enforceable per-request deadline for
-  remote mode? (Phase-2 gating spike.)
+- How often does the Phase 1 watchdog actually fire in prod? (drives whether any
+  of options 1–3 is worth its risk.)
