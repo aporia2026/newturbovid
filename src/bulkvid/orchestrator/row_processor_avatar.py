@@ -386,7 +386,11 @@ async def process_avatar_row(
             )
             try:
                 ow, oh = dimensions_for_ratio(row.aspect_ratio)
-                overlay_bytes = render_cartoon_cta_overlay_bytes(
+                # Off the event loop: this Pillow/raqm render is CPU-bound and,
+                # run inline under high row concurrency, blocks EVERY other
+                # row's async I/O for its duration. Plan §Fix 5.
+                overlay_bytes = await asyncio.to_thread(
+                    render_cartoon_cta_overlay_bytes,
                     cta_text,
                     canvas_width=ow,
                     canvas_height=oh,

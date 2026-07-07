@@ -495,11 +495,16 @@ class GeminiTTSClient:
         chosen_voice = pick_voice(language, override=voice)
         client = self._ensure_client()
 
-        # Prepend an accent directive (from country) then the per-row style
-        # direction, as soft instructions Gemini TTS picks up from the prompt.
+        # Speak ONLY the script. Gemini 2.5 TTS VOCALIZES any instruction text we
+        # prepend: a 7-word line came out ~14s because the model read the ~12s
+        # accent/style preamble ("Use the natural accent... Read warmly...") out
+        # loud, blowing every capped tab's VO budget and captioning the
+        # instructions (2026-07-06 incident). Prompt-based accent/style steering
+        # is disabled until it can be tuned by ear with a format the model
+        # applies WITHOUT speaking. ``accent`` is still computed for the log so
+        # the intended market stays visible.
         accent = accent_directive(language, country)
-        prefix = " ".join(p for p in (accent, (style_prompt or "").strip()) if p)
-        prompt_text = f"{prefix}\n\n{text.strip()}" if prefix else text.strip()
+        prompt_text = text.strip()
 
         config = gtypes.GenerateContentConfig(
             response_modalities=["audio"],

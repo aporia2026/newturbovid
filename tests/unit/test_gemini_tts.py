@@ -10,7 +10,7 @@ Covers:
   - synthesize: success returns TTSResult with cost, voice, duration
   - synthesize: empty text raises ValueError
   - synthesize: missing audio in response raises GeminiTTSNoAudioError
-  - synthesize: style_prompt is prepended to the input
+  - synthesize: only the script is spoken (style/accent NOT vocalized)
   - Constructor rejects empty project
 """
 
@@ -271,7 +271,11 @@ async def test_synthesize_raises_when_no_audio_in_response() -> None:
         await tts.synthesize(text="hello", language="en")
 
 
-async def test_synthesize_prepends_style_prompt() -> None:
+async def test_synthesize_speaks_only_the_script_not_style() -> None:
+    # Regression (2026-07-06 incident): Gemini 2.5 TTS VOCALIZES any instruction
+    # text we prepend, so a style preamble was read aloud (~12s of extra audio)
+    # and blew every capped tab's VO budget. The spoken contents must now be
+    # ONLY the script — the style hint is never sent as spoken text.
     pcm = b"\x00" * 2000
     fake_client = _make_fake_client(_make_fake_response(pcm))
     tts = GeminiTTSClient(project="amit-tts", client=fake_client)
@@ -282,13 +286,9 @@ async def test_synthesize_prepends_style_prompt() -> None:
         style_prompt="Say warmly, like a podcast intro.",
     )
 
-    # The fake client recorded the call; check that the prompt carries both pieces.
-    call = fake_client.aio.models.generate_content.await_args
-    contents_arg = call.kwargs["contents"]
-    assert "Say warmly" in contents_arg
-    assert "The actual script body." in contents_arg
-    # Style must appear before the script body.
-    assert contents_arg.index("Say warmly") < contents_arg.index("The actual script body.")
+    contents_arg = fake_client.aio.models.generate_content.await_args.kwargs["contents"]
+    assert contents_arg == "The actual script body."
+    assert "Say warmly" not in contents_arg    # style must NOT be spoken
 
 
 def test_accent_directive_english_by_country() -> None:
@@ -315,7 +315,11 @@ def test_accent_directive_expands_country_code() -> None:
     assert "PL" not in accent_directive("pl", "PL")
 
 
-async def test_synthesize_prepends_accent_for_country() -> None:
+async def test_synthesize_does_not_vocalize_accent() -> None:
+    # The accent directive must NOT reach the spoken text — it would be read
+    # aloud (and captioned by ZapCap). Only the script is synthesized. The
+    # ``accent_directive`` helper still exists for a future non-spoken steering
+    # mechanism; it's just no longer prepended. See the 2026-07-06 incident.
     pcm = b"\x00" * 2000
     fake_client = _make_fake_client(_make_fake_response(pcm))
     tts = GeminiTTSClient(project="amit-tts", client=fake_client)
@@ -323,8 +327,8 @@ async def test_synthesize_prepends_accent_for_country() -> None:
     await tts.synthesize(text="The script body.", language="en", country="UK")
 
     contents = fake_client.aio.models.generate_content.await_args.kwargs["contents"]
-    assert "British English accent" in contents
-    assert contents.index("British") < contents.index("The script body.")
+    assert contents == "The script body."
+    assert "British" not in contents           # accent must NOT be spoken
 
 
 async def test_synthesize_honors_voice_override() -> None:

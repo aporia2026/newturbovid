@@ -119,6 +119,12 @@ class _KeyState:
         return now >= self.cooldown_until
 
 
+# Throttle for the "all keys cooling" warning so a sustained rate-limit
+# starvation shows up in logs once every N seconds instead of on every
+# acquire-spin. Plan ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 4.
+_ALL_COOLING_WARN_INTERVAL_SECONDS = 30.0
+
+
 class KiePool:
     """Round-robin pool of kie.ai keys with per-key cooldown on 429.
 
@@ -132,6 +138,8 @@ class KiePool:
         self._cooldown_seconds = cooldown_seconds
         self._cursor = 0
         self._lock = asyncio.Lock()
+        # Last time we logged "all keys cooling" (monotonic; throttled).
+        self._last_all_cooling_warn = 0.0
         _log.info(
             "kie_pool_init",
             key_count=len(keys),
@@ -156,6 +164,19 @@ class KiePool:
                     self._cursor += 1
                     if state.is_available(now):
                         return state.key
+                # Every key is in cooldown. A throttled warning makes KIE
+                # throughput starvation — a prime "runs feel stuck" cause with a
+                # single key under high row concurrency — visible in the logs
+                # without flooding them. Plan
+                # ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 4.
+                if now - self._last_all_cooling_warn >= _ALL_COOLING_WARN_INTERVAL_SECONDS:
+                    self._last_all_cooling_warn = now
+                    soonest = min(s.cooldown_until for s in self._states)
+                    _log.warning(
+                        "kie_pool_all_keys_cooling",
+                        key_count=len(self._states),
+                        wait_seconds=round(max(0.0, soonest - now), 1),
+                    )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 5.0)
 

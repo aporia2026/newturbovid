@@ -1188,6 +1188,30 @@ class JobQueue:
             for r in cur.fetchall()
         ]
 
+    def _count_active_queue_sync(self) -> tuple[int, int]:
+        """``(pending, processing)`` rows whose parent job is still active.
+
+        Cheap: two COUNTs on the indexed status column. Used by the runner
+        heartbeat so a "rows stranded in PENDING" wedge is distinguishable from
+        a genuinely empty queue — both otherwise log identically as
+        ``idle=True in_flight=0``. Plan
+        ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2."""
+        pending_cur = self._conn.execute(
+            "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+            "WHERE rq.status = ? AND j.status IN (?, ?)",
+            (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
+        )
+        processing_cur = self._conn.execute(
+            "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+            "WHERE rq.status = ? AND j.status IN (?, ?)",
+            (ROW_PROCESSING, JOB_QUEUED, JOB_RUNNING),
+        )
+        p = pending_cur.fetchone()
+        q = processing_cur.fetchone()
+        pending = int(p[0]) if p is not None else 0
+        processing = int(q[0]) if q is not None else 0
+        return pending, processing
+
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
         with self._tx():
@@ -1227,7 +1251,7 @@ class JobQueue:
             async with self._lock:
                 try:
                     return await asyncio.wait_for(
-                        asyncio.to_thread(fn, *args, **kwargs),
+                        _db.run_db_call(fn, *args, **kwargs),
                         timeout=_DB_CALL_TIMEOUT_SECONDS,
                     )
                 except QueueBusy:
@@ -1248,7 +1272,7 @@ class JobQueue:
                         break
                     try:
                         await asyncio.wait_for(
-                            asyncio.to_thread(
+                            _db.run_db_call(
                                 self._reconnect_sync,
                                 reason=f"{op}:{type(e).__name__}",
                             ),
@@ -1463,6 +1487,14 @@ class JobQueue:
         """Newest-first kill attempts for the admin audit page."""
         return await self._run_db(
             self._list_kill_attempts_sync, limit=limit, op="list_kill_attempts"
+        )
+
+    async def count_active_queue(self) -> tuple[int, int]:
+        """Async wrapper for ``_count_active_queue_sync``: ``(pending,
+        processing)`` rows across all still-active jobs. Self-heals via
+        ``_run_db``. Used by the runner heartbeat."""
+        return await self._run_db(
+            self._count_active_queue_sync, op="count_active_queue"
         )
 
     async def recover_orphaned_rows(self) -> int:
