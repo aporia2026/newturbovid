@@ -358,9 +358,59 @@ class KieClient:
         params = {"taskId": real_task_id}
 
         for attempt in range(max_attempts):
-            resp = await self._client.get(url, headers=headers, params=params)
+            last_attempt = attempt == max_attempts - 1
+
+            # ── Read-back resilience (cartoon "no Seedance clips" bug) ──
+            # The task may already have SUCCEEDED on kie's side; a flaky
+            # read-back must NOT be reported as a failed clip. Every transient
+            # condition below re-polls within the same attempt budget and only
+            # surfaces (as ``KieTimeoutError`` — "couldn't retrieve in time",
+            # which the seedance wrapper retries) once attempts are exhausted.
+
+            # (a) Network flap on the GET: read/pool/connect timeout, reset,
+            #     protocol error. Uncaught, this instantly killed a finished
+            #     clip. httpx.TransportError is the base of all of these.
+            try:
+                resp = await self._client.get(url, headers=headers, params=params)
+            except httpx.TransportError as e:
+                if last_attempt:
+                    raise KieTimeoutError(
+                        f"kie.ai poll transport error after {max_attempts} "
+                        f"attempts (task {real_task_id}): {type(e).__name__}: {e}"
+                    ) from e
+                _log.warning(
+                    "kie_poll_transient_error",
+                    task_id=real_task_id,
+                    key_suffix=_key_suffix(key),
+                    error_type=type(e).__name__,
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
+            # (b) Rate-limited poll, HTTP-status form. kie signals a per-key
+            #     poll rate-limit as HTTP 429; cool the key (backpressure on
+            #     other callers) and keep polling THIS pinned task — a 429 on
+            #     recordInfo is never a terminal result.
+            if resp.status_code == 429:
+                await self._pool.mark_rate_limited(key)
+                if last_attempt:
+                    raise KieTimeoutError(
+                        f"kie.ai poll rate-limited (HTTP 429) through "
+                        f"{max_attempts} attempts (task {real_task_id})"
+                    )
+                _log.warning(
+                    "kie_poll_rate_limited",
+                    task_id=real_task_id,
+                    key_suffix=_key_suffix(key),
+                    signal="http_429",
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
             if resp.status_code != 200:
-                if attempt == max_attempts - 1:
+                if last_attempt:
                     raise KieError(
                         f"kie.ai poll HTTP {resp.status_code} "
                         f"after {max_attempts} attempts (task {real_task_id})"
@@ -368,7 +418,49 @@ class KieClient:
                 await asyncio.sleep(delay_seconds)
                 continue
 
-            body = resp.json()
+            # (c) Unparseable 200 body (transient edge/proxy HTML, truncated
+            #     JSON). Treat as transient rather than crashing the clip.
+            try:
+                body = resp.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                if last_attempt:
+                    raise KieTimeoutError(
+                        f"kie.ai poll unparseable body after {max_attempts} "
+                        f"attempts (task {real_task_id}): {e}"
+                    ) from e
+                _log.warning(
+                    "kie_poll_bad_json",
+                    task_id=real_task_id,
+                    key_suffix=_key_suffix(key),
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
+            # (d) Rate-limited poll, HTTP-200 body-code form. kie ALSO signals
+            #     rate-limit as HTTP 200 + ``{"code": 429, ...}`` (same dual
+            #     pattern as submit — see ``_submit_once``). Without this the
+            #     body has no ``data``, ``state`` reads as None, the poll spins
+            #     to KieTimeoutError 10 minutes later, and the operator sees
+            #     "no Seedance clips produced" for a clip that was READY. This
+            #     is the reported bug.
+            if body.get("code") == 429:
+                await self._pool.mark_rate_limited(key)
+                if last_attempt:
+                    raise KieTimeoutError(
+                        f"kie.ai poll rate-limited (body code 429) through "
+                        f"{max_attempts} attempts (task {real_task_id})"
+                    )
+                _log.warning(
+                    "kie_poll_rate_limited",
+                    task_id=real_task_id,
+                    key_suffix=_key_suffix(key),
+                    signal="body_429",
+                    attempt=attempt + 1,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
             data = body.get("data") or {}
             state = data.get("state")
 
@@ -588,6 +680,7 @@ async def seedance_image_to_video(
     resolution: str = "720p",
     max_attempts: int = 120,
     delay_seconds: float = 5.0,
+    retries: int = 1,
 ) -> tuple[str, float]:
     """Animate one still image into a short clip with Seedance 1.5 Pro.
 
@@ -595,6 +688,17 @@ async def seedance_image_to_video(
     sent as a STRING — the API rejects an integer ("duration it must be a
     string"). Audio generation is left off (VO is added downstream). Returns
     ``(video_url, cost_usd)`` with the cost matching the duration tier.
+
+    Resilience: submit + poll are retried ``retries`` extra times (default 1)
+    on a genuine ``KieTimeoutError`` (task never finished / poll couldn't
+    retrieve it in the window) or a submit-time network flap. ``poll_task``
+    already survives transient read-back errors internally, so a retry here
+    only fires when the whole clip truly didn't land — the difference between
+    dropping the clip (and the row's "no Seedance clips produced" failure) and
+    re-driving it once. Mirrors Rendi's ``_submit_and_poll`` timeout-resubmit.
+    Not retried: ``KieRateLimitError`` on submit (every key is cooling — an
+    immediate retry just hits cooled keys), ``KieTaskFailedError`` and other
+    ``KieError`` (a resubmit would only repeat a deterministic failure).
     """
     input_params: dict[str, Any] = {
         "prompt": prompt,
@@ -603,10 +707,6 @@ async def seedance_image_to_video(
         "resolution": resolution,
         "duration": str(duration),
     }
-    task_id = await client.create_task(MODEL_SEEDANCE_PRO, input_params)
-    urls = await client.poll_task(
-        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
-    )
     # 8s clips are billed roughly 2x the 4s tier (plan §11; verify next live run).
     # 12s is not used by cartoon mode today — fall through to the 8s cost rather
     # than under-reporting, with a TODO if a 12s path appears later.
@@ -614,7 +714,28 @@ async def seedance_image_to_video(
         COST_SEEDANCE_PRO_720P_4S_USD if duration == 4
         else COST_SEEDANCE_PRO_720P_8S_USD
     )
-    return urls[0], cost
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            task_id = await client.create_task(MODEL_SEEDANCE_PRO, input_params)
+            urls = await client.poll_task(
+                task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+            )
+            return urls[0], cost
+        except (KieTimeoutError, httpx.TransportError) as e:
+            last_exc = e
+            if attempt < retries:
+                _log.warning(
+                    "seedance_retry_after_timeout",
+                    attempt=attempt + 1,
+                    total=retries + 1,
+                    error=f"{type(e).__name__}: {str(e)[:150]}",
+                )
+                continue
+            raise
+    # Unreachable: the loop runs at least once and always returns or raises.
+    assert last_exc is not None
+    raise last_exc
 
 
 # ── Construction from settings ───────────────────────────────────────────────

@@ -341,6 +341,113 @@ async def test_poll_task_routes_to_pinned_key() -> None:
     assert captured_auth == [f"Bearer {KEY_B}"]
 
 
+# ── poll_task read-back resilience (cartoon "no Seedance clips" bug) ──────────
+# A task that SUCCEEDED on kie must never be reported as a failed clip because
+# the read-back flapped. Each transient below re-polls; only exhaustion surfaces
+# (as KieTimeoutError, which the seedance wrapper then resubmit-retries).
+
+
+def _poll_success(url: str = "https://cdn/clip.mp4") -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "code": 200,
+            "data": {"state": "success", "resultJson": json.dumps({"resultUrls": [url]})},
+        },
+    )
+
+
+@respx.mock
+async def test_poll_task_retries_through_transport_error_then_succeeds() -> None:
+    # A network flap on the GET (ReadTimeout is an httpx.TransportError) must
+    # NOT kill a clip that finished on kie's side — the next poll gets it.
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[httpx.ReadTimeout("slow poll"), _poll_success()]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        urls = await client.poll_task(
+            _pin_task_id("t", KEY_A), max_attempts=3, delay_seconds=0.0
+        )
+    assert urls == ["https://cdn/clip.mp4"]
+
+
+@respx.mock
+async def test_poll_task_retries_through_http_429_then_succeeds() -> None:
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[httpx.Response(429, text="rate limited"), _poll_success()]
+    )
+    pool = KiePool(keys=[KEY_A], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        urls = await client.poll_task(
+            _pin_task_id("t", KEY_A), max_attempts=3, delay_seconds=0.0
+        )
+    assert urls == ["https://cdn/clip.mp4"]
+    # The poll cooled the tripped key so other callers back off.
+    assert pool._states[0].cooldown_until > 0
+
+
+@respx.mock
+async def test_poll_task_retries_through_body_code_429_then_succeeds() -> None:
+    # HTTP 200 + body {"code": 429} is kie's OTHER rate-limit signal. Unhandled,
+    # data is empty, state reads None, and the poll silently spins to timeout on
+    # a clip that is READY — the exact reported failure. It must re-poll instead.
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[
+            httpx.Response(200, json={"code": 429, "msg": "rate limit exceeded"}),
+            _poll_success(),
+        ]
+    )
+    pool = KiePool(keys=[KEY_A], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        urls = await client.poll_task(
+            _pin_task_id("t", KEY_A), max_attempts=3, delay_seconds=0.0
+        )
+    assert urls == ["https://cdn/clip.mp4"]
+    assert pool._states[0].cooldown_until > 0
+
+
+@respx.mock
+async def test_poll_task_transport_error_exhausts_as_timeout() -> None:
+    # Sustained transport errors surface as KieTimeoutError (NOT a bare httpx
+    # error and NOT a generic KieError), so the seedance wrapper resubmit-retries.
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[httpx.ReadTimeout("a"), httpx.ReadTimeout("b")]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieTimeoutError):
+            await client.poll_task(
+                _pin_task_id("t", KEY_A), max_attempts=2, delay_seconds=0.0
+            )
+
+
+@respx.mock
+async def test_poll_task_sustained_body_429_exhausts_as_timeout() -> None:
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=httpx.Response(200, json={"code": 429, "msg": "rate limit"})
+    )
+    pool = KiePool(keys=[KEY_A], cooldown_seconds=300.0)
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieTimeoutError):
+            await client.poll_task(
+                _pin_task_id("t", KEY_A), max_attempts=2, delay_seconds=0.0
+            )
+
+
+@respx.mock
+async def test_poll_task_unparseable_body_retries_then_succeeds() -> None:
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[httpx.Response(200, text="<html>gateway error</html>"), _poll_success()]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        urls = await client.poll_task(
+            _pin_task_id("t", KEY_A), max_attempts=3, delay_seconds=0.0
+        )
+    assert urls == ["https://cdn/clip.mp4"]
+
+
 # ── High-level wrappers ──────────────────────────────────────────────────────
 
 
@@ -587,6 +694,96 @@ async def test_seedance_8s_returns_long_tier_cost() -> None:
     assert url == "https://cdn/clip8.mp4"
     assert cost == COST_SEEDANCE_PRO_720P_8S_USD
     assert captured[0]["input"]["duration"] == "8"
+
+
+@respx.mock
+async def test_seedance_resubmits_on_poll_timeout() -> None:
+    # First task never finishes (poll times out -> KieTimeoutError). The wrapper
+    # must resubmit a FRESH task and return its clip, not drop the shot. This is
+    # the difference between the row's "no Seedance clips produced" failure and a
+    # recovered clip.
+    submits = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        submits["n"] += 1
+        task_id = "t1" if submits["n"] == 1 else "t2"
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": task_id}})
+
+    def _poll(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("taskId") == "t2":
+            return _poll_success("https://cdn/recovered.mp4")
+        return httpx.Response(200, json={"code": 200, "data": {"state": "generating"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(side_effect=_poll)
+
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=4, resolution="720p",
+            max_attempts=1, delay_seconds=0.0, retries=1,
+        )
+    assert url == "https://cdn/recovered.mp4"
+    assert cost == COST_SEEDANCE_PRO_720P_4S_USD
+    assert submits["n"] == 2    # original timed out, resubmit recovered it
+
+
+@respx.mock
+async def test_seedance_resubmits_on_submit_transport_error() -> None:
+    # A network flap on the SUBMIT (not the poll) must also resubmit rather than
+    # drop the shot.
+    submits = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        submits["n"] += 1
+        if submits["n"] == 1:
+            raise httpx.ConnectError("submit flap")
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "t2"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=_poll_success("https://cdn/after_flap.mp4")
+    )
+
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=4, resolution="720p",
+            max_attempts=2, delay_seconds=0.0, retries=1,
+        )
+    assert url == "https://cdn/after_flap.mp4"
+    assert cost == COST_SEEDANCE_PRO_720P_4S_USD
+    assert submits["n"] == 2
+
+
+@respx.mock
+async def test_seedance_does_not_resubmit_on_task_failure() -> None:
+    # A genuine model failure (state=fail) is deterministic — resubmitting would
+    # just repeat it and double-bill. It must NOT be retried.
+    submits = {"n": 0}
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        submits["n"] += 1
+        return httpx.Response(200, json={"code": 200, "data": {"taskId": "t1"}})
+
+    respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(side_effect=_submit)
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        return_value=httpx.Response(
+            200, json={"code": 200, "data": {"state": "fail", "failMsg": "bad prompt"}}
+        )
+    )
+
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieTaskFailedError):
+            await seedance_image_to_video(
+                client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+                aspect_ratio="9:16", duration=4, resolution="720p",
+                max_attempts=2, delay_seconds=0.0, retries=1,
+            )
+    assert submits["n"] == 1    # no resubmit on a deterministic failure
 
 
 # ── Sanity on the model names + cost constants (catch accidental renames) ────
