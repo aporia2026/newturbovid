@@ -35,6 +35,7 @@ from bulkvid.models.row import (
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
+    MotionAdsRow,
     RowResult,
     SimpleMotionRow,
     SimpleRow,
@@ -73,6 +74,7 @@ TAB_YT_CARTOON = "yt_cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
 TAB_TEXT_ON_IMG = "text_on_img"
 TAB_AVATAR = "avatar"
+TAB_MOTION_ADS = "motion_ads"
 
 # Idempotency-key replay window. A submit POST that PA's frontend dropped on
 # the way back to the client gets retried by the Apps Script, with the SAME
@@ -274,7 +276,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -294,30 +296,6 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
         for c in raw_cards
     ]
     return SimpleX4Row(cards=cards, **data)
-
-
-def _payload_to_row(
-    payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
-    data = json.loads(payload_json)
-    tab = data.pop("__tab__", TAB_IMAGE_VO)
-    if tab == TAB_FOUR_IMAGES:
-        return FourImagesVO2Row(**data)
-    if tab == TAB_SIMPLE:
-        return SimpleRow(**data)
-    if tab == TAB_SIMPLE_MOTION:
-        return SimpleMotionRow(**data)
-    if tab == TAB_CARTOON:
-        return CartoonRow(**data)
-    if tab == TAB_YT_CARTOON:
-        return YtCartoonRow(**data)
-    if tab == TAB_SIMPLE_X4:
-        return _hydrate_simple_x4(data)
-    if tab == TAB_TEXT_ON_IMG:
-        return TextOnImgRow(**data)
-    if tab == TAB_AVATAR:
-        return AvatarRow(**data)
-    return ImageVORow(**data)
 
 
 class JobQueue:
@@ -671,6 +649,11 @@ class JobQueue:
                 "elapsed_seconds": result.elapsed_seconds,
                 "error": result.error,
                 "metadata": result.metadata,
+                # Text outputs (Motion_Ads Headline / Description). Persisted so a
+                # buffered/retried record_result and the sheet write agree even
+                # across a worker restart. Empty on every other tab.
+                "headline": result.headline,
+                "description": result.description,
             },
             ensure_ascii=False,
         )
@@ -1517,7 +1500,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -1536,4 +1519,6 @@ def payload_to_row(
         return TextOnImgRow(**payload)
     if tab == TAB_AVATAR:
         return AvatarRow(**payload)
+    if tab == TAB_MOTION_ADS:
+        return MotionAdsRow(**payload)
     return ImageVORow(**payload)

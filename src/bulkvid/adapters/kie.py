@@ -45,6 +45,9 @@ COST_GPT_IMAGE_2_USD = 0.08          # gpt-image-2 fallback, rough mid-tier esti
 COST_RECRAFT_UPSCALE_USD = 0.04
 COST_SEEDANCE_PRO_720P_4S_USD = 0.07  # Seedance 1.5 Pro i2v @ 720p, 4s, no audio
 COST_SEEDANCE_PRO_720P_8S_USD = 0.14  # Seedance 1.5 Pro i2v @ 720p, 8s, no audio
+# 12s tier — linear from the verified 4s/8s anchors ($0.0175/s). Used by the
+# Motion_Ads tab (always-12s silent clip). Verify on the next live run.
+COST_SEEDANCE_PRO_720P_12S_USD = 0.21  # Seedance 1.5 Pro i2v @ 720p, 12s, no audio
 
 # Production model identifiers.
 MODEL_NANO_BANANA_EDIT = "google/nano-banana-edit"
@@ -777,11 +780,12 @@ async def seedance_image_to_video(
         "resolution": resolution,
         "duration": str(duration),
     }
-    # 8s clips are billed roughly 2x the 4s tier (plan §11; verify next live run).
-    # 12s is not used by cartoon mode today — fall through to the 8s cost rather
-    # than under-reporting, with a TODO if a 12s path appears later.
+    # Cost by duration tier (plan §11; verify next live run). The 12s tier is
+    # used by the Motion_Ads tab (always-12s silent clip); billing it at the 8s
+    # cost used to under-report by ~$0.07/clip.
     cost = (
         COST_SEEDANCE_PRO_720P_4S_USD if duration == 4
+        else COST_SEEDANCE_PRO_720P_12S_USD if duration == 12
         else COST_SEEDANCE_PRO_720P_8S_USD
     )
     last_exc: Exception | None = None

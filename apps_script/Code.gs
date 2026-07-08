@@ -20,6 +20,7 @@ const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
 const TAB_TEXT_ON_IMG = 'text_on_img';
 const TAB_AVATAR = 'avatar';
+const TAB_MOTION_ADS = 'motion_ads';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -75,7 +76,7 @@ const SIZE_DROPDOWN_OPTIONS = [
 // operator sees the active model and its sizes at pick time. Keep
 // SEEDANCE_SIZE_OPTIONS in sync with SEEDANCE_ALLOWED_ASPECT_RATIOS in
 // src/bulkvid/adapters/kie.py.
-const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON];
+const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
 const ACTIVE_VIDEO_MODEL_LABEL = 'Seedance 1.5 Pro';
 const SEEDANCE_SIZE_OPTIONS = ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'];
 
@@ -192,6 +193,23 @@ const AVATAR_COLS = {
   lastInputCol: 12,
 };
 
+// Motion_Ads tab (2026-07-08): a silent motion-ad video + ad copy. Country /
+// Vertical / Article, then TWO text OUTPUT columns the backend writes — Headline
+// (D) and Description (E) — then Manual Image (F), Apple Yes/No (G), Change Size
+// (H), Open Comments (I), Ready Video (J). Read by HEADER NAME first (like avatar
+// / simple-motion) so inserting/moving columns can't corrupt the read; these
+// positional values are the fallback. ONE video per row. Manual Image is
+// optional (blank → generate; filled → animate as-is). Apple = Yes → the
+// generated image has no people.
+const MOTION_ADS_COLS = {
+  country: 1, vertical: 2, article: 3,
+  headline: 4, description: 5,
+  manualImage: 6, apple: 7, aspectRatio: 8,
+  openComments: 9,
+  readyVideo1: 10,
+  lastInputCol: 9,
+};
+
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
 const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
@@ -213,6 +231,7 @@ function onOpen() {
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
+    .addItem('Apply Motion_Ads dropdowns', 'applyMotionAdsDropdowns')
     .addItem('Add "use this script" tips', 'applyOpenCommentsTips')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
@@ -259,6 +278,13 @@ function _detectTabType(sheet) {
   // narration overlaid at bottom-left (2026-06-09). Checked BEFORE
   // generic name matches.
   if (name.indexOf('avatar') !== -1) return TAB_AVATAR;
+  // "Motion_Ads" -> silent motion-ad video (no VO/CTA/sound) + Headline /
+  // Description ad copy (2026-07-08). The name has no "simple"/"cartoon", so
+  // order vs those matches is moot; kept up top with the other name detections.
+  if (name.indexOf('motion_ads') !== -1 || name.indexOf('motion ads') !== -1
+      || name.indexOf('motion-ads') !== -1) {
+    return TAB_MOTION_ADS;
+  }
   // "paste text on img" -> manual image + center-overlay text (2026-06-09).
   // Checked BEFORE "simple" because the name doesn't contain "simple" — but
   // ordered up top alongside the other name-based detections for clarity.
@@ -506,6 +532,39 @@ function _readSimpleMotionRow(sheet, rowNum) {
 }
 
 
+function _readMotionAdsRow(sheet, rowNum) {
+  // Motion_Ads: Country / Vertical / Article, then TWO OUTPUT columns the backend
+  // fills (Headline D, Description E) which are NOT read here, then Manual Image /
+  // Apple / Change Size / Open Comments. Resolved by HEADER NAME first (mirrors
+  // _readSimpleMotionRow / _readAvatarRow) so inserting/moving columns can't
+  // corrupt the read; MOTION_ADS_COLS is the positional fallback. Only the
+  // article is required — a blank Manual Image means "generate the image".
+  const cols = MOTION_ADS_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage  = _colForHeaders(headerMap, ['Manual Image'], cols.manualImage);
+  const cApple        = _colForHeaders(headerMap, ['Apple'], cols.apple);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_url: _cell(values, cManualImage),
+    apple: _yes(_cell(values, cApple), false),
+    aspect_ratio: _cell(values, cAspectRatio) || '16:9',
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
 function _readYtCartoonRow(sheet, rowNum) {
   // yt-cartoon: cartoon inputs PLUS four new knobs (Tone, Cap Position, CTA
   // Position, Vid Length). Every column is resolved by HEADER NAME first
@@ -693,6 +752,15 @@ function _validateSimpleMotion(r) {
 }
 
 
+function _validateMotionAds(r) {
+  // Only the article is required. Manual Image is optional (blank → the backend
+  // generates a realistic image; filled → it animates that image as-is). Apple /
+  // Change Size / Open Comments are all optional with sensible defaults.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
 function _validateYtCartoon(r) {
   // Same as cartoon — only the article is required. The four knob columns are
   // optional (blank = defaults) and coerced server-side.
@@ -830,6 +898,7 @@ function generateAllUnprocessed() {
     : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
     : tabType === TAB_AVATAR ? AVATAR_COLS
+    : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -858,6 +927,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
     : tabType === TAB_AVATAR ? _readAvatarRow
+    : tabType === TAB_MOTION_ADS ? _readMotionAdsRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
@@ -866,6 +936,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
     : tabType === TAB_AVATAR ? _validateAvatar
+    : tabType === TAB_MOTION_ADS ? _validateMotionAds
     : _validateImageVO;
 
   let rows = [];
@@ -897,6 +968,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
       : tabType === TAB_AVATAR ? AVATAR_COLS
+      : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -941,6 +1013,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
   else if (tabType === TAB_TEXT_ON_IMG) payload.rows_text_on_img = rows;
   else if (tabType === TAB_AVATAR) payload.rows_avatar = rows;
+  else if (tabType === TAB_MOTION_ADS) payload.rows_motion_ads = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);
@@ -1282,7 +1355,7 @@ function showActiveModels() {
     '<h1>Active models &amp; sizes</h1>' +
     '<p class="sub">Which model each tab runs, and the sizes it accepts.</p>' +
     '<div class="card video"><div class="top">' +
-    '<span class="tabs">cartoon · yt-cartoon · simple-motion</span>' +
+    '<span class="tabs">cartoon · yt-cartoon · simple-motion · Motion_Ads</span>' +
     '<span class="model">animated video · <b>' + ACTIVE_VIDEO_MODEL_LABEL + '</b></span>' +
     '</div><div class="chips">' + chips(SEEDANCE_SIZE_OPTIONS) + '</div></div>' +
     '<div class="card image"><div class="top">' +
@@ -1353,6 +1426,47 @@ function applyYtCartoonDropdowns() {
 }
 
 
+// ─── Motion_Ads dropdowns ───────────────────────────────────────────────────
+
+/** One-shot: (re)apply the Apple (Yes/No) dropdown on every Motion_Ads tab.
+ *  Resolves the Apple column BY HEADER NAME (positional fallback = col G) so it
+ *  follows the header wherever it sits. Idempotent and non-strict (blank is
+ *  allowed — the backend treats a blank Apple cell as No). The Change Size
+ *  column on this tab is handled by applySizeDropdowns like every other tab.
+ *  Plan _plans/2026-07-08-motion-ads-tab.md. */
+function applyMotionAdsDropdowns() {
+  const ui = SpreadsheetApp.getUi();
+  const validation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Yes', 'No'], true)
+    .setAllowInvalid(true)    // blank = No
+    .setHelpText('Apple = Yes → the generated image has NO people. Blank = No.')
+    .build();
+
+  const updated = [];
+  SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
+    if (_detectTabType(sheet) !== TAB_MOTION_ADS) return;
+    const headerMap = _buildHeaderColMap(sheet);
+    const col = _colForHeaders(headerMap, ['Apple'], MOTION_ADS_COLS.apple);
+    if (!col) return;
+    const firstData = 2;
+    const maxRow = sheet.getMaxRows();
+    if (maxRow < firstData) return;
+    sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
+      .setDataValidation(validation);
+    updated.push(sheet.getName());
+  });
+
+  ui.alert(
+    'Motion_Ads dropdowns updated',
+    updated.length
+      ? 'Apple (Yes/No) dropdown applied to:\n\n• ' + updated.join('\n• ')
+        + '\n\nAlso run "Update size dropdowns on all tabs" for the Change Size column.'
+      : 'No Motion_Ads tab found. Name a tab "Motion_Ads" and re-run.',
+    ui.ButtonSet.OK
+  );
+}
+
+
 // ─── Open Comments verbatim-script tip ──────────────────────────────────────
 
 /** One-shot: add a header NOTE to the "Open Comments" column on every video tab
@@ -1375,7 +1489,9 @@ function applyOpenCommentsTips() {
 
   const updated = [];
   SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
-    if (_detectTabType(sheet) === TAB_TEXT_ON_IMG) return;    // no voiceover here
+    var tabType = _detectTabType(sheet);
+    // No voiceover on these tabs, so the "use this script:" marker does nothing.
+    if (tabType === TAB_TEXT_ON_IMG || tabType === TAB_MOTION_ADS) return;
     // Headers sit on row 1 everywhere except migrated simple_x4 tabs, where
     // row 1 is the template-preview band and row 2 holds them (mirrors
     // applySizeDropdowns).
@@ -1586,7 +1702,7 @@ function _rowCountForPayload_(payload) {
   return (payload.rows_image_vo || payload.rows_four_images
     || payload.rows_simple || payload.rows_cartoon || payload.rows_yt_cartoon
     || payload.rows_simple_x4 || payload.rows_text_on_img
-    || payload.rows_avatar || []).length;
+    || payload.rows_avatar || payload.rows_motion_ads || []).length;
 }
 
 

@@ -282,6 +282,35 @@ class SimpleMotionRow:
 
 
 @dataclass
+class MotionAdsRow:
+    """Motion_Ads tab input row — a silent motion-ad video + ad copy.
+
+    Produces ONE 12-second SILENT video (no voiceover, no CTA, no captions, no
+    audio track) from a single realistic image, plus two text outputs generated
+    from the article: a Headline (sheet col D, <=60 chars) and a Description
+    (col E, <=80 chars) written back by the sheet writer.
+
+      * ``manual_image_url`` (col F) — blank -> generate a realistic image sized
+        to ``aspect_ratio``; filled -> animate that image as-is.
+      * ``apple`` (col G) — Yes -> a GENERATED image must contain NO people
+        (Apple/Taboola motion-ad convention). Ignored for a pasted manual image.
+
+    Only the article is required. The cartoon / simple-motion pipelines are
+    untouched — this is a separate row + processor that reuses the shared kie
+    image + Seedance helpers. Plan ``_plans/2026-07-08-motion-ads-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str             # col F — blank → generate; filled → as-is
+    apple: bool                       # col G — Yes → generated image has no people
+    aspect_ratio: str                 # col H "Change Size" — default 16:9
+    open_comments: str                # col I — context/directives
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 
@@ -309,3 +338,10 @@ class RowResult:
     elapsed_seconds: float = 0.0
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Text outputs written back to their own named columns (Motion_Ads tab:
+    # Headline -> col D, Description -> col E). Empty on every other tab, whose
+    # rows never populate them and whose sheets have no such columns. The sheet
+    # writer resolves the target column by header name and only writes when the
+    # value is non-empty. Plan ``_plans/2026-07-08-motion-ads-tab.md``.
+    headline: str = ""
+    description: str = ""

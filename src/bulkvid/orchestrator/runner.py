@@ -34,6 +34,7 @@ from bulkvid.models.row import (
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
+    MotionAdsRow,
     RowResult,
     SimpleMotionRow,
     SimpleRow,
@@ -48,6 +49,7 @@ from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
+from bulkvid.orchestrator.row_processor_motion_ads import process_motion_ads_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
 from bulkvid.orchestrator.row_processor_simple_motion import process_simple_motion_row
 from bulkvid.orchestrator.row_processor_simple_x4 import process_simple_x4_row
@@ -89,6 +91,7 @@ _TAB_YT_CARTOON = "yt_cartoon"
 _TAB_SIMPLE_X4 = "simple_x4"
 _TAB_TEXT_ON_IMG = "text_on_img"
 _TAB_AVATAR = "avatar"
+_TAB_MOTION_ADS = "motion_ads"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
@@ -112,6 +115,12 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # flow. Same 20-min ceiling — multi-shot planner + image-gen + the
     # parallel avatar call all fit in the cartoon budget.
     _TAB_AVATAR: 1200.0,
+    # motion_ads is one image + one 12s Seedance clip + one small copy call. A
+    # single row measures ~5 min (Seedance i2v is slow), so a batch sharing one
+    # KIE key can queue well past image_vo's 15-min budget before a clip lands —
+    # give it 25 min so key contention doesn't time a row out with its copy
+    # already generated (which would leave Headline/Description unwritten).
+    _TAB_MOTION_ADS: 1500.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -127,6 +136,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_TEXT_ON_IMG: SETTING_ROW_TIMEOUT_SIMPLE,
     # avatar reuses cartoon's timeout — multi-shot pipeline + TikTok poll.
     _TAB_AVATAR: SETTING_ROW_TIMEOUT_CARTOON,
+    # motion_ads reuses the image_vo timeout — same shape (heavy image + video).
+    _TAB_MOTION_ADS: SETTING_ROW_TIMEOUT_IMAGE_VO,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -263,6 +274,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_TEXT_ON_IMG
     if isinstance(row, AvatarRow):
         return _TAB_AVATAR
+    if isinstance(row, MotionAdsRow):
+        return _TAB_MOTION_ADS
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -370,6 +383,8 @@ async def _dispatch_to_processor(
         return await process_text_on_img_row(row, clients, job_id=job_id)
     if isinstance(row, AvatarRow):
         return await process_avatar_row(row, clients, job_id=job_id)
+    if isinstance(row, MotionAdsRow):
+        return await process_motion_ads_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):
@@ -815,6 +830,8 @@ class BatchRunner:
                 video_urls=list(result.video_urls),
                 status=result.status,
                 error=result.error,
+                headline=result.headline,
+                description=result.description,
             )
             await self._write_back(write)
         except Exception as e:

@@ -39,6 +39,11 @@ class PendingWrite:
     video_urls: list[str]
     status: str
     error: str | None
+    # Text outputs written to their own named columns (Motion_Ads: Headline ->
+    # col D, Description -> col E). Empty for every other tab. The sheet writer
+    # resolves the target column by header name and only writes when non-empty.
+    headline: str = ""
+    description: str = ""
 
 
 FlushCallback = Callable[[list[PendingWrite]], Awaitable[None]]

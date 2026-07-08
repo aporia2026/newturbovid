@@ -26,6 +26,7 @@ from bulkvid.models.row import (
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
+    MotionAdsRow,
     RowResult,
 )
 from bulkvid.orchestrator.queue import (
@@ -39,6 +40,7 @@ from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
+    TAB_MOTION_ADS,
     JobQueue,
     payload_to_row,
 )
@@ -85,6 +87,19 @@ def _four_row(n: int = 3) -> FourImagesVO2Row:
         zapcap=False,
         aspect_ratio="1:1",
         script_pattern="",
+        open_comments="",
+    )
+
+
+def _motion_ads_row(n: int = 2) -> MotionAdsRow:
+    return MotionAdsRow(
+        row_num=n,
+        country="SE",
+        vertical="Shipping Container Homes",
+        article_url="https://example.com/article",
+        manual_image_url="",
+        apple=True,
+        aspect_ratio="16:9",
         open_comments="",
     )
 
@@ -206,6 +221,24 @@ async def test_claim_payload_round_trips_cartoon(queue: JobQueue) -> None:
     assert isinstance(row, CartoonRow)
     assert row.row_num == 4
     assert row.vertical == "automotive"
+
+
+async def test_claim_payload_round_trips_motion_ads(queue: JobQueue) -> None:
+    # Regression: ``payload_to_row`` was missing its ``motion_ads`` branch, so a
+    # claimed Motion_Ads row fell through to ``ImageVORow(**payload)`` and every
+    # row crashed with ``unexpected keyword argument 'apple'`` (prod 2026-07-08).
+    await queue.enqueue(
+        user_email="u@aporia.com",
+        sheet_id="s", worksheet="w", tab_type=TAB_MOTION_ADS,
+        rows=[_motion_ads_row(2)],
+    )
+    queued = await queue.claim_next_row()
+    assert queued is not None
+    row = payload_to_row(queued.payload)
+    assert isinstance(row, MotionAdsRow)
+    assert row.row_num == 2
+    assert row.apple is True
+    assert row.aspect_ratio == "16:9"
 
 
 # ── record_result ───────────────────────────────────────────────────────────
