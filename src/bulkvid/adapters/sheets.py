@@ -41,6 +41,7 @@ from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
+    TAB_MOTION_ADS,
     TAB_SIMPLE,
     TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
@@ -328,6 +329,33 @@ class _AvatarCols:
 AVATAR_COLS = _AvatarCols()
 
 
+@dataclass(frozen=True)
+class _MotionAdsCols:
+    """Layout for the ``Motion_Ads`` tab (2026-07-08).
+
+    Country / Vertical / Article, then TWO text OUTPUT columns the sheet writer
+    fills — Headline (D) and Description (E) — then Manual Image (F), Apple
+    Yes/No (G), Change Size (H), Open Comments (I), and one Ready Video (J).
+    Headline / Description are resolved by header name at write time, with these
+    positions as the fallback; the video URL lands in Ready Video like every
+    other tab. Plan ``_plans/2026-07-08-motion-ads-tab.md``.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    headline: int = 3         # D  (OUTPUT — text)
+    description: int = 4      # E  (OUTPUT — text)
+    manual_image: int = 5     # F
+    apple: int = 6            # G  (Yes/No)
+    aspect_ratio: int = 7     # H  (Change Size)
+    open_comments: int = 8    # I
+    ready_video_start: int = 9   # J = 0-indexed col 9
+
+
+MOTION_ADS_COLS = _MotionAdsCols()
+
+
 # Header rows BEFORE data starts.
 #   - Image-VO / Simple / Cartoon / 4Images: 1 header row → data at sheet row 2
 #   - Simple x4 (post-migration): 2 header rows (row 1 = template previews,
@@ -344,6 +372,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_SIMPLE_X4: 2,
     TAB_TEXT_ON_IMG: 1,
     TAB_AVATAR: 1,
+    TAB_MOTION_ADS: 1,
 }
 
 
@@ -536,6 +565,8 @@ class SheetsClient:
             col = TEXT_ON_IMG_COLS.ready_video_start
         elif layout == TAB_AVATAR:
             col = AVATAR_COLS.ready_video_start
+        elif layout == TAB_MOTION_ADS:
+            col = MOTION_ADS_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -828,6 +859,12 @@ class SheetsClient:
         "ready_video_1",
     )
 
+    # Header names for the Motion_Ads text OUTPUT columns. Resolved the same
+    # header-first way as Ready Video so inserting/moving columns can't send the
+    # copy to the wrong cell. Plan ``_plans/2026-07-08-motion-ads-tab.md``.
+    _HEADLINE_HEADER_CANDIDATES: tuple[str, ...] = ("headline", "head line")
+    _DESCRIPTION_HEADER_CANDIDATES: tuple[str, ...] = ("description", "desc")
+
     def _resolve_ready_video_col_sync(
         self, sheet_id: str, worksheet_name: str, positional_fallback: int,
     ) -> int:
@@ -856,6 +893,43 @@ class SheetsClient:
                 return idx
         return positional_fallback
 
+    def _resolve_text_output_cols_sync(
+        self, sheet_id: str, worksheet_name: str, tab_type: str,
+    ) -> tuple[int | None, int | None]:
+        """Return the 0-indexed ``(headline_col, description_col)`` for a
+        worksheet, resolved by header name.
+
+        Positional fallback (D / E) applies ONLY to the motion_ads tab — every
+        other tab returns ``None`` for a missing header, so a stray text value
+        can never be written to an unrelated column. A header-read failure
+        degrades to the same per-tab fallback (or ``None``) rather than failing
+        the write.
+        """
+        try:
+            headers = self._read_header_row_sync(sheet_id, worksheet_name)
+        except Exception as e:    # noqa: BLE001 — never fail the write on a header read
+            _log.warning(
+                "text_output_header_lookup_failed_fallback_positional",
+                sheet_id=sheet_id,
+                worksheet=worksheet_name,
+                error=str(e)[:200],
+            )
+            headers = []
+        headline_col: int | None = None
+        description_col: int | None = None
+        for idx, raw in enumerate(headers):
+            cleaned = str(raw or "").strip().lower()
+            if headline_col is None and cleaned in self._HEADLINE_HEADER_CANDIDATES:
+                headline_col = idx
+            if description_col is None and cleaned in self._DESCRIPTION_HEADER_CANDIDATES:
+                description_col = idx
+        if tab_type == TAB_MOTION_ADS:
+            if headline_col is None:
+                headline_col = MOTION_ADS_COLS.headline
+            if description_col is None:
+                description_col = MOTION_ADS_COLS.description
+        return headline_col, description_col
+
     async def batch_write_video_urls(self, writes: list[PendingWrite]) -> int:
         """Group by (sheet, worksheet) and issue one ``batch_update`` per destination.
 
@@ -865,6 +939,11 @@ class SheetsClient:
         per-tab positional value as fallback) so a sheet whose operator
         inserted extra input columns still receives the URL in the column
         actually labelled "Ready Video". Chat 2026-06-09.
+
+        Text outputs (Motion_Ads Headline / Description) ride along in the same
+        batch: they are resolved by header name, written only when non-empty,
+        and landed even when the row produced no video (so failed rows still get
+        their copy). Plan ``_plans/2026-07-08-motion-ads-tab.md``.
         """
         if not writes:
             return 0
@@ -892,6 +971,8 @@ class SheetsClient:
                 if tab_type == TAB_TEXT_ON_IMG
                 else AVATAR_COLS.ready_video_start
                 if tab_type == TAB_AVATAR
+                else MOTION_ADS_COLS.ready_video_start
+                if tab_type == TAB_MOTION_ADS
                 else None
             )
             if positional_fallback is None:
@@ -928,6 +1009,26 @@ class SheetsClient:
                     col_1based = ready_start + slot + 1   # gspread uses 1-indexed
                     cell = gspread.utils.rowcol_to_a1(w.row_num, col_1based)
                     updates.append({"range": cell, "values": [[url]]})
+
+            # Text outputs (Headline / Description). Resolved by header name,
+            # value-guarded, positional fallback for motion_ads only — so no
+            # other tab is ever touched, and a row whose video failed still lands
+            # its copy (this runs before the ``if not updates`` guard below).
+            if any(w.headline or w.description for w in batch):
+                headline_col, description_col = await self._to_thread_with_retry(
+                    self._resolve_text_output_cols_sync,
+                    sheet_id,
+                    worksheet,
+                    tab_type,
+                    op="sheets resolve_text_output_cols",
+                )
+                for w in batch:
+                    if headline_col is not None and w.headline:
+                        cell = gspread.utils.rowcol_to_a1(w.row_num, headline_col + 1)
+                        updates.append({"range": cell, "values": [[w.headline]]})
+                    if description_col is not None and w.description:
+                        cell = gspread.utils.rowcol_to_a1(w.row_num, description_col + 1)
+                        updates.append({"range": cell, "values": [[w.description]]})
 
             if not updates:
                 continue

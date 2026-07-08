@@ -35,6 +35,7 @@ from bulkvid.models.row import (
     CartoonRow,
     FourImagesVO2Row,
     ImageVORow,
+    MotionAdsRow,
     RowResult,
     SimpleMotionRow,
     SimpleRow,
@@ -73,6 +74,7 @@ TAB_YT_CARTOON = "yt_cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
 TAB_TEXT_ON_IMG = "text_on_img"
 TAB_AVATAR = "avatar"
+TAB_MOTION_ADS = "motion_ads"
 
 # Idempotency-key replay window. A submit POST that PA's frontend dropped on
 # the way back to the client gets retried by the Apps Script, with the SAME
@@ -274,7 +276,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -298,7 +300,7 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
 
 def _payload_to_row(
     payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow:
     data = json.loads(payload_json)
     tab = data.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -317,6 +319,8 @@ def _payload_to_row(
         return TextOnImgRow(**data)
     if tab == TAB_AVATAR:
         return AvatarRow(**data)
+    if tab == TAB_MOTION_ADS:
+        return MotionAdsRow(**data)
     return ImageVORow(**data)
 
 
@@ -671,6 +675,11 @@ class JobQueue:
                 "elapsed_seconds": result.elapsed_seconds,
                 "error": result.error,
                 "metadata": result.metadata,
+                # Text outputs (Motion_Ads Headline / Description). Persisted so a
+                # buffered/retried record_result and the sheet write agree even
+                # across a worker restart. Empty on every other tab.
+                "headline": result.headline,
+                "description": result.description,
             },
             ensure_ascii=False,
         )

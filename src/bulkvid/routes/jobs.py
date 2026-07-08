@@ -32,6 +32,7 @@ from bulkvid.models.row import (
     AvatarRow,
     FourImagesVO2Row,
     ImageVORow,
+    MotionAdsRow,
     SimpleMotionRow,
     SimpleRow,
     SimpleX4Row,
@@ -52,6 +53,7 @@ from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
+    TAB_MOTION_ADS,
     TAB_SIMPLE,
     TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
@@ -271,6 +273,25 @@ class TextOnImgRowIn(BaseModel):
     open_comments: str = ""
 
 
+class MotionAdsRowIn(BaseModel):
+    """Wire shape for the ``Motion_Ads`` tab — a silent motion-ad video plus
+    Headline / Description ad copy generated from the article.
+
+    Only ``article_url`` is required. ``manual_image_url`` is optional (blank ->
+    generate a realistic image; filled -> animate it as-is). ``apple`` = Yes
+    forces a GENERATED image to contain no people (Apple/Taboola motion-ad
+    convention). Plan ``_plans/2026-07-08-motion-ads-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_url: str = ""   # optional — blank → generate; filled → as-is
+    apple: bool = False
+    aspect_ratio: str = "16:9"
+    open_comments: str = ""
+
+
 class SubmitJobIn(BaseModel):
     sheet_id: str
     worksheet: str
@@ -291,6 +312,8 @@ class SubmitJobIn(BaseModel):
     rows_text_on_img: list[TextOnImgRowIn] | None = None
     # video with avatar: 2-shot kie/Seedance + TikTok avatar overlay (plan 2026-06-09).
     rows_avatar: list[AvatarRowIn] | None = None
+    # Motion_Ads: silent motion-ad video + Headline/Description copy (plan 2026-07-08).
+    rows_motion_ads: list[MotionAdsRowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -448,6 +471,26 @@ def _build_simple_motion_row(r: SimpleMotionRowIn) -> SimpleMotionRow:
         script_pattern=r.script_pattern,
         cta_enabled=r.cta_enabled,
         cta_text=(r.cta_text or "")[:80],
+        open_comments=r.open_comments,
+    )
+
+
+def _build_motion_ads_row(r: MotionAdsRowIn) -> MotionAdsRow:
+    """Coerce a MotionAdsRowIn into a MotionAdsRow.
+
+    Server-side hardening: the manual image URL is trimmed and passed through
+    (downloaded through the same guard as the avatar / simple-motion tabs). No
+    other coercion — Apple is a plain bool and the aspect string is normalised
+    in the row processor.
+    """
+    return MotionAdsRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=(r.manual_image_url or "").strip(),
+        apple=r.apple,
+        aspect_ratio=r.aspect_ratio,
         open_comments=r.open_comments,
     )
 
@@ -836,6 +879,12 @@ async def submit_job(
         rows = [
             _build_avatar_row(r) for r in payload.rows_avatar
         ]
+    elif payload.tab_type == TAB_MOTION_ADS:
+        if not payload.rows_motion_ads:
+            raise HTTPException(
+                400, "rows_motion_ads is required for tab_type=motion_ads"
+            )
+        rows = [_build_motion_ads_row(r) for r in payload.rows_motion_ads]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 
