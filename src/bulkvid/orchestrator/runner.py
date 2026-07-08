@@ -115,9 +115,12 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # flow. Same 20-min ceiling — multi-shot planner + image-gen + the
     # parallel avatar call all fit in the cartoon budget.
     _TAB_AVATAR: 1200.0,
-    # motion_ads is one image + one 12s Seedance clip + one small copy call —
-    # lighter than image_vo (no VO, no Rendi). Same 15-min budget is ample.
-    _TAB_MOTION_ADS: 900.0,
+    # motion_ads is one image + one 12s Seedance clip + one small copy call. A
+    # single row measures ~5 min (Seedance i2v is slow), so a batch sharing one
+    # KIE key can queue well past image_vo's 15-min budget before a clip lands —
+    # give it 25 min so key contention doesn't time a row out with its copy
+    # already generated (which would leave Headline/Description unwritten).
+    _TAB_MOTION_ADS: 1500.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {

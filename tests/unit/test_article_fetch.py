@@ -25,6 +25,7 @@ from bulkvid.adapters.article_fetch import (
     ArticleFetcher,
     ArticleFetchError,
     _truncate,
+    extract_main_text,
     html_to_text,
 )
 
@@ -62,6 +63,37 @@ def test_html_to_text_collapses_whitespace() -> None:
     html = "<p>line\n\n\n  one</p>\n\n<p>line   two</p>"
     out = html_to_text(html)
     assert out == "line one line two"
+
+
+# ── extract_main_text ───────────────────────────────────────────────────────
+
+
+def test_extract_main_text_keeps_prose_drops_chrome() -> None:
+    # The prose paragraph is well over the 200-char paragraph-path threshold, so
+    # extraction uses the paragraphs and never falls back to a whole-page strip.
+    prose = (
+        "This paragraph is comfortably long enough to be treated as genuine "
+        "article prose and kept by the extractor, well past the minimum length "
+        "the heuristic uses to separate real body copy from short navigation "
+        "labels, buttons, and boilerplate that clutter a page's chrome."
+    )
+    html = (
+        "<nav><a>Home</a></nav>"
+        "<p>Short</p>"    # under the min length — dropped as chrome
+        f"<p>{prose}</p>"
+        "<footer><p>tiny</p></footer>"
+    )
+    out = extract_main_text(html)
+    assert "article prose and kept" in out
+    assert "Home" not in out
+    assert "Short" not in out    # too short to survive the prose filter
+
+
+def test_extract_main_text_falls_back_to_full_strip_without_paragraphs() -> None:
+    # No <p> tags at all -> fall back to a whole-page strip so we still get text.
+    html = "<div>" + ("Body text without paragraph wrappers. " * 10) + "</div>"
+    out = extract_main_text(html)
+    assert "Body text without paragraph wrappers." in out
 
 
 # ── _truncate ───────────────────────────────────────────────────────────────
@@ -191,16 +223,65 @@ async def test_only_scrapingbee_configured_skips_tavily() -> None:
 
 
 @respx.mock
-async def test_both_fail_raises_article_fetch_error() -> None:
+async def test_all_three_fail_raises_article_fetch_error() -> None:
+    # Tavily 500, ScrapingBee 500, AND the free direct-HTTP last resort 500.
     respx.post(f"{TAVILY_BASE_URL}/extract").mock(
         return_value=httpx.Response(500)
     )
     respx.get(SCRAPINGBEE_BASE_URL).mock(return_value=httpx.Response(500))
+    respx.get("https://example.com/dead").mock(return_value=httpx.Response(500))
     async with ArticleFetcher(
         tavily_api_key="tav", scrapingbee_api_key="sb"
     ) as fetcher:
         with pytest.raises(ArticleFetchError):
             await fetcher.fetch("https://example.com/dead")
+
+
+@respx.mock
+async def test_both_providers_fail_direct_fallback_succeeds() -> None:
+    # Tavily + ScrapingBee both down (e.g. Tavily account disabled, no working
+    # ScrapingBee) -> the free direct fetch pulls the page's paragraphs.
+    respx.post(f"{TAVILY_BASE_URL}/extract").mock(return_value=httpx.Response(402))
+    respx.get(SCRAPINGBEE_BASE_URL).mock(return_value=httpx.Response(500))
+    page = (
+        "<html><body><nav><a>Home</a><a>About</a></nav>"
+        "<p>This is the real article body paragraph, long enough to count as "
+        "genuine prose rather than a navigation label.</p>"
+        "<p>A second substantial paragraph continues the article with more "
+        "detail so the extractor keeps it too.</p>"
+        "<footer><p>© 2026</p></footer></body></html>"
+    )
+    respx.get("https://example.com/story").mock(
+        return_value=httpx.Response(200, text=page)
+    )
+    async with ArticleFetcher(
+        tavily_api_key="tav", scrapingbee_api_key="sb"
+    ) as fetcher:
+        result = await fetcher.fetch("https://example.com/story")
+    assert result.source == "direct"
+    assert "real article body paragraph" in result.content
+    assert "second substantial paragraph" in result.content
+    assert "Home" not in result.content and "© 2026" not in result.content
+    # Direct fetch is free; ScrapingBee bills only on SUCCESS, so a 500 there
+    # adds nothing — only Tavily's always-billed attempt is charged.
+    assert result.cost_usd == COST_TAVILY_EXTRACT_USD
+
+
+@respx.mock
+async def test_direct_fallback_when_no_provider_keys_configured() -> None:
+    # A deploy with a (present-but-dead) Tavily key and no ScrapingBee: the
+    # direct fetch still carries the row.
+    respx.post(f"{TAVILY_BASE_URL}/extract").mock(return_value=httpx.Response(402))
+    respx.get("https://example.com/only-direct").mock(
+        return_value=httpx.Response(
+            200,
+            text="<article><p>" + ("Solid article sentence. " * 5) + "</p></article>",
+        )
+    )
+    async with ArticleFetcher(tavily_api_key="tav") as fetcher:
+        result = await fetcher.fetch("https://example.com/only-direct")
+    assert result.source == "direct"
+    assert "Solid article sentence." in result.content
 
 
 # ── Invalid URL ─────────────────────────────────────────────────────────────

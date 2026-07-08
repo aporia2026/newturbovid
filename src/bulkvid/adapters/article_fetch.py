@@ -1,15 +1,21 @@
-"""Article fetch adapter — Tavily primary, ScrapingBee fallback.
+"""Article fetch adapter — Tavily → ScrapingBee → direct-HTTP fallback.
 
 The bulk pipeline needs the *full* article body, not just the title, to
-generate a ~10-second voiceover script in the article's language. Tavily's
+generate copy / a voiceover script in the article's language. Tavily's
 ``/extract`` endpoint gives us clean text directly. When Tavily fails (paywall,
-cookie wall, JS-only sites), we fall back to ScrapingBee with JS rendering on
-and strip the resulting HTML.
+cookie wall, JS-only sites, or an unpaid/disabled account), we fall back to
+ScrapingBee with JS rendering on and strip the resulting HTML. When BOTH paid
+extractors are unavailable — e.g. Tavily's account is disabled AND no
+ScrapingBee key is configured on this deploy — a free direct-HTTP fetch is the
+last resort: pull the page ourselves and pull its paragraph text. It's lower
+quality (and datacenter IPs are sometimes blocked), but a row that ships beats a
+row that fails outright when the paid providers are both down.
 
 Cost note: most calls cost Tavily-only (~$0.008). ScrapingBee fires only on
-fallback (~$0.003).
+fallback (~$0.003). The direct fetch is free.
 
-Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 (Article fetch), §11.
+Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 (Article fetch), §11;
+direct fallback ``_plans/2026-07-08-motion-ads-tab.md`` (Tavily-down hardening).
 """
 
 from __future__ import annotations
@@ -61,7 +67,7 @@ class ScrapingBeeError(RuntimeError):
 class ArticleResult:
     url: str
     content: str
-    source: str                       # "tavily" | "scrapingbee"
+    source: str                       # "tavily" | "scrapingbee" | "direct"
     char_count: int
     cost_usd: float
 
@@ -73,6 +79,11 @@ _SCRIPT_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
 _STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+_PARAGRAPH_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.DOTALL | re.IGNORECASE)
+
+# A <p> block shorter than this is almost always chrome (a nav label, a button,
+# a copyright line), not article prose — skip it when extracting main text.
+_MIN_PARAGRAPH_CHARS = 40
 
 
 def html_to_text(html: str) -> str:
@@ -82,6 +93,27 @@ def html_to_text(html: str) -> str:
     h = _TAG_RE.sub(" ", h)
     h = html_lib.unescape(h)
     return _WHITESPACE_RE.sub(" ", h).strip()
+
+
+def extract_main_text(html: str) -> str:
+    """Best-effort ARTICLE text from a raw page, no dependencies.
+
+    Pulls the text of every ``<p>`` block long enough to be prose, which skips
+    most of a page's nav / menu / footer chrome (those live in ``<a>`` / ``<li>``
+    / ``<nav>``, not ``<p>``). Falls back to a whole-page strip when paragraph
+    extraction finds too little — some sites render body text without ``<p>``
+    wrappers. Used only by the direct-HTTP fallback, where we get raw HTML
+    instead of a provider's pre-extracted text.
+    """
+    paragraphs: list[str] = []
+    for raw in _PARAGRAPH_RE.findall(html):
+        text = html_to_text(raw)
+        if len(text) >= _MIN_PARAGRAPH_CHARS:
+            paragraphs.append(text)
+    joined = "\n\n".join(paragraphs).strip()
+    if len(joined) < 200:    # paragraph extraction found little — strip it all
+        return html_to_text(html)
+    return joined
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -183,6 +215,39 @@ class ArticleFetcher:
             raise ScrapingBeeError(f"ScrapingBee returned empty body for {url}")
         return text
 
+    # ── Direct-HTTP path (free last resort) ─────────────────────────────
+
+    async def _fetch_direct(self, url: str) -> str:
+        """Fetch the page ourselves with a browser UA and pull its main text.
+
+        No paid API — reached only when Tavily and ScrapingBee are both
+        unavailable. Lower quality (and datacenter IPs are sometimes blocked
+        with a 403), so it is deliberately last.
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en,*;q=0.5",
+        }
+        _log.info("article_direct_submit", url=url[:200])
+        resp = await self._client.get(
+            url,
+            headers=headers,
+            timeout=self._scrapingbee_timeout,
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            raise ArticleFetchError(
+                f"direct HTTP {resp.status_code} for {url}"
+            )
+        text = extract_main_text(resp.text)
+        if not text:
+            raise ArticleFetchError(f"direct fetch returned empty body for {url}")
+        return text
+
     # ── Public entrypoint ───────────────────────────────────────────────
 
     async def fetch(self, url: str) -> ArticleResult:
@@ -246,6 +311,34 @@ class ArticleFetcher:
                     url=url[:200],
                     error=str(e)[:200],
                 )
+
+        # Last resort: free direct-HTTP fetch. Reached when both paid extractors
+        # are down/unconfigured (e.g. Tavily's account disabled AND no working
+        # ScrapingBee key on this deploy). No added cost. A lower-quality body
+        # that lets the row ship beats failing the row outright.
+        try:
+            content = await self._fetch_direct(url)
+            truncated = _truncate(content, self._max_chars)
+            _log.info(
+                "article_fetch_ok",
+                url=url[:200],
+                source="direct",
+                chars=len(truncated),
+                cost_usd=cost,
+            )
+            return ArticleResult(
+                url=url,
+                content=truncated,
+                source="direct",
+                char_count=len(truncated),
+                cost_usd=cost,
+            )
+        except (ArticleFetchError, httpx.HTTPError, asyncio.TimeoutError) as e:
+            _log.error(
+                "article_direct_failed",
+                url=url[:200],
+                error=str(e)[:200],
+            )
 
         raise ArticleFetchError(
             f"All article fetch strategies failed for {url}"
