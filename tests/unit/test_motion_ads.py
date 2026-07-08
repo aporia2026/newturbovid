@@ -15,6 +15,7 @@ outputs (Headline -> col D, Description -> col E). Covers:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -28,8 +29,8 @@ from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import (
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
-    _payload_to_row,
     _row_to_payload,
+    payload_to_row,
 )
 from bulkvid.orchestrator.row_processor_motion_ads import (
     MA_VIDEO_DURATION_SECONDS,
@@ -72,7 +73,13 @@ def test_payload_round_trip_motion_ads() -> None:
     row = _row(apple=True, manual_image_url="https://img/x.png", open_comments="hi")
     payload = _row_to_payload(row, TAB_MOTION_ADS)
     assert '"__tab__": "motion_ads"' in payload
-    restored = _payload_to_row(payload)
+    # Deserialize exactly as the worker does: the claimed row's JSON payload is
+    # ``json.loads``-ed to a dict, then handed to ``payload_to_row``. Testing the
+    # live function (not a look-alike helper) is the whole point — an earlier
+    # version round-tripped through a dead duplicate that HAD the motion_ads
+    # branch while the real ``payload_to_row`` did not, so every prod row crashed
+    # with ``ImageVORow ... unexpected keyword argument 'apple'`` (2026-07-08).
+    restored = payload_to_row(json.loads(payload))
     assert isinstance(restored, MotionAdsRow)
     assert restored == row
 
