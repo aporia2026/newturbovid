@@ -83,7 +83,7 @@ def test_deep_health_admin_returns_full_status(client: TestClient) -> None:
     vendors = body["vendors"]
     for name in (
         "openai", "kie_ai", "vertex_ai", "rendi", "zapcap",
-        "tavily", "scrapingbee", "aws_s3", "gcs", "sheets",
+        "scrapingbee", "aws_s3", "gcs", "sheets",
     ):
         assert name in vendors
 

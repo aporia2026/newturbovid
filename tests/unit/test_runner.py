@@ -104,7 +104,7 @@ def _make_dummy_clients() -> PipelineClients:
         tts=GeminiTTSClient(project="amit-tts", client=object()),
         rendi=RendiClient(api_key="r"),
         storage=storage,
-        article=ArticleFetcher(tavily_api_key="t"),
+        article=ArticleFetcher(scrapingbee_api_key="t"),
         zapcap=None,
     )
 

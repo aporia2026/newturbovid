@@ -92,7 +92,6 @@ async def deep_health(
             },
             "rendi": _present(settings.RENDI_API_KEY),
             "zapcap": _present(settings.ZAPCAP_API_KEY),
-            "tavily": _present(settings.TAVILY_API_KEY),
             "scrapingbee": _present(settings.SCRAPINGBEE_API_KEY),
             "aws_s3": {
                 "configured": bool(

@@ -17,7 +17,7 @@ the Rendi concat — and only swaps the image step (manual-or-generate) and the
 image style (``REALISTIC_STYLE``).
 
 Pipeline:
-  1. Article fetch (Tavily -> ScrapingBee)
+  1. Article fetch (ScrapingBee -> direct)
   2. language detect -> classify Open Comments -> safety
   3. generate_cartoon_plan (realistic prompt) -> 1 idea: a VO line + 2 scene/motion shots
   4. Build ONE video:

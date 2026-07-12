@@ -759,7 +759,6 @@ async def _run(args: ParsedArgs) -> int:
         atlas_configured=bool(settings.ATLAS_API_KEY),
         rendi_configured=bool(settings.RENDI_API_KEY),
         openai_configured=bool(settings.OPENAI_API_KEY),
-        tavily_configured=bool(settings.TAVILY_API_KEY),
         scrapingbee_configured=bool(settings.SCRAPINGBEE_API_KEY),
     )
 

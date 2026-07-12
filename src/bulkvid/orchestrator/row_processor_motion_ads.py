@@ -8,7 +8,7 @@ any kind) plus two text outputs written back to the sheet:
   * Description (col E, <= 80 chars)
 
 Pipeline (deliberately lean — no planner, no TTS, no Rendi):
-  1. Article fetch (Tavily -> ScrapingBee).
+  1. Article fetch (ScrapingBee -> direct).
   2. language detect -> reconcile with the operator's market -> safety check.
   3. ONE LLM call (motion_ads_copy) -> {headline, description, image_scene}.
   4. Image: a pasted Manual Image (col F) is animated as-is; a blank cell is
