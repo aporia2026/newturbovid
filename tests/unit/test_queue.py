@@ -287,7 +287,7 @@ async def test_record_failure_increments_failed_and_keeps_running(queue: JobQueu
             row_num=2,
             status=STATUS_ARTICLE_FETCH_FAILED,
             cost_usd=0.01,
-            error="tavily down",
+            error="scrapingbee down",
         ),
     )
     job = await queue.get_job(job_id)

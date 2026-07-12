@@ -4,7 +4,7 @@ Pipeline (simplified 2026-06-09 per
 ``_plans/2026-06-09-avatar-static-image-pipeline.md`` — was previously
 a 2-shot Seedance-animated cartoon with the avatar composited on top):
 
-  1. Article fetch (Tavily → ScrapingBee)
+  1. Article fetch (ScrapingBee → direct)
   2. language detect → classify Open Comments → safety resolve
   3. ``generate_script`` — same article→script flow the simple /
      simple-x4 tabs use; produces the ~10 s narration the avatar will

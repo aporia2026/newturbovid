@@ -72,10 +72,10 @@ class _FakeArticleFetcher:
         if self._fail:
             from bulkvid.adapters.article_fetch import ArticleFetchError
 
-            raise ArticleFetchError("simulated tavily+scrapingbee fail")
+            raise ArticleFetchError("simulated scrapingbee+direct fail")
         return ArticleResult(
-            url=url, content=self._content, source="tavily",
-            char_count=len(self._content), cost_usd=0.008,
+            url=url, content=self._content, source="scrapingbee",
+            char_count=len(self._content), cost_usd=0.003,
         )
 
 
@@ -385,6 +385,35 @@ async def test_kie_failure_returns_image_gen_failed() -> None:
 
     assert result.status == STATUS_IMAGE_GEN_FAILED
     assert result.video_urls == []
+
+
+@respx.mock
+async def test_upscale_failure_falls_back_to_raw_collage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # recraft upscale is down even after its internal retries. The row must
+    # still ship by splitting the raw (un-upscaled) collage instead of dying at
+    # IMAGE_GEN_FAILED — the reported "finished but nothing pasted" bug.
+    _register_default_openai_routes()
+    _register_default_kie_routes()
+    _register_default_rendi_routes()
+    _register_seed_image_download(_make_collage_png(200))
+
+    from bulkvid.adapters.kie import KieError
+    from bulkvid.orchestrator import row_processor_image_vo as mod
+
+    monkeypatch.setattr(
+        mod,
+        "recraft_crisp_upscale",
+        AsyncMock(side_effect=KieError("internal error, please try again later.")),
+    )
+
+    clients = _build_clients()
+    result = await process_image_vo_row(_row(), clients)
+
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 4
+    assert result.metadata.get("upscale_fallback_raw") is True
 
 
 @respx.mock

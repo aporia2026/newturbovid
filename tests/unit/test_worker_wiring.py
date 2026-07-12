@@ -27,7 +27,7 @@ def _full_settings(**overrides) -> Settings:
         KIE_AI_KEYS="kie_key_AAAAAAAAAAAA",
         RENDI_API_KEY="rendi-test",
         ZAPCAP_API_KEY="zc-test",
-        TAVILY_API_KEY="tav-test",
+        SCRAPINGBEE_API_KEY="sb-test",
         AWS_ACCESS_KEY_ID="aws-id",
         AWS_SECRET_ACCESS_KEY="aws-secret",
         AWS_BUCKET_NAME="b",
@@ -128,9 +128,8 @@ def test_gcs_credentials_alone_satisfies_storage() -> None:
     assert clients.storage is not None
 
 
-def test_missing_tavily_and_scrapingbee_raises() -> None:
-    settings = _full_settings(TAVILY_API_KEY="")
-    # SCRAPINGBEE_API_KEY is also empty by default in our fixture.
+def test_missing_scrapingbee_raises() -> None:
+    settings = _full_settings(SCRAPINGBEE_API_KEY="")
     with pytest.raises(ValueError):
         build_pipeline_clients(settings)
 

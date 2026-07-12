@@ -147,8 +147,8 @@ class Settings(BaseSettings):
     ZAPCAP_POLL_INTERVAL_SECONDS: float = 10.0
 
     # ── Article fetching ─────────────────────────────────────────────────
-    TAVILY_API_KEY: str = ""
-    TAVILY_TIMEOUT_SECONDS: float = 15.0
+    # ScrapingBee is the sole paid extractor (Tavily removed 2026-07-12); a
+    # free direct-HTTP fetch is the last-resort fallback inside ArticleFetcher.
     SCRAPINGBEE_API_KEY: str = ""
     SCRAPINGBEE_TIMEOUT_SECONDS: float = 30.0
     ARTICLE_MAX_CONTENT_CHARS: int = 50000

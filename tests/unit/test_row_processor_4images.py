@@ -62,9 +62,9 @@ class _FakeArticleFetcher:
         return ArticleResult(
             url=url,
             content="Article body about smartwatches and fitness tracking.",
-            source="tavily",
+            source="scrapingbee",
             char_count=53,
-            cost_usd=0.008,
+            cost_usd=0.003,
         )
 
 

@@ -3,7 +3,7 @@
 Implements the pipeline from plan §5 ("Per-row pipeline (Image-VO tab)"):
 
   1. Parallel kickoff:
-     1a. Article fetch (Tavily -> ScrapingBee fallback)
+     1a. Article fetch (ScrapingBee -> direct fallback)
      1b. Pre-upload source image to storage + capture base64
   2. After 1b: GPT-4o visual description
   3. After 2:  gpt-5.4-mini collage prompt
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 from PIL import Image
 
-from bulkvid.adapters.kie import recraft_crisp_upscale
+from bulkvid.adapters.kie import KieError, recraft_crisp_upscale
 from bulkvid.adapters.rendi import normalize_aspect_ratio
 from bulkvid.http_download import download_image
 from bulkvid.image_ops import (
@@ -248,10 +248,23 @@ async def process_image_vo_row(
                 )
                 costs.image_gen += c3
 
-                upscaled_url, c4 = await recraft_crisp_upscale(clients.kie, collage_url)
-                costs.upscale += c4
+                # Upscale is a quality boost, not a hard requirement. If recraft
+                # is down even after its internal retries, fall back to the raw
+                # collage so the row still ships — softer quadrants beat a dead
+                # row. A transient recraft "internal error, please try again
+                # later." used to fail the whole row at IMAGE_GEN_FAILED. Plan:
+                # ``_plans/2026-07-12-upscale-resilience-tavily-removal.md``.
+                try:
+                    split_source_url, c4 = await recraft_crisp_upscale(
+                        clients.kie, collage_url
+                    )
+                    costs.upscale += c4
+                except KieError as e:
+                    _log.warning("upscale_failed_kept_raw", error=str(e)[:200])
+                    metadata["upscale_fallback_raw"] = True
+                    split_source_url = collage_url
 
-                upscaled_bytes = await download_image(upscaled_url, timeout=120.0)
+                upscaled_bytes = await download_image(split_source_url, timeout=120.0)
                 quadrants = split_collage_2x2(upscaled_bytes, edge_crop_pixels=edge_crop_pixels)
                 if len(quadrants) != 4:
                     raise RuntimeError(f"split_collage_2x2 returned {len(quadrants)} quadrants")

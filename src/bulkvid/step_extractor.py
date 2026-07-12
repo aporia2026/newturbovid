@@ -31,9 +31,8 @@ from bulkvid.config import get_settings
 # Plain + informative tone per Yoav's pick on the plan question.
 STEP_FROM_EVENT: dict[str, str] = {
     # Article fetch
-    "article_tavily_submit":      "Fetching article (Tavily)",
-    "article_tavily_failed":      "Fetching article (Tavily failed, falling back)",
     "article_scrapingbee_submit": "Fetching article (ScrapingBee)",
+    "article_direct_submit":      "Fetching article (direct)",
     "article_fetch_ok":           "Article fetched",
     # Language + safety
     "detect_submit":              "Detecting language",

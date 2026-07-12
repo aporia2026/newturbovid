@@ -1,21 +1,22 @@
-"""Article fetch adapter — Tavily → ScrapingBee → direct-HTTP fallback.
+"""Article fetch adapter — ScrapingBee → direct-HTTP fallback.
 
 The bulk pipeline needs the *full* article body, not just the title, to
-generate copy / a voiceover script in the article's language. Tavily's
-``/extract`` endpoint gives us clean text directly. When Tavily fails (paywall,
-cookie wall, JS-only sites, or an unpaid/disabled account), we fall back to
-ScrapingBee with JS rendering on and strip the resulting HTML. When BOTH paid
-extractors are unavailable — e.g. Tavily's account is disabled AND no
-ScrapingBee key is configured on this deploy — a free direct-HTTP fetch is the
-last resort: pull the page ourselves and pull its paragraph text. It's lower
-quality (and datacenter IPs are sometimes blocked), but a row that ships beats a
-row that fails outright when the paid providers are both down.
+generate copy / a voiceover script in the article's language. ScrapingBee
+renders the page with JS on and returns the HTML, which we strip to text. When
+ScrapingBee is unavailable — no key configured, or its account is down — a free
+direct-HTTP fetch is the last resort: pull the page ourselves and pull its
+paragraph text. It's lower quality (and datacenter IPs are sometimes blocked),
+but a row that ships beats a row that fails outright.
 
-Cost note: most calls cost Tavily-only (~$0.008). ScrapingBee fires only on
-fallback (~$0.003). The direct fetch is free.
+Tavily was removed 2026-07-12 (account disabled for non-payment, and it billed
+every failed attempt). ScrapingBee is the sole paid extractor now. Plan:
+``_plans/2026-07-12-upscale-resilience-tavily-removal.md``.
+
+Cost note: ScrapingBee bills only on a successful fetch (~$0.003). The direct
+fetch is free.
 
 Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 (Article fetch), §11;
-direct fallback ``_plans/2026-07-08-motion-ads-tab.md`` (Tavily-down hardening).
+direct fallback ``_plans/2026-07-08-motion-ads-tab.md`` (provider-down hardening).
 """
 
 from __future__ import annotations
@@ -36,12 +37,10 @@ _log = get_logger("article")
 
 # ── Pricing (USD) ────────────────────────────────────────────────────────────
 # Verified plan §11 2026-06-02. Refresh before each release.
-COST_TAVILY_EXTRACT_USD = 0.008
 COST_SCRAPINGBEE_REQUEST_USD = 0.003
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
-TAVILY_BASE_URL = "https://api.tavily.com"
 SCRAPINGBEE_BASE_URL = "https://app.scrapingbee.com/api/v1/"
 
 
@@ -50,10 +49,6 @@ SCRAPINGBEE_BASE_URL = "https://app.scrapingbee.com/api/v1/"
 
 class ArticleFetchError(RuntimeError):
     """All fetch strategies exhausted."""
-
-
-class TavilyError(RuntimeError):
-    """Tavily returned an error (used internally; not propagated)."""
 
 
 class ScrapingBeeError(RuntimeError):
@@ -67,7 +62,7 @@ class ScrapingBeeError(RuntimeError):
 class ArticleResult:
     url: str
     content: str
-    source: str                       # "tavily" | "scrapingbee" | "direct"
+    source: str                       # "scrapingbee" | "direct"
     char_count: int
     cost_usd: float
 
@@ -128,29 +123,22 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 class ArticleFetcher:
-    """Two-stage article fetcher with Tavily → ScrapingBee fallback."""
+    """Article fetcher with ScrapingBee → free direct-HTTP fallback."""
 
     def __init__(
         self,
-        tavily_api_key: str = "",
         scrapingbee_api_key: str = "",
         max_chars: int = 50_000,
-        tavily_timeout: float = 15.0,
         scrapingbee_timeout: float = 30.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        if not tavily_api_key and not scrapingbee_api_key:
-            raise ValueError(
-                "ArticleFetcher requires at least one of "
-                "tavily_api_key or scrapingbee_api_key"
-            )
-        self._tavily_key = tavily_api_key
+        if not scrapingbee_api_key:
+            raise ValueError("ArticleFetcher requires scrapingbee_api_key")
         self._scrapingbee_key = scrapingbee_api_key
         self._max_chars = max_chars
-        self._tavily_timeout = tavily_timeout
         self._scrapingbee_timeout = scrapingbee_timeout
         self._owned = client is None
-        self._client = client or httpx.AsyncClient(timeout=max(tavily_timeout, scrapingbee_timeout))
+        self._client = client or httpx.AsyncClient(timeout=scrapingbee_timeout)
 
     async def aclose(self) -> None:
         if self._owned:
@@ -161,35 +149,6 @@ class ArticleFetcher:
 
     async def __aexit__(self, *_: Any) -> None:
         await self.aclose()
-
-    # ── Tavily path ─────────────────────────────────────────────────────
-
-    async def _fetch_tavily(self, url: str) -> str:
-        endpoint = f"{TAVILY_BASE_URL}/extract"
-        headers = {
-            "Authorization": f"Bearer {self._tavily_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {"urls": [url], "extract_depth": "advanced"}
-        _log.info("article_tavily_submit", url=url[:200])
-        resp = await self._client.post(
-            endpoint, json=payload, headers=headers, timeout=self._tavily_timeout
-        )
-        if resp.status_code != 200:
-            raise TavilyError(
-                f"Tavily HTTP {resp.status_code}: {resp.text[:200]}"
-            )
-        body = resp.json()
-        results = body.get("results") or []
-        if not results:
-            raise TavilyError(f"Tavily returned no results for {url}")
-        # raw_content is the canonical full article body in newer Tavily versions;
-        # `content` is the older shape.
-        first = results[0]
-        content = (first.get("raw_content") or first.get("content") or "").strip()
-        if not content:
-            raise TavilyError(f"Tavily result had empty content for {url}")
-        return content
 
     # ── ScrapingBee path ────────────────────────────────────────────────
 
@@ -220,9 +179,9 @@ class ArticleFetcher:
     async def _fetch_direct(self, url: str) -> str:
         """Fetch the page ourselves with a browser UA and pull its main text.
 
-        No paid API — reached only when Tavily and ScrapingBee are both
-        unavailable. Lower quality (and datacenter IPs are sometimes blocked
-        with a 403), so it is deliberately last.
+        No paid API — reached only when ScrapingBee is unavailable. Lower
+        quality (and datacenter IPs are sometimes blocked with a 403), so it is
+        deliberately last.
         """
         headers = {
             "User-Agent": (
@@ -251,71 +210,41 @@ class ArticleFetcher:
     # ── Public entrypoint ───────────────────────────────────────────────
 
     async def fetch(self, url: str) -> ArticleResult:
-        """Fetch full article content. Tavily first, ScrapingBee fallback."""
+        """Fetch full article content. ScrapingBee first, direct-HTTP fallback."""
         if not url or not url.startswith(("http://", "https://")):
             raise ArticleFetchError(f"Invalid URL: {url!r}")
 
         cost = 0.0
 
-        # Try Tavily.
-        if self._tavily_key:
-            try:
-                content = await self._fetch_tavily(url)
-                cost += COST_TAVILY_EXTRACT_USD
-                truncated = _truncate(content, self._max_chars)
-                _log.info(
-                    "article_fetch_ok",
-                    url=url[:200],
-                    source="tavily",
-                    chars=len(truncated),
-                    cost_usd=cost,
-                )
-                return ArticleResult(
-                    url=url,
-                    content=truncated,
-                    source="tavily",
-                    char_count=len(truncated),
-                    cost_usd=cost,
-                )
-            except (TavilyError, httpx.HTTPError, asyncio.TimeoutError) as e:
-                _log.warning(
-                    "article_tavily_failed",
-                    url=url[:200],
-                    error=str(e)[:200],
-                )
-                cost += COST_TAVILY_EXTRACT_USD  # Tavily still bills failed attempts
+        # Primary: ScrapingBee (JS-rendered, HTML stripped to text).
+        try:
+            content = await self._fetch_scrapingbee(url)
+            cost += COST_SCRAPINGBEE_REQUEST_USD
+            truncated = _truncate(content, self._max_chars)
+            _log.info(
+                "article_fetch_ok",
+                url=url[:200],
+                source="scrapingbee",
+                chars=len(truncated),
+                cost_usd=cost,
+            )
+            return ArticleResult(
+                url=url,
+                content=truncated,
+                source="scrapingbee",
+                char_count=len(truncated),
+                cost_usd=cost,
+            )
+        except (ScrapingBeeError, httpx.HTTPError, asyncio.TimeoutError) as e:
+            _log.error(
+                "article_scrapingbee_failed",
+                url=url[:200],
+                error=str(e)[:200],
+            )
 
-        # Fallback to ScrapingBee.
-        if self._scrapingbee_key:
-            try:
-                content = await self._fetch_scrapingbee(url)
-                cost += COST_SCRAPINGBEE_REQUEST_USD
-                truncated = _truncate(content, self._max_chars)
-                _log.info(
-                    "article_fetch_ok",
-                    url=url[:200],
-                    source="scrapingbee",
-                    chars=len(truncated),
-                    cost_usd=cost,
-                )
-                return ArticleResult(
-                    url=url,
-                    content=truncated,
-                    source="scrapingbee",
-                    char_count=len(truncated),
-                    cost_usd=cost,
-                )
-            except (ScrapingBeeError, httpx.HTTPError, asyncio.TimeoutError) as e:
-                _log.error(
-                    "article_scrapingbee_failed",
-                    url=url[:200],
-                    error=str(e)[:200],
-                )
-
-        # Last resort: free direct-HTTP fetch. Reached when both paid extractors
-        # are down/unconfigured (e.g. Tavily's account disabled AND no working
-        # ScrapingBee key on this deploy). No added cost. A lower-quality body
-        # that lets the row ship beats failing the row outright.
+        # Last resort: free direct-HTTP fetch. Reached when ScrapingBee is
+        # down/unconfigured. No added cost. A lower-quality body that lets the
+        # row ship beats failing the row outright.
         try:
             content = await self._fetch_direct(url)
             truncated = _truncate(content, self._max_chars)
@@ -347,14 +276,10 @@ class ArticleFetcher:
 
 def build_fetcher_from_settings(settings: Settings | None = None) -> ArticleFetcher:
     s = settings or get_settings()
-    if not s.TAVILY_API_KEY and not s.SCRAPINGBEE_API_KEY:
-        raise ValueError(
-            "Need at least one of TAVILY_API_KEY or SCRAPINGBEE_API_KEY"
-        )
+    if not s.SCRAPINGBEE_API_KEY:
+        raise ValueError("Need SCRAPINGBEE_API_KEY")
     return ArticleFetcher(
-        tavily_api_key=s.TAVILY_API_KEY,
         scrapingbee_api_key=s.SCRAPINGBEE_API_KEY,
         max_chars=s.ARTICLE_MAX_CONTENT_CHARS,
-        tavily_timeout=s.TAVILY_TIMEOUT_SECONDS,
         scrapingbee_timeout=s.SCRAPINGBEE_TIMEOUT_SECONDS,
     )

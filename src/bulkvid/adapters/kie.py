@@ -616,19 +616,81 @@ async def gpt_image_2(
     return urls[0], COST_GPT_IMAGE_2_USD
 
 
+# Substrings in a kie ``failMsg`` that mark a RETRYABLE server-side blip (vs a
+# deterministic rejection — content-policy block, bad input — that a resubmit
+# would only repeat). Matched case-insensitively. The reported upscale outage
+# was ``failMsg='internal error, please try again later.'`` — both phrases are
+# covered here. Plan: ``_plans/2026-07-12-upscale-resilience-tavily-removal.md``.
+_TRANSIENT_KIE_FAIL_MARKERS = (
+    "internal error",
+    "try again",
+    "timeout",
+    "timed out",
+    "server error",
+    "temporarily",
+    "please retry",
+)
+
+
+def _is_transient_kie_fail(message: str) -> bool:
+    """True when a ``KieTaskFailedError`` message looks like a server-side blip."""
+    m = message.lower()
+    return any(marker in m for marker in _TRANSIENT_KIE_FAIL_MARKERS)
+
+
 async def recraft_crisp_upscale(
     client: KieClient,
     image_url: str,
     max_attempts: int = 120,
     delay_seconds: float = 3.0,
+    retries: int = 2,
+    retry_backoff_seconds: float = 2.0,
 ) -> tuple[str, float]:
-    """Upscale an image with recraft/crisp-upscale. Returns ``(url, cost_usd)``."""
+    """Upscale an image with recraft/crisp-upscale. Returns ``(url, cost_usd)``.
+
+    Resilience: the whole submit+poll is retried up to ``retries`` extra times
+    (default 2) on a TRANSIENT kie failure — a ``KieTaskFailedError`` whose
+    ``failMsg`` looks server-side (the reported one was "internal error, please
+    try again later."), a ``KieTimeoutError`` (task never landed), or a
+    submit-time network flap. A single transient recraft blip used to kill the
+    whole row at ``IMAGE_GEN_FAILED`` even though kie itself said "please try
+    again later"; the caller ALSO keeps the un-upscaled collage as a last
+    resort. Not retried: ``KieRateLimitError`` (every key is cooling — an
+    immediate resubmit just hits cooled keys) and a NON-transient
+    ``KieTaskFailedError`` (a deterministic rejection). Mirrors
+    ``seedance_image_to_video``'s timeout-resubmit. Plan:
+    ``_plans/2026-07-12-upscale-resilience-tavily-removal.md``.
+    """
     input_params: dict[str, Any] = {"image": image_url}
-    task_id = await client.create_task(MODEL_RECRAFT_UPSCALE, input_params)
-    urls = await client.poll_task(
-        task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
-    )
-    return urls[0], COST_RECRAFT_UPSCALE_USD
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            task_id = await client.create_task(MODEL_RECRAFT_UPSCALE, input_params)
+            urls = await client.poll_task(
+                task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
+            )
+            return urls[0], COST_RECRAFT_UPSCALE_USD
+        except KieTaskFailedError as e:
+            # Only a transient server-side blip is worth a resubmit; a
+            # deterministic rejection is re-raised as-is so we don't burn
+            # attempts (and money) repeating a failure that won't change.
+            if not _is_transient_kie_fail(str(e)):
+                raise
+            last_exc = e
+        except (KieTimeoutError, httpx.TransportError) as e:
+            last_exc = e
+        if attempt < retries:
+            _log.warning(
+                "recraft_upscale_retry",
+                attempt=attempt + 1,
+                total=retries + 1,
+                error=f"{type(last_exc).__name__}: {str(last_exc)[:150]}",
+            )
+            await asyncio.sleep(retry_backoff_seconds)
+    # Retries exhausted — surface the last transient error so the caller can
+    # fall back to the un-upscaled collage rather than failing the row.
+    assert last_exc is not None
+    raise last_exc
 
 
 def _nano_banana_2_cost(resolution: str) -> float:

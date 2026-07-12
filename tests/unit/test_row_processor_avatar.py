@@ -219,7 +219,7 @@ def _register_downloads() -> None:
 def _build_clients() -> PipelineClients:
     """All clients are real adapter classes; their HTTP traffic is mocked
     by the respx routes above. Storage + article are in-process fakes so
-    the test doesn't need a real GCS / Tavily."""
+    the test doesn't need a real GCS / ScrapingBee."""
     return PipelineClients(
         openai=OpenAIClient(api_key="sk-test"),
         kie=KieClient(pool=KiePool(keys=["k_unused_AAAAAAAAAAAA"]), base_url=KIE_BASE),
@@ -316,7 +316,7 @@ async def test_avatar_no_manual_image_uses_kie_text_to_image(
 async def test_avatar_missing_avatar_id_fails_before_any_external_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Empty avatar_id -> immediate STATUS_INTERNAL_ERROR; no Tavily,
+    """Empty avatar_id -> immediate STATUS_INTERNAL_ERROR; no article fetch,
     no OpenAI, no kie, no Rendi traffic at all."""
     monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
     openai_route = respx.post(f"{OPENAI_BASE}/chat/completions").mock(
@@ -338,7 +338,7 @@ async def test_avatar_missing_avatar_id_fails_before_any_external_call(
 async def test_avatar_article_fetch_failure_surfaces_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tavily/ScrapingBee both down -> STATUS_ARTICLE_FETCH_FAILED with
+    """ScrapingBee + direct both down -> STATUS_ARTICLE_FETCH_FAILED with
     no kie cost burned."""
     monkeypatch.setenv("TIKTOK_ACCESS_TOKEN", "tt-test")
     _register_openai_routes()
