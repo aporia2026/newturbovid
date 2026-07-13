@@ -33,6 +33,7 @@ from bulkvid.models.row import (
     AvatarRow,
     CartoonRow,
     FourImagesVO2Row,
+    HookCardRow,
     ImageVORow,
     MotionAdsRow,
     RowResult,
@@ -48,6 +49,7 @@ from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
+from bulkvid.orchestrator.row_processor_hook_card import process_hook_card_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_motion_ads import process_motion_ads_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
@@ -92,6 +94,7 @@ _TAB_SIMPLE_X4 = "simple_x4"
 _TAB_TEXT_ON_IMG = "text_on_img"
 _TAB_AVATAR = "avatar"
 _TAB_MOTION_ADS = "motion_ads"
+_TAB_HOOK_CARD = "hook_card"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
@@ -121,6 +124,10 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # give it 25 min so key contention doesn't time a row out with its copy
     # already generated (which would leave Headline/Description unwritten).
     _TAB_MOTION_ADS: 1500.0,
+    # hook_card: up to 5 parallel image-gens + N Ken Burns + concat + final
+    # assembly, all on Rendi. No Seedance (Ken Burns is CPU-cheap ffmpeg), but
+    # the extra Rendi round-trips can queue on a shared account — 20 min ample.
+    _TAB_HOOK_CARD: 1200.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -138,6 +145,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_AVATAR: SETTING_ROW_TIMEOUT_CARTOON,
     # motion_ads reuses the image_vo timeout — same shape (heavy image + video).
     _TAB_MOTION_ADS: SETTING_ROW_TIMEOUT_IMAGE_VO,
+    # hook_card reuses the image_vo timeout — heavy image gen + Rendi assembly.
+    _TAB_HOOK_CARD: SETTING_ROW_TIMEOUT_IMAGE_VO,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -276,6 +285,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_AVATAR
     if isinstance(row, MotionAdsRow):
         return _TAB_MOTION_ADS
+    if isinstance(row, HookCardRow):
+        return _TAB_HOOK_CARD
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -385,6 +396,8 @@ async def _dispatch_to_processor(
         return await process_avatar_row(row, clients, job_id=job_id)
     if isinstance(row, MotionAdsRow):
         return await process_motion_ads_row(row, clients, job_id=job_id)
+    if isinstance(row, HookCardRow):
+        return await process_hook_card_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):

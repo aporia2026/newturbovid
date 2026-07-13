@@ -21,6 +21,7 @@ const TAB_SIMPLE_X4 = 'simple_x4';
 const TAB_TEXT_ON_IMG = 'text_on_img';
 const TAB_AVATAR = 'avatar';
 const TAB_MOTION_ADS = 'motion_ads';
+const TAB_HOOK_CARD = 'hook_card';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -210,6 +211,20 @@ const MOTION_ADS_COLS = {
   lastInputCol: 9,
 };
 
+// Hook_Card layout: Country / Vertical / Article / Num of Images / Text, then
+// FIVE Manual Image columns, then Change Size / Open Comments, then ONE Ready
+// Video. Read BY HEADER NAME (mirrors motion_ads) so inserting/moving columns
+// can't corrupt the read; these positional values are the fallback.
+const HOOK_CARD_COLS = {
+  country: 1, vertical: 2, article: 3,
+  numImages: 4, text: 5,
+  manualImage1: 6, manualImage2: 7, manualImage3: 8,
+  manualImage4: 9, manualImage5: 10,
+  aspectRatio: 11, openComments: 12,
+  readyVideo1: 13,
+  lastInputCol: 12,
+};
+
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
 const SIMPLE_X4_HEADER_ROW = 2;     // column names (frozen)
@@ -284,6 +299,13 @@ function _detectTabType(sheet) {
   if (name.indexOf('motion_ads') !== -1 || name.indexOf('motion ads') !== -1
       || name.indexOf('motion-ads') !== -1) {
     return TAB_MOTION_ADS;
+  }
+  // "Hook_Card" -> 9:16 hook-box slideshow + background music, no voiceover
+  // (2026-07-13). The name has no "simple"/"cartoon", so order vs those is
+  // moot; kept up top with the other name detections.
+  if (name.indexOf('hook_card') !== -1 || name.indexOf('hook card') !== -1
+      || name.indexOf('hook-card') !== -1) {
+    return TAB_HOOK_CARD;
   }
   // "paste text on img" -> manual image + center-overlay text (2026-06-09).
   // Checked BEFORE "simple" because the name doesn't contain "simple" — but
@@ -565,6 +587,51 @@ function _readMotionAdsRow(sheet, rowNum) {
 }
 
 
+function _readHookCardRow(sheet, rowNum) {
+  // Hook_Card: Country / Vertical / Article / Num of Images / Text, then FIVE
+  // Manual Image columns, then Change Size / Open Comments. Resolved by HEADER
+  // NAME first (mirrors _readMotionAdsRow) so inserting/moving columns can't
+  // corrupt the read; HOOK_CARD_COLS is the positional fallback. Filled Manual
+  // Image cells become the scenes; all blank -> the backend generates Num of
+  // Images realistic images. Only the article is required (see validate).
+  const cols = HOOK_CARD_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cNumImages    = _colForHeaders(headerMap, ['Num of Images', 'Number of Images', 'Num Images'], cols.numImages);
+  const cText         = _colForHeaders(headerMap, ['Text'], cols.text);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  const manualImageUrls = [
+    _colForHeaders(headerMap, ['Manual Image 1'], cols.manualImage1),
+    _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2),
+    _colForHeaders(headerMap, ['Manual Image 3'], cols.manualImage3),
+    _colForHeaders(headerMap, ['Manual Image 4'], cols.manualImage4),
+    _colForHeaders(headerMap, ['Manual Image 5'], cols.manualImage5),
+  ].map(function (c) { return _cell(values, c); })
+   .filter(function (u) { return !!u; });
+
+  const numImages = Math.max(1, Math.min(5, parseInt(_cell(values, cNumImages), 10) || 1));
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    num_images: numImages,
+    text: _cell(values, cText),
+    manual_image_urls: manualImageUrls,
+    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
 function _readYtCartoonRow(sheet, rowNum) {
   // yt-cartoon: cartoon inputs PLUS four new knobs (Tone, Cap Position, CTA
   // Position, Vid Length). Every column is resolved by HEADER NAME first
@@ -761,6 +828,18 @@ function _validateMotionAds(r) {
 }
 
 
+function _validateHookCard(r) {
+  // The article is required whenever the backend must GENERATE something: a
+  // blank Text needs it for the hook, and no Manual Images needs it for the
+  // scenes. A row that supplies BOTH the Text and >=1 Manual Image needs none.
+  if (!r.article_url) {
+    if (!r.text) return 'article URL missing (needed to write the hook)';
+    if (!r.manual_image_urls.length) return 'article URL missing (needed to generate images)';
+  }
+  return null;
+}
+
+
 function _validateYtCartoon(r) {
   // Same as cartoon — only the article is required. The four knob columns are
   // optional (blank = defaults) and coerced server-side.
@@ -899,6 +978,7 @@ function generateAllUnprocessed() {
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
     : tabType === TAB_AVATAR ? AVATAR_COLS
     : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
+    : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -928,6 +1008,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
     : tabType === TAB_AVATAR ? _readAvatarRow
     : tabType === TAB_MOTION_ADS ? _readMotionAdsRow
+    : tabType === TAB_HOOK_CARD ? _readHookCardRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
@@ -937,6 +1018,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
     : tabType === TAB_AVATAR ? _validateAvatar
     : tabType === TAB_MOTION_ADS ? _validateMotionAds
+    : tabType === TAB_HOOK_CARD ? _validateHookCard
     : _validateImageVO;
 
   let rows = [];
@@ -969,6 +1051,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
       : tabType === TAB_AVATAR ? AVATAR_COLS
       : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
+      : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -1014,6 +1097,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_TEXT_ON_IMG) payload.rows_text_on_img = rows;
   else if (tabType === TAB_AVATAR) payload.rows_avatar = rows;
   else if (tabType === TAB_MOTION_ADS) payload.rows_motion_ads = rows;
+  else if (tabType === TAB_HOOK_CARD) payload.rows_hook_card = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);
@@ -1491,7 +1575,8 @@ function applyOpenCommentsTips() {
   SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
     var tabType = _detectTabType(sheet);
     // No voiceover on these tabs, so the "use this script:" marker does nothing.
-    if (tabType === TAB_TEXT_ON_IMG || tabType === TAB_MOTION_ADS) return;
+    if (tabType === TAB_TEXT_ON_IMG || tabType === TAB_MOTION_ADS
+        || tabType === TAB_HOOK_CARD) return;
     // Headers sit on row 1 everywhere except migrated simple_x4 tabs, where
     // row 1 is the template-preview band and row 2 holds them (mirrors
     // applySizeDropdowns).
@@ -1702,7 +1787,8 @@ function _rowCountForPayload_(payload) {
   return (payload.rows_image_vo || payload.rows_four_images
     || payload.rows_simple || payload.rows_cartoon || payload.rows_yt_cartoon
     || payload.rows_simple_x4 || payload.rows_text_on_img
-    || payload.rows_avatar || payload.rows_motion_ads || []).length;
+    || payload.rows_avatar || payload.rows_motion_ads
+    || payload.rows_hook_card || []).length;
 }
 
 

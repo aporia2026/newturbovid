@@ -1207,3 +1207,130 @@ def render_card_bytes(
         bytes_out=len(data),
     )
     return data
+
+
+# ── Hook-card overlay (hook_card tab) ────────────────────────────────────────
+#
+# The hook_card tab burns a fixed lower-third "hook" box over a moving
+# slideshow. Unlike the templates above (which composite text onto a still
+# background), this renders ONLY the box + text onto a fully transparent RGBA
+# canvas the size of the video frame, so Rendi can overlay it on the finished
+# slideshow. Reuses the same per-script font routing + auto-fit + wrap
+# machinery so a localized, multi-script hook stays legible and never
+# overflows. Plan: ``_plans/2026-07-13-hook-card-tab.md``.
+
+# ~65% black box, opaque white text — matches the reference creatives.
+_HOOK_BOX_RGBA: Final[tuple[int, int, int, int]] = (0, 0, 0, 165)
+_HOOK_TEXT_RGBA: Final[tuple[int, int, int, int]] = (255, 255, 255, 255)
+# Box vertical center as a fraction of frame height (lower third).
+_HOOK_BOX_CENTER_FRAC: Final[float] = 0.70
+
+
+def _empty_rgba_png(width: int, height: int) -> bytes:
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    try:
+        out = io.BytesIO()
+        canvas.save(out, format="PNG")
+        return out.getvalue()
+    finally:
+        canvas.close()
+
+
+def render_hook_overlay_bytes(
+    *,
+    text: str,
+    width: int,
+    height: int,
+    font_override: str | None = None,
+) -> bytes:
+    """Render the hook_card overlay PNG.
+
+    Returns a transparent RGBA PNG the size of the video frame, empty except
+    for a lower-third semi-transparent rounded box holding ``text`` as
+    centered bold white auto-fit wrapped lines. The box hugs the fitted text
+    block. Empty ``text`` yields a fully transparent frame (no box) so the
+    caller can overlay unconditionally.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"width and height must be positive (got {width}x{height})")
+
+    text = (text or "").strip()
+    if not text:
+        return _empty_rgba_png(width, height)
+
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    side_pad = int(width * 0.05)     # inner box padding, left/right
+    top_pad = int(width * 0.04)      # inner box padding, top/bottom
+    radius = int(width * 0.04)
+    # Wider text column than the templates so a typical hook lands on ~3 lines
+    # like the reference (the box hugs the fitted text, up to this width).
+    max_text_w = int(width * 0.88) - side_pad * 2
+
+    font, lines = _fit_title_font(
+        draw,
+        text,
+        max_text_w,
+        int(height * 0.40),
+        max_lines=4,
+        initial_size=int(width * 0.075),
+        min_size=max(14, int(width * 0.042)),
+        font_override=font_override,
+    )
+    if not lines:
+        canvas.close()
+        return _empty_rgba_png(width, height)
+
+    line_heights = [
+        draw.textbbox((0, 0), ln or " ", font=font)[3]
+        - draw.textbbox((0, 0), ln or " ", font=font)[1]
+        for ln in lines
+    ]
+    line_spacing = int(getattr(font, "size", 16) * 0.22)
+    block_h = sum(line_heights) + line_spacing * (len(lines) - 1)
+    text_w = max(
+        draw.textbbox((0, 0), ln, font=font)[2]
+        - draw.textbbox((0, 0), ln, font=font)[0]
+        for ln in lines
+    )
+
+    box_w = int(text_w) + side_pad * 2
+    box_h = block_h + top_pad * 2
+    cx = width // 2
+    cy = int(height * _HOOK_BOX_CENTER_FRAC)
+    # Keep the whole box inside a safe margin (never off the top/bottom edge).
+    top = min(max(cy - box_h // 2, int(height * 0.08)), int(height * 0.92) - box_h)
+    left = cx - box_w // 2
+
+    draw.rounded_rectangle(
+        (left, top, left + box_w, top + box_h),
+        radius=radius,
+        fill=_HOOK_BOX_RGBA,
+    )
+
+    y = top + top_pad
+    for ln, lh in zip(lines, line_heights, strict=True):
+        bbox = draw.textbbox((0, 0), ln, font=font)
+        tw = bbox[2] - bbox[0]
+        tx = cx - tw // 2 - bbox[0]
+        ty = y - bbox[1]
+        draw.text((tx, ty), ln, fill=_HOOK_TEXT_RGBA, font=font)
+        y += lh + line_spacing
+
+    try:
+        out = io.BytesIO()
+        canvas.save(out, format="PNG", optimize=True)
+        data = out.getvalue()
+    finally:
+        canvas.close()
+
+    _log.info(
+        "hook_overlay_render_done",
+        width=width,
+        height=height,
+        lines=len(lines),
+        font_size=getattr(font, "size", None),
+        bytes_out=len(data),
+    )
+    return data

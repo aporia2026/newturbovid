@@ -577,6 +577,77 @@ def render_cartoon_concat_command(
     return f'{inputs}-filter_complex "{graph}" {maps}{codecs}{{{{out_1}}}}'
 
 
+# ── Hook card (hook_card tab) ────────────────────────────────────────────────
+#
+# Ken Burns still -> silent clip: the source is supersampled (so zoompan's
+# integer-rounded sub-pixel steps stay smooth — the default form shudders),
+# cover-cropped to the target aspect, then slowly zoomed via a LINEAR ramp on
+# the output frame index ``on`` (the accumulating ``zoom+step`` form drifts and
+# jitters). ``d`` + ``-frames:v`` pin the exact frame count so the clip is
+# exactly ``seconds`` long. No audio. Plan: _plans/2026-07-13-hook-card-tab.md.
+_KEN_BURNS_TEMPLATE = (
+    "-loop 1 -i {{in_1}} "
+    '-vf "scale=__SSW__:__SSH__:force_original_aspect_ratio=increase,'
+    "crop=__SSW__:__SSH__,"
+    "zoompan=z='__ZEXPR__':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+    'd=__FRAMES__:s=__W__x__H__:fps=__FPS__,setsar=1,format=yuv420p" '
+    "-frames:v __FRAMES__ -c:v libx264 -crf 20 -pix_fmt yuv420p -r __FPS__ "
+    "-an {{out_1}}"
+)
+
+# Burn the hook overlay PNG on a SILENT video AND set a music track as its only
+# audio, in one command. in_1 = silent slideshow, in_2 = music, in_3 = overlay
+# PNG (same frame size). ``-shortest`` ends output when the slideshow ends; the
+# bundled tracks are always longer, so the music is trimmed, never padded. The
+# existing _MUSIC_MIX_TEMPLATE can't be reused here — it ``amix``es two audio
+# streams and the slideshow has none.
+_OVERLAY_AND_MUSIC_TEMPLATE = (
+    "-i {{in_1}} -i {{in_2}} -i {{in_3}} "
+    '-filter_complex "[0:v][2:v]overlay=0:0[v]" '
+    '-map "[v]" -map 1:a '
+    "-c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest {{out_1}}"
+)
+
+# Supersample factor, output fps, and total zoom travel (1.00 -> 1.12) for the
+# Ken Burns push. Tunable; 3x keeps a 1080-wide frame smooth without a huge
+# intermediate.
+_KEN_BURNS_SUPERSAMPLE = 3
+_KEN_BURNS_FPS = 30
+_KEN_BURNS_ZOOM = 0.12
+
+
+def render_ken_burns_command(
+    width: int,
+    height: int,
+    seconds: float,
+    *,
+    zoom_in: bool = True,
+    fps: int = _KEN_BURNS_FPS,
+) -> str:
+    """Ken Burns one still into a smooth silent clip of ``seconds`` at
+    ``width`` x ``height``. ``zoom_in`` pushes in; otherwise it pulls out."""
+    frames = max(1, round(seconds * fps))
+    denom = max(1, frames - 1)
+    if zoom_in:
+        zexpr = f"1.0+{_KEN_BURNS_ZOOM}*on/{denom}"
+    else:
+        zexpr = f"{1.0 + _KEN_BURNS_ZOOM:.2f}-{_KEN_BURNS_ZOOM}*on/{denom}"
+    return (
+        _KEN_BURNS_TEMPLATE
+        .replace("__SSW__", str(width * _KEN_BURNS_SUPERSAMPLE))
+        .replace("__SSH__", str(height * _KEN_BURNS_SUPERSAMPLE))
+        .replace("__ZEXPR__", zexpr)
+        .replace("__FRAMES__", str(frames))
+        .replace("__W__", str(width))
+        .replace("__H__", str(height))
+        .replace("__FPS__", str(fps))
+    )
+
+
+def render_overlay_and_music_command() -> str:
+    return _OVERLAY_AND_MUSIC_TEMPLATE
+
+
 # ── Result ───────────────────────────────────────────────────────────────────
 
 
@@ -1085,6 +1156,63 @@ class RendiClient:
         url, command_id = await self._submit_and_poll(
             command,
             inputs,
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    # ── Hook card ──────────────────────────────────────────────────────────
+
+    async def ken_burns_clip(
+        self,
+        image_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        aspect_ratio: str = "9:16",
+        seconds: float,
+        zoom_in: bool = True,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Ken Burns one image into a SILENT clip of ``seconds`` at
+        ``aspect_ratio``.
+
+        Supersampled + linear zoom so the slow push is smooth (no zoompan
+        jitter). Used by the hook_card slideshow, one clip per scene.
+        Auto-retried.
+        """
+        width, height = dimensions_for_ratio(aspect_ratio)
+        url, command_id = await self._submit_and_poll(
+            render_ken_burns_command(width, height, seconds, zoom_in=zoom_in),
+            {"in_1": image_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def overlay_and_add_music(
+        self,
+        video_url: str,
+        overlay_url: str,
+        music_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Burn a transparent overlay PNG onto a SILENT video and set
+        ``music_url`` as its only audio track, in one command.
+
+        ``video_url`` is the silent hook_card slideshow, ``overlay_url`` the
+        lower-third hook box PNG (same frame size), ``music_url`` a bundled
+        track longer than the video (``-shortest`` trims it to the video
+        length). Used by the hook_card tab's final assembly step. Auto-retried.
+        """
+        url, command_id = await self._submit_and_poll(
+            render_overlay_and_music_command(),
+            {"in_1": video_url, "in_2": music_url, "in_3": overlay_url},
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,
