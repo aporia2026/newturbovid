@@ -2,12 +2,15 @@
 
 The hook_card video plays a royalty-free instrumental under the slideshow.
 Tracks live in ``src/bulkvid/assets/music/`` and are named ``<name>_<n>.mp3``
-where ``<name>`` is a short 1-2 word label the operator picks in the sheet's
-Music column (col F) and ``<n>`` is the variation. Selection:
+where ``<name>`` is a short 1-2 word style label and ``<n>`` is the variation.
+The sheet's Music column (col F) selects one:
 
-  - Music cell filled  -> play a track whose name matches (a random variation
-    of that name; a name with no match falls back to a random track).
-  - Music cell blank    -> play a random track from the whole pool.
+  - ``"Uplifting 2"`` (name + variation) -> that exact track.
+  - ``"Uplifting"``   (name only)        -> a random variation of that style.
+  - blank                                 -> a random track from the whole pool.
+
+An unknown name (typo) also falls back to a random track. Name matching is
+case- and separator-insensitive ("Lo-Fi" / "lo fi" / "lofi" all match).
 
 The pool is generated once with ``tools/generate_hook_card_music.py`` (Suno via
 kie.ai) — instrumental, no vocals. See the folder README for the licensing note.
@@ -38,18 +41,40 @@ _CONTENT_TYPES = {
     ".ogg": "audio/ogg",
     ".opus": "audio/opus",
 }
-_VARIATION_RE = re.compile(r"_\d+$")
+# Trailing ``_<n>`` on a file stem (uplifting_2 -> variation 2, base "uplifting").
+_FILE_VARIATION_RE = re.compile(r"_(\d+)$")
+# Trailing variation on a REQUEST value, allowing a space/underscore/hyphen or
+# nothing before the number ("Uplifting 2", "uplifting_2", "Uplifting2").
+_REQUEST_VARIATION_RE = re.compile(r"[ _-]?(\d+)$")
 
 
 def _name_key(text: str) -> str:
-    """Normalize a track name for matching: lowercase alphanumerics only, so
+    """Normalize a name for matching: lowercase alphanumerics only, so
     ``"Lo-Fi"``, ``"lo fi"`` and ``"lofi"`` all collapse to the same key."""
     return "".join(ch for ch in (text or "").lower() if ch.isalnum())
 
 
 def _base_name(path: Path) -> str:
-    """The display name of a track file, minus the ``_<n>`` variation suffix."""
-    return _VARIATION_RE.sub("", path.stem)
+    """The style name of a track file, minus the ``_<n>`` variation suffix."""
+    return _FILE_VARIATION_RE.sub("", path.stem)
+
+
+def _file_variation(path: Path) -> int | None:
+    m = _FILE_VARIATION_RE.search(path.stem)
+    return int(m.group(1)) if m else None
+
+
+def _parse_request(text: str) -> tuple[str, int | None]:
+    """Split a Music value into ``(name key, variation or None)``.
+
+    ``"Uplifting 2"`` -> ``("uplifting", 2)``; ``"Uplifting"`` ->
+    ``("uplifting", None)``; ``""`` -> ``("", None)``.
+    """
+    t = (text or "").strip()
+    m = _REQUEST_VARIATION_RE.search(t)
+    if m:
+        return _name_key(t[: m.start()]), int(m.group(1))
+    return _name_key(t), None
 
 
 def list_tracks() -> list[Path]:
@@ -64,7 +89,7 @@ def list_tracks() -> list[Path]:
 
 
 def track_names() -> list[str]:
-    """Distinct pickable track names (first-seen spelling wins), sorted."""
+    """Distinct style names (first-seen spelling wins), sorted."""
     seen: dict[str, str] = {}
     for p in list_tracks():
         base = _base_name(p)
@@ -72,24 +97,40 @@ def track_names() -> list[str]:
     return sorted(seen.values(), key=str.lower)
 
 
-def select_track(name: str | None = None, *, rng: random.Random | None = None) -> Path | None:
-    """Pick a bundled track.
+def track_choices() -> list[str]:
+    """Every pickable value — each track as ``"<Name> <n>"`` (title-cased) —
+    so the sheet dropdown can be kept in sync with the actual files."""
+    out: list[str] = []
+    for p in list_tracks():
+        base = _base_name(p)
+        label = base[:1].upper() + base[1:]
+        v = _file_variation(p)
+        out.append(f"{label} {v}" if v is not None else label)
+    return out
 
-    ``name`` given -> a random variation of the track with that name; if no
-    track matches, fall back to a random track (a typo still yields music).
-    ``name`` blank/None -> a random track from the whole pool. Returns None when
-    no tracks are bundled.
+
+def select_track(name: str | None = None, *, rng: random.Random | None = None) -> Path | None:
+    """Pick a bundled track for a Music-column value.
+
+    ``"<name> <n>"`` -> that exact variation; ``"<name>"`` -> a random variation
+    of that style; blank/None -> a random track from the whole pool. An unknown
+    name, or a variation that does not exist, falls back to a random choice.
+    Returns None when no tracks are bundled.
     """
     tracks = list_tracks()
     if not tracks:
         _log.warning("hook_card_music_empty", music_dir=str(MUSIC_DIR))
         return None
     chooser = rng or random
-    wanted = _name_key(name or "")
-    if wanted:
-        matching = [p for p in tracks if _name_key(_base_name(p)) == wanted]
-        if matching:
-            return chooser.choice(matching)
+    key, variation = _parse_request(name or "")
+    if key:
+        by_name = [p for p in tracks if _name_key(_base_name(p)) == key]
+        if by_name:
+            if variation is not None:
+                exact = [p for p in by_name if _file_variation(p) == variation]
+                if exact:
+                    return exact[0]
+            return chooser.choice(by_name)    # name only, or no such variation
         _log.warning("hook_card_music_name_not_found", requested=name)
     return chooser.choice(tracks)
 

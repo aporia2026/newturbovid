@@ -450,3 +450,35 @@ def test_select_track_empty_pool_returns_none(monkeypatch, tmp_path) -> None:
     empty.mkdir()
     monkeypatch.setattr(hcm, "MUSIC_DIR", empty)
     assert hcm.select_track("Uplifting") is None
+
+
+def test_select_track_exact_variation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        hcm, "MUSIC_DIR",
+        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
+    )
+    assert hcm.select_track("Uplifting 2").name == "uplifting_2.mp3"
+    assert hcm.select_track("Uplifting 1").name == "uplifting_1.mp3"
+
+
+def test_select_track_variation_underscore_form(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3"])
+    )
+    assert hcm.select_track("uplifting_2").name == "uplifting_2.mp3"
+
+
+def test_select_track_missing_variation_falls_back_within_name(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3"]))
+    # Asked for variation 2 but only 1 exists -> still an uplifting track.
+    assert hcm.select_track("Uplifting 2", rng=random.Random(0)).name == "uplifting_1.mp3"
+
+
+def test_track_choices_labels_each_variation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        hcm, "MUSIC_DIR",
+        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
+    )
+    assert hcm.track_choices() == ["Piano 1", "Uplifting 1", "Uplifting 2"]
