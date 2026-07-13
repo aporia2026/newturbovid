@@ -211,19 +211,35 @@ const MOTION_ADS_COLS = {
   lastInputCol: 9,
 };
 
-// Hook_Card layout: Country / Vertical / Article / Num of Images / Text, then
-// FIVE Manual Image columns, then Change Size / Open Comments, then ONE Ready
-// Video. Read BY HEADER NAME (mirrors motion_ads) so inserting/moving columns
-// can't corrupt the read; these positional values are the fallback.
+// Hook_Card layout: Country / Vertical / Article / Num of Images / Text /
+// Music, then FIVE Manual Image columns, then Change Size / Open Comments,
+// then ONE Ready Video. Read BY HEADER NAME (mirrors motion_ads) so
+// inserting/moving columns can't corrupt the read; these positional values are
+// the fallback.
 const HOOK_CARD_COLS = {
   country: 1, vertical: 2, article: 3,
-  numImages: 4, text: 5,
-  manualImage1: 6, manualImage2: 7, manualImage3: 8,
-  manualImage4: 9, manualImage5: 10,
-  aspectRatio: 11, openComments: 12,
-  readyVideo1: 13,
-  lastInputCol: 12,
+  numImages: 4, text: 5, music: 6,
+  manualImage1: 7, manualImage2: 8, manualImage3: 9,
+  manualImage4: 10, manualImage5: 11,
+  aspectRatio: 12, openComments: 13,
+  readyVideo1: 14,
+  lastInputCol: 13,
 };
+
+// Pickable names for the Music column (col F) dropdown. MUST match the track
+// file names produced by tools/generate_hook_card_music.py (a blank cell = a
+// random track). Applied via applyHookCardMusicDropdown().
+const HOOK_CARD_MUSIC_NAMES = [
+  'Uplifting', 'Cinematic', 'Piano', 'Lofi', 'Acoustic',
+  'Energetic', 'Ambient', 'Electronic', 'Indie',
+];
+
+// Base URL for the music-preview players. The tracks live in the HF Space repo
+// (LFS) and are served by HuggingFace's resolver (302 → CDN), exactly like the
+// card-template previews above. Only resolves once the tracks are deployed
+// (git push hf main). File names: <name-lowercased>_1.mp3 / _2.mp3.
+const HOOK_CARD_MUSIC_BASE_URL =
+  'https://huggingface.co/spaces/yoavaporia/aporia-bulkvid/resolve/main/src/bulkvid/assets/music/';
 
 // Row indices for the post-migration simple_x4 layout.
 const SIMPLE_X4_PREVIEW_ROW = 1;    // template preview images (frozen)
@@ -247,6 +263,8 @@ function onOpen() {
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
     .addItem('Apply Motion_Ads dropdowns', 'applyMotionAdsDropdowns')
+    .addItem('Apply Hook_Card music dropdown', 'applyHookCardMusicDropdown')
+    .addItem('Preview Hook_Card music…', 'showHookCardMusicPreview')
     .addItem('Add "use this script" tips', 'applyOpenCommentsTips')
     .addItem('Configure backend URL', 'configureBackendUrl')
     .addToUi();
@@ -604,6 +622,7 @@ function _readHookCardRow(sheet, rowNum) {
   const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
   const cNumImages    = _colForHeaders(headerMap, ['Num of Images', 'Number of Images', 'Num Images'], cols.numImages);
   const cText         = _colForHeaders(headerMap, ['Text'], cols.text);
+  const cMusic        = _colForHeaders(headerMap, ['Music'], cols.music);
   const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
   const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
 
@@ -625,6 +644,7 @@ function _readHookCardRow(sheet, rowNum) {
     article_url: _cell(values, cArticle),
     num_images: numImages,
     text: _cell(values, cText),
+    music: _cell(values, cMusic),
     manual_image_urls: manualImageUrls,
     aspect_ratio: _cell(values, cAspectRatio) || '9:16',
     open_comments: _cell(values, cOpenComments),
@@ -1507,6 +1527,83 @@ function applyYtCartoonDropdowns() {
       : 'No yt-cartoon tab found. Name a tab "yt-cartoon" and re-run.',
     ui.ButtonSet.OK
   );
+}
+
+
+// ─── Hook_Card music dropdown ───────────────────────────────────────────────
+
+/** One-shot: (re)apply the Music dropdown on every Hook_Card tab. Resolves the
+ *  Music column BY HEADER NAME (positional fallback = col F) so it follows the
+ *  header wherever it sits. Non-strict: a blank cell = a random track, and a
+ *  stray value falls back to random server-side. Keep HOOK_CARD_MUSIC_NAMES in
+ *  sync with tools/generate_hook_card_music.py. */
+function applyHookCardMusicDropdown() {
+  const ui = SpreadsheetApp.getUi();
+  const updated = [];
+  SpreadsheetApp.getActive().getSheets().forEach(function (sheet) {
+    if (_detectTabType(sheet) !== TAB_HOOK_CARD) return;
+    const headerMap = _buildHeaderColMap(sheet);
+    const firstData = 2;
+    const maxRow = sheet.getMaxRows();
+    if (maxRow < firstData) return;
+    const col = _colForHeaders(headerMap, ['Music'], HOOK_CARD_COLS.music);
+    if (!col) return;
+    const validation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(HOOK_CARD_MUSIC_NAMES, true)
+      .setAllowInvalid(true)    // blank = random; unknown value = random server-side
+      .setHelpText('Pick a background track, or leave blank for a random one.')
+      .build();
+    sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
+      .setDataValidation(validation);
+    updated.push(sheet.getName());
+  });
+
+  ui.alert(
+    'Hook_Card music dropdown',
+    updated.length
+      ? 'Applied to:\n\n• ' + updated.join('\n• ')
+      : 'No Hook_Card tab found. Name a tab to contain "hook card" and re-run.',
+    ui.ButtonSet.OK
+  );
+}
+
+
+/** Open an audition panel: every pickable Music name with inline players for
+ *  its two variations, so the operator chooses BY EAR and then types/picks the
+ *  name in the Music column (blank = random). Audio streams from the deployed
+ *  HF Space, so a track only plays once it has been pushed (git push hf main);
+ *  before that the players show but won't load. Names come from
+ *  HOOK_CARD_MUSIC_NAMES so this panel always matches the dropdown. */
+function showHookCardMusicPreview() {
+  const rowsHtml = HOOK_CARD_MUSIC_NAMES.map(function (name) {
+    const slug = String(name).toLowerCase();
+    const u1 = HOOK_CARD_MUSIC_BASE_URL + slug + '_1.mp3';
+    const u2 = HOOK_CARD_MUSIC_BASE_URL + slug + '_2.mp3';
+    return '<div class="row"><div class="name">' + name + '</div>' +
+      '<div class="players">' +
+      '<audio controls preload="none" src="' + u1 + '"></audio>' +
+      '<audio controls preload="none" src="' + u2 + '"></audio>' +
+      '</div></div>';
+  }).join('');
+
+  const html = '<!DOCTYPE html><html><head><base target="_top"><style>' +
+    'body{font-family:Arial,Helvetica,sans-serif;margin:0;padding:14px;color:#222}' +
+    'h3{margin:0 0 4px}' +
+    '.hint{color:#666;font-size:12px;margin:0 0 12px;line-height:1.4}' +
+    '.row{display:flex;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #eee}' +
+    '.name{width:92px;font-weight:bold;flex:0 0 auto}' +
+    '.players{display:flex;gap:8px;flex-wrap:wrap}' +
+    'audio{height:32px}' +
+    '</style></head><body>' +
+    '<h3>Hook_Card music</h3>' +
+    '<p class="hint">Preview each track, then type or pick its name in the Music ' +
+    'column (leave blank for a random track). Each name has two variations; the ' +
+    'video plays one at random.</p>' +
+    rowsHtml +
+    '</body></html>';
+
+  const out = HtmlService.createHtmlOutput(html).setWidth(520).setHeight(470);
+  SpreadsheetApp.getUi().showModalDialog(out, 'Hook_Card music preview');
 }
 
 

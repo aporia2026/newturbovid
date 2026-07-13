@@ -135,6 +135,7 @@ async def process_hook_card_row(
         "num_images": row.num_images,
         "manual_images": len(manual),
         "text_provided": bool(hook_text),
+        "music_requested": row.music or None,
         "tab": "hook_card",
     }
 
@@ -313,7 +314,7 @@ async def process_hook_card_row(
 
         # ─── Stage 6: overlay hook + set music (silent overlay if no track) ───
         try:
-            track = select_track(row.row_num)
+            track = select_track(row.music)    # named track, or random when blank
             if track is not None:
                 mu = await clients.storage.upload_bytes(
                     track.read_bytes(),
