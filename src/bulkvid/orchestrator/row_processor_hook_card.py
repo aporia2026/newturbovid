@@ -149,9 +149,14 @@ def _music_label(track: Path | None) -> str:
 def _video_name(
     country: str, vertical: str, language: str, track: Path | None, row_num: int
 ) -> str:
-    """``Country-Vertical-<lang>-Music-RowNumber``, filename-safe."""
+    """``Country-Vertical-<lang>-Music-RowNumber``, filename-safe. A trailing
+    "PR" campaign tag on the vertical is dropped, e.g. "Shipping Container Homes
+    PR" -> "ShippingContainerHomes"."""
     c = re.sub(r"[^A-Za-z0-9]", "", country) or "XX"
-    v = "".join(w.capitalize() for w in re.findall(r"[A-Za-z0-9]+", vertical)) or "Video"
+    words = re.findall(r"[A-Za-z0-9]+", vertical)
+    if words and words[-1].lower() == "pr":
+        words = words[:-1]
+    v = "".join(w.capitalize() for w in words) or "Video"
     lang = re.sub(r"[^A-Za-z0-9]", "", (language or "xx").lower()) or "xx"
     return f"{c}-{v}-{lang}-{_music_label(track)}-{row_num}"
 

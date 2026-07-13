@@ -91,6 +91,9 @@ def test_music_label() -> None:
 def test_video_name() -> None:
     name = _video_name("SE", "Shipping Container Homes", "sv", None, 5)
     assert name == "SE-ShippingContainerHomes-sv-NoMusic-5"
+    # A trailing "PR" campaign tag is dropped from the vertical.
+    assert _video_name("SE", "Shipping Container Homes PR", "sv", None, 3) == \
+        "SE-ShippingContainerHomes-sv-NoMusic-3"
 
 
 # ── Overlay renderer ────────────────────────────────────────────────────────
