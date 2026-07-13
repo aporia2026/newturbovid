@@ -1532,6 +1532,20 @@ function applyYtCartoonDropdowns() {
 
 // ─── Hook_Card music dropdown ───────────────────────────────────────────────
 
+/** The pickable Music values: each style name x its 2 variations, e.g.
+ *  "Uplifting 2". Kept in sync with the generated tracks (<name>_1.mp3 /
+ *  _2.mp3). A bare style name (random variation) and a blank cell (random
+ *  track) also work — both handled server-side. */
+function _hookCardMusicChoices() {
+  const out = [];
+  HOOK_CARD_MUSIC_NAMES.forEach(function (name) {
+    out.push(name + ' 1');
+    out.push(name + ' 2');
+  });
+  return out;
+}
+
+
 /** One-shot: (re)apply the Music dropdown on every Hook_Card tab. Resolves the
  *  Music column BY HEADER NAME (positional fallback = col F) so it follows the
  *  header wherever it sits. Non-strict: a blank cell = a random track, and a
@@ -1549,9 +1563,10 @@ function applyHookCardMusicDropdown() {
     const col = _colForHeaders(headerMap, ['Music'], HOOK_CARD_COLS.music);
     if (!col) return;
     const validation = SpreadsheetApp.newDataValidation()
-      .requireValueInList(HOOK_CARD_MUSIC_NAMES, true)
-      .setAllowInvalid(true)    // blank = random; unknown value = random server-side
-      .setHelpText('Pick a background track, or leave blank for a random one.')
+      .requireValueInList(_hookCardMusicChoices(), true)
+      .setAllowInvalid(true)    // blank = random; a bare style name = random variation
+      .setHelpText('Pick a track (e.g. "Uplifting 2"), a style name for a random '
+        + 'variation, or leave blank for a random track.')
       .build();
     sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
       .setDataValidation(validation);
@@ -1577,13 +1592,12 @@ function applyHookCardMusicDropdown() {
 function showHookCardMusicPreview() {
   const rowsHtml = HOOK_CARD_MUSIC_NAMES.map(function (name) {
     const slug = String(name).toLowerCase();
-    const u1 = HOOK_CARD_MUSIC_BASE_URL + slug + '_1.mp3';
-    const u2 = HOOK_CARD_MUSIC_BASE_URL + slug + '_2.mp3';
-    return '<div class="row"><div class="name">' + name + '</div>' +
-      '<div class="players">' +
-      '<audio controls preload="none" src="' + u1 + '"></audio>' +
-      '<audio controls preload="none" src="' + u2 + '"></audio>' +
-      '</div></div>';
+    return [1, 2].map(function (v) {
+      const url = HOOK_CARD_MUSIC_BASE_URL + slug + '_' + v + '.mp3';
+      // The label IS the exact value to type in the Music column.
+      return '<div class="row"><div class="name">' + name + ' ' + v + '</div>' +
+        '<audio controls preload="none" src="' + url + '"></audio></div>';
+    }).join('');
   }).join('');
 
   const html = '<!DOCTYPE html><html><head><base target="_top"><style>' +
@@ -1591,18 +1605,17 @@ function showHookCardMusicPreview() {
     'h3{margin:0 0 4px}' +
     '.hint{color:#666;font-size:12px;margin:0 0 12px;line-height:1.4}' +
     '.row{display:flex;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #eee}' +
-    '.name{width:92px;font-weight:bold;flex:0 0 auto}' +
-    '.players{display:flex;gap:8px;flex-wrap:wrap}' +
+    '.name{width:108px;font-weight:bold;flex:0 0 auto}' +
     'audio{height:32px}' +
     '</style></head><body>' +
     '<h3>Hook_Card music</h3>' +
-    '<p class="hint">Preview each track, then type or pick its name in the Music ' +
-    'column (leave blank for a random track). Each name has two variations; the ' +
-    'video plays one at random.</p>' +
+    '<p class="hint">Each track is labelled with its exact name. Type that name ' +
+    'in the Music column (e.g. "Uplifting 2") to lock it in — or a bare style ' +
+    'name for a random variation, or leave the cell blank for a random track.</p>' +
     rowsHtml +
     '</body></html>';
 
-  const out = HtmlService.createHtmlOutput(html).setWidth(520).setHeight(470);
+  const out = HtmlService.createHtmlOutput(html).setWidth(520).setHeight(560);
   SpreadsheetApp.getUi().showModalDialog(out, 'Hook_Card music preview');
 }
 
