@@ -2,13 +2,14 @@
 
 All network calls mocked via respx. Covers:
   - html_to_text: strips script/style/tags, decodes entities, collapses whitespace
+  - extract_main_text: keeps prose, drops chrome, whole-page fallback
   - _truncate: respects word boundaries, no-op when under limit
-  - Tavily success path (Bearer header, /extract endpoint)
-  - Tavily error -> ScrapingBee fallback succeeds (with HTML stripped)
+  - ScrapingBee success path (HTML stripped to text)
+  - ScrapingBee fail -> free direct-HTTP fallback succeeds
   - Both fail -> ArticleFetchError
   - Invalid URL -> ArticleFetchError without any network call
   - max_chars truncation
-  - Constructor rejects when both keys empty
+  - Constructor rejects when the ScrapingBee key is empty
 """
 
 from __future__ import annotations
@@ -19,9 +20,7 @@ import respx
 
 from bulkvid.adapters.article_fetch import (
     COST_SCRAPINGBEE_REQUEST_USD,
-    COST_TAVILY_EXTRACT_USD,
     SCRAPINGBEE_BASE_URL,
-    TAVILY_BASE_URL,
     ArticleFetcher,
     ArticleFetchError,
     _truncate,
@@ -121,167 +120,86 @@ def test_truncate_hard_cut_when_no_space() -> None:
 # ── Constructor ─────────────────────────────────────────────────────────────
 
 
-def test_constructor_rejects_when_both_keys_empty() -> None:
+def test_constructor_rejects_when_key_empty() -> None:
     with pytest.raises(ValueError):
-        ArticleFetcher(tavily_api_key="", scrapingbee_api_key="")
+        ArticleFetcher(scrapingbee_api_key="")
 
 
-# ── Tavily happy path ──────────────────────────────────────────────────────
-
-
-@respx.mock
-async def test_tavily_success_returns_article() -> None:
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "url": "https://example.com/a",
-                        "raw_content": "Full article body about a topic.",
-                    }
-                ]
-            },
-        )
-    )
-    async with ArticleFetcher(tavily_api_key="tav_test_key") as fetcher:
-        result = await fetcher.fetch("https://example.com/a")
-    assert result.source == "tavily"
-    assert "Full article body" in result.content
-    assert result.cost_usd == COST_TAVILY_EXTRACT_USD
+# ── ScrapingBee happy path ──────────────────────────────────────────────────
 
 
 @respx.mock
-async def test_tavily_uses_bearer_auth() -> None:
-    captured: list[str] = []
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.headers.get("authorization", ""))
-        return httpx.Response(
-            200,
-            json={"results": [{"raw_content": "x"}]},
-        )
-
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(side_effect=_handler)
-    async with ArticleFetcher(tavily_api_key="tav_key") as fetcher:
-        await fetcher.fetch("https://example.com/a")
-    assert captured == ["Bearer tav_key"]
-
-
-@respx.mock
-async def test_tavily_legacy_content_field_also_accepted() -> None:
-    # Some Tavily versions return ``content`` instead of ``raw_content``.
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(
-        return_value=httpx.Response(
-            200,
-            json={"results": [{"content": "Older shape article."}]},
-        )
-    )
-    async with ArticleFetcher(tavily_api_key="tav") as fetcher:
-        result = await fetcher.fetch("https://example.com/x")
-    assert "Older shape article." in result.content
-
-
-# ── Tavily fail -> ScrapingBee fallback ─────────────────────────────────────
-
-
-@respx.mock
-async def test_tavily_failure_falls_back_to_scrapingbee() -> None:
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(
-        return_value=httpx.Response(500, text="server error")
-    )
+async def test_scrapingbee_success_returns_article() -> None:
     respx.get(SCRAPINGBEE_BASE_URL).mock(
         return_value=httpx.Response(
-            200,
-            text="<html><body><p>Real article content.</p></body></html>",
-        )
-    )
-    async with ArticleFetcher(
-        tavily_api_key="tav", scrapingbee_api_key="sb"
-    ) as fetcher:
-        result = await fetcher.fetch("https://example.com/blocked")
-    assert result.source == "scrapingbee"
-    assert "Real article content." in result.content
-    # Cost charged for BOTH attempts (Tavily attempt + ScrapingBee fallback).
-    assert result.cost_usd == COST_TAVILY_EXTRACT_USD + COST_SCRAPINGBEE_REQUEST_USD
-
-
-@respx.mock
-async def test_only_scrapingbee_configured_skips_tavily() -> None:
-    respx.get(SCRAPINGBEE_BASE_URL).mock(
-        return_value=httpx.Response(
-            200, text="<p>ScrapingBee-only content</p>"
+            200, text="<html><body><p>Full article body about a topic.</p></body></html>"
         )
     )
     async with ArticleFetcher(scrapingbee_api_key="sb") as fetcher:
         result = await fetcher.fetch("https://example.com/a")
     assert result.source == "scrapingbee"
+    assert "Full article body" in result.content
     assert result.cost_usd == COST_SCRAPINGBEE_REQUEST_USD
 
 
-# ── Both fail ───────────────────────────────────────────────────────────────
+@respx.mock
+async def test_scrapingbee_passes_api_key_and_render_flags() -> None:
+    captured: dict[str, str] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(200, text="<p>Article content here.</p>")
+
+    respx.get(SCRAPINGBEE_BASE_URL).mock(side_effect=_handler)
+    async with ArticleFetcher(scrapingbee_api_key="sb_key") as fetcher:
+        await fetcher.fetch("https://example.com/a")
+    assert captured["api_key"] == "sb_key"
+    assert captured["render_js"] == "true"
+    assert captured["url"] == "https://example.com/a"
+
+
+# ── ScrapingBee fail -> direct fallback ─────────────────────────────────────
 
 
 @respx.mock
-async def test_all_three_fail_raises_article_fetch_error() -> None:
-    # Tavily 500, ScrapingBee 500, AND the free direct-HTTP last resort 500.
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(
-        return_value=httpx.Response(500)
-    )
+async def test_scrapingbee_failure_falls_back_to_direct() -> None:
     respx.get(SCRAPINGBEE_BASE_URL).mock(return_value=httpx.Response(500))
-    respx.get("https://example.com/dead").mock(return_value=httpx.Response(500))
-    async with ArticleFetcher(
-        tavily_api_key="tav", scrapingbee_api_key="sb"
-    ) as fetcher:
-        with pytest.raises(ArticleFetchError):
-            await fetcher.fetch("https://example.com/dead")
-
-
-@respx.mock
-async def test_both_providers_fail_direct_fallback_succeeds() -> None:
-    # Tavily + ScrapingBee both down (e.g. Tavily account disabled, no working
-    # ScrapingBee) -> the free direct fetch pulls the page's paragraphs.
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(return_value=httpx.Response(402))
-    respx.get(SCRAPINGBEE_BASE_URL).mock(return_value=httpx.Response(500))
+    # Two substantial paragraphs push the joined prose past the 200-char
+    # paragraph-path threshold, so extraction keeps only the <p> prose and
+    # drops the nav/footer chrome (rather than whole-page-stripping).
     page = (
-        "<html><body><nav><a>Home</a><a>About</a></nav>"
+        "<html><body><nav><a>Home</a></nav>"
         "<p>This is the real article body paragraph, long enough to count as "
-        "genuine prose rather than a navigation label.</p>"
+        "genuine prose rather than a navigation label or a button.</p>"
         "<p>A second substantial paragraph continues the article with more "
-        "detail so the extractor keeps it too.</p>"
+        "detail so the extractor keeps it and skips the page chrome.</p>"
         "<footer><p>© 2026</p></footer></body></html>"
     )
     respx.get("https://example.com/story").mock(
         return_value=httpx.Response(200, text=page)
     )
-    async with ArticleFetcher(
-        tavily_api_key="tav", scrapingbee_api_key="sb"
-    ) as fetcher:
+    async with ArticleFetcher(scrapingbee_api_key="sb") as fetcher:
         result = await fetcher.fetch("https://example.com/story")
     assert result.source == "direct"
     assert "real article body paragraph" in result.content
     assert "second substantial paragraph" in result.content
     assert "Home" not in result.content and "© 2026" not in result.content
     # Direct fetch is free; ScrapingBee bills only on SUCCESS, so a 500 there
-    # adds nothing — only Tavily's always-billed attempt is charged.
-    assert result.cost_usd == COST_TAVILY_EXTRACT_USD
+    # adds nothing.
+    assert result.cost_usd == 0.0
+
+
+# ── Both fail ───────────────────────────────────────────────────────────────
 
 
 @respx.mock
-async def test_direct_fallback_when_no_provider_keys_configured() -> None:
-    # A deploy with a (present-but-dead) Tavily key and no ScrapingBee: the
-    # direct fetch still carries the row.
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(return_value=httpx.Response(402))
-    respx.get("https://example.com/only-direct").mock(
-        return_value=httpx.Response(
-            200,
-            text="<article><p>" + ("Solid article sentence. " * 5) + "</p></article>",
-        )
-    )
-    async with ArticleFetcher(tavily_api_key="tav") as fetcher:
-        result = await fetcher.fetch("https://example.com/only-direct")
-    assert result.source == "direct"
-    assert "Solid article sentence." in result.content
+async def test_both_paths_fail_raises_article_fetch_error() -> None:
+    # ScrapingBee 500 AND the free direct-HTTP last resort 500.
+    respx.get(SCRAPINGBEE_BASE_URL).mock(return_value=httpx.Response(500))
+    respx.get("https://example.com/dead").mock(return_value=httpx.Response(500))
+    async with ArticleFetcher(scrapingbee_api_key="sb") as fetcher:
+        with pytest.raises(ArticleFetchError):
+            await fetcher.fetch("https://example.com/dead")
 
 
 # ── Invalid URL ─────────────────────────────────────────────────────────────
@@ -289,7 +207,7 @@ async def test_direct_fallback_when_no_provider_keys_configured() -> None:
 
 @respx.mock
 async def test_invalid_url_rejected_without_network_call() -> None:
-    async with ArticleFetcher(tavily_api_key="tav") as fetcher:
+    async with ArticleFetcher(scrapingbee_api_key="sb") as fetcher:
         with pytest.raises(ArticleFetchError):
             await fetcher.fetch("not-a-url")
         with pytest.raises(ArticleFetchError):
@@ -306,12 +224,10 @@ async def test_invalid_url_rejected_without_network_call() -> None:
 @respx.mock
 async def test_max_chars_truncates_long_articles() -> None:
     long_content = " ".join(["word"] * 50_000)  # ~250k chars
-    respx.post(f"{TAVILY_BASE_URL}/extract").mock(
-        return_value=httpx.Response(
-            200, json={"results": [{"raw_content": long_content}]}
-        )
+    respx.get(SCRAPINGBEE_BASE_URL).mock(
+        return_value=httpx.Response(200, text=f"<p>{long_content}</p>")
     )
-    async with ArticleFetcher(tavily_api_key="tav", max_chars=200) as fetcher:
+    async with ArticleFetcher(scrapingbee_api_key="sb", max_chars=200) as fetcher:
         result = await fetcher.fetch("https://example.com/long")
     assert len(result.content) <= 200
     assert result.char_count == len(result.content)
@@ -321,5 +237,4 @@ async def test_max_chars_truncates_long_articles() -> None:
 
 
 def test_cost_constants_positive() -> None:
-    assert COST_TAVILY_EXTRACT_USD > 0
     assert COST_SCRAPINGBEE_REQUEST_USD > 0

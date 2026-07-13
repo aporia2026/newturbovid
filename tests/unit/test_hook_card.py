@@ -38,8 +38,8 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.queue import (
     TAB_HOOK_CARD,
-    _payload_to_row,
     _row_to_payload,
+    payload_to_row,
 )
 from bulkvid.orchestrator.row_processor_hook_card import (
     HC_TOTAL_SECONDS,
@@ -80,7 +80,10 @@ def test_payload_round_trip_hook_card() -> None:
     row = _row(text="Buy abandoned houses", manual_image_urls=["https://i/1.png"])
     payload = _row_to_payload(row, TAB_HOOK_CARD)
     assert '"__tab__": "hook_card"' in payload
-    restored = _payload_to_row(payload)
+    # Deserialize exactly as the worker does: JSON payload -> dict -> the LIVE
+    # ``payload_to_row`` (not a dead look-alike — see the motion_ads round-trip
+    # test for why testing the real function matters).
+    restored = payload_to_row(json.loads(payload))
     assert isinstance(restored, HookCardRow)
     assert restored == row
 

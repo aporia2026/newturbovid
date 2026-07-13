@@ -5,7 +5,7 @@ The "cartoon" tab does NO seed image. Per row it produces TWO independent
 over a short voiceover.
 
 Pipeline (plan _plans/2026-06-03-cartoon-mode.md):
-  1. Article fetch (Tavily -> ScrapingBee)
+  1. Article fetch (ScrapingBee -> direct)
   2. language detect -> classify Open Comments
   3. generate_cartoon_plan -> 2 ideas, each with a VO line + N scene/motion shots
   4. For EACH idea (concurrently), build one video:

@@ -73,7 +73,7 @@ def _build_clients(storage: _FakeStorageClient | None = None) -> PipelineClients
         tts=cast(Any, object()),    # never invoked by the image-only pipeline
         rendi=RendiClient(api_key="rendi-test", base_url=RENDI_BASE),
         storage=storage or _FakeStorageClient(),    # type: ignore[arg-type]
-        article=ArticleFetcher(tavily_api_key="tv-test", scrapingbee_api_key="sb-test"),
+        article=ArticleFetcher(scrapingbee_api_key="sb-test"),
         zapcap=ZapCapClient(api_key="zc-test", template_id="tpl", base_url=ZAPCAP_BASE),
     )
 

@@ -300,34 +300,6 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
     return SimpleX4Row(cards=cards, **data)
 
 
-def _payload_to_row(
-    payload_json: str,
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow:
-    data = json.loads(payload_json)
-    tab = data.pop("__tab__", TAB_IMAGE_VO)
-    if tab == TAB_FOUR_IMAGES:
-        return FourImagesVO2Row(**data)
-    if tab == TAB_SIMPLE:
-        return SimpleRow(**data)
-    if tab == TAB_SIMPLE_MOTION:
-        return SimpleMotionRow(**data)
-    if tab == TAB_CARTOON:
-        return CartoonRow(**data)
-    if tab == TAB_YT_CARTOON:
-        return YtCartoonRow(**data)
-    if tab == TAB_SIMPLE_X4:
-        return _hydrate_simple_x4(data)
-    if tab == TAB_TEXT_ON_IMG:
-        return TextOnImgRow(**data)
-    if tab == TAB_AVATAR:
-        return AvatarRow(**data)
-    if tab == TAB_MOTION_ADS:
-        return MotionAdsRow(**data)
-    if tab == TAB_HOOK_CARD:
-        return HookCardRow(**data)
-    return ImageVORow(**data)
-
-
 class JobQueue:
     """SQLite job queue. Synchronous methods; async wrappers via ``asyncio.to_thread``."""
 
@@ -1530,7 +1502,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -1549,4 +1521,8 @@ def payload_to_row(
         return TextOnImgRow(**payload)
     if tab == TAB_AVATAR:
         return AvatarRow(**payload)
+    if tab == TAB_MOTION_ADS:
+        return MotionAdsRow(**payload)
+    if tab == TAB_HOOK_CARD:
+        return HookCardRow(**payload)
     return ImageVORow(**payload)

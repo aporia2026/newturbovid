@@ -599,6 +599,109 @@ async def test_recraft_crisp_upscale_returns_url_and_cost() -> None:
     assert cost == COST_RECRAFT_UPSCALE_USD
 
 
+def _submit_resp(task_id: str) -> httpx.Response:
+    return httpx.Response(200, json={"code": 200, "data": {"taskId": task_id}})
+
+
+def _fail_resp(msg: str) -> httpx.Response:
+    return httpx.Response(
+        200, json={"code": 200, "data": {"state": "fail", "failMsg": msg}}
+    )
+
+
+def _success_resp(url: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "code": 200,
+            "data": {
+                "state": "success",
+                "resultJson": json.dumps({"resultUrls": [url]}),
+            },
+        },
+    )
+
+
+@respx.mock
+async def test_recraft_upscale_retries_transient_fail_then_succeeds() -> None:
+    # First task fails with a server-side blip ("internal error, please try
+    # again later." — the exact reported failure); the resubmit succeeds. On the
+    # old single-shot wrapper this raised and killed the row.
+    submit = respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
+        side_effect=[_submit_resp("t1"), _submit_resp("t2")]
+    )
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[
+            _fail_resp("internal error, please try again later."),
+            _success_resp("https://cdn/up.png"),
+        ]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        url, cost = await recraft_crisp_upscale(
+            client,
+            image_url="https://cdn/collage.png",
+            max_attempts=1,
+            delay_seconds=0.0,
+            retries=2,
+            retry_backoff_seconds=0.0,
+        )
+    assert url == "https://cdn/up.png"
+    assert cost == COST_RECRAFT_UPSCALE_USD
+    assert submit.call_count == 2    # one retry after the transient fail
+
+
+@respx.mock
+async def test_recraft_upscale_does_not_retry_nontransient_fail() -> None:
+    # A deterministic rejection (content policy) must NOT be resubmitted — a
+    # retry would only repeat it and burn money.
+    submit = respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
+        side_effect=[_submit_resp("t1")]
+    )
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[_fail_resp("content policy violation: firearms")]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieTaskFailedError):
+            await recraft_crisp_upscale(
+                client,
+                image_url="https://cdn/collage.png",
+                max_attempts=1,
+                delay_seconds=0.0,
+                retries=2,
+                retry_backoff_seconds=0.0,
+            )
+    assert submit.call_count == 1    # no retry on a deterministic failure
+
+
+@respx.mock
+async def test_recraft_upscale_raises_after_exhausting_retries() -> None:
+    # A sustained transient outage exhausts the retries and surfaces the error,
+    # which the row processor catches to fall back to the un-upscaled collage.
+    submit = respx.post(f"{KIE_BASE}/api/v1/jobs/createTask").mock(
+        side_effect=[_submit_resp("t1"), _submit_resp("t2")]
+    )
+    respx.get(f"{KIE_BASE}/api/v1/jobs/recordInfo").mock(
+        side_effect=[
+            _fail_resp("internal error, please try again later."),
+            _fail_resp("internal error, please try again later."),
+        ]
+    )
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        with pytest.raises(KieTaskFailedError):
+            await recraft_crisp_upscale(
+                client,
+                image_url="https://cdn/collage.png",
+                max_attempts=1,
+                delay_seconds=0.0,
+                retries=1,
+                retry_backoff_seconds=0.0,
+            )
+    assert submit.call_count == 2    # initial attempt + 1 retry, both failed
+
+
 # ── Cartoon-mode wrappers ────────────────────────────────────────────────────
 
 
