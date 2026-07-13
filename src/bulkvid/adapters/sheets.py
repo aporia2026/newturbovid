@@ -40,6 +40,7 @@ from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
+    TAB_HOOK_CARD,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
     TAB_SIMPLE,
@@ -356,6 +357,23 @@ class _MotionAdsCols:
 MOTION_ADS_COLS = _MotionAdsCols()
 
 
+@dataclass(frozen=True)
+class _HookCardCols:
+    """Layout for the ``Hook_Card`` tab (2026-07-13).
+
+    Country / Vertical / Article / Num of Images / Text / Music, then FIVE
+    Manual Image columns (G-K), Change Size (L), Open Comments (M), and one
+    Ready Video (N). The writer only needs the output column: the video URL is
+    resolved by the "Ready Video" header at write time, with this as the
+    positional fallback. Plan ``_plans/2026-07-13-hook-card-tab.md``.
+    """
+
+    ready_video_start: int = 13   # N = 0-indexed col 13
+
+
+HOOK_CARD_COLS = _HookCardCols()
+
+
 # Header rows BEFORE data starts.
 #   - Image-VO / Simple / Cartoon / 4Images: 1 header row → data at sheet row 2
 #   - Simple x4 (post-migration): 2 header rows (row 1 = template previews,
@@ -373,6 +391,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_TEXT_ON_IMG: 1,
     TAB_AVATAR: 1,
     TAB_MOTION_ADS: 1,
+    TAB_HOOK_CARD: 1,
 }
 
 
@@ -567,6 +586,8 @@ class SheetsClient:
             col = AVATAR_COLS.ready_video_start
         elif layout == TAB_MOTION_ADS:
             col = MOTION_ADS_COLS.ready_video_start
+        elif layout == TAB_HOOK_CARD:
+            col = HOOK_CARD_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -973,6 +994,8 @@ class SheetsClient:
                 if tab_type == TAB_AVATAR
                 else MOTION_ADS_COLS.ready_video_start
                 if tab_type == TAB_MOTION_ADS
+                else HOOK_CARD_COLS.ready_video_start
+                if tab_type == TAB_HOOK_CARD
                 else None
             )
             if positional_fallback is None:

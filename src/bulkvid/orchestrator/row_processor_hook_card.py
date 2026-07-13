@@ -26,8 +26,10 @@ Plan: ``_plans/2026-07-13-hook-card-tab.md``.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from bulkvid.adapters.kie import nano_banana_2_text_to_image
@@ -80,6 +82,15 @@ def _compose_image_prompt(scene: str, *, safety: Any, safety_block: str) -> str:
     a safety match (mirrors motion_ads)."""
     base = f"{REALISTIC_STYLE} {scene.strip()} {NO_BRANDING}"
     return append_safety_block(base, safety, safety_block)
+
+
+def _music_slug(track: Path | None) -> str:
+    """Filename-safe tag for the chosen track, appended to the video name so the
+    music actually used — even a randomly assigned one — is visible in the
+    Ready Video URL. ``"no_music"`` when the pool is empty (silent video)."""
+    if track is None:
+        return "no_music"
+    return re.sub(r"[^a-z0-9_-]+", "", track.stem.lower()) or "music"
 
 
 @dataclass
@@ -315,6 +326,7 @@ async def process_hook_card_row(
         # ─── Stage 6: overlay hook + set music (silent overlay if no track) ───
         try:
             track = select_track(row.music)    # named track, or random when blank
+            music_name = _music_slug(track)    # tagged onto the video filename
             if track is not None:
                 mu = await clients.storage.upload_bytes(
                     track.read_bytes(),
@@ -350,7 +362,7 @@ async def process_hook_card_row(
                 )
             up = await clients.storage.upload_bytes(
                 data,
-                key=f"bulkvid/videos/{slug}/v1.mp4",
+                key=f"bulkvid/videos/{slug}/v1_{music_name}.mp4",
                 content_type="video/mp4",
             )
             costs.storage += up.cost_usd
