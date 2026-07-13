@@ -19,6 +19,7 @@ import io
 import json
 import random
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
@@ -30,6 +31,7 @@ from bulkvid.adapters.rendi import (
     render_ken_burns_command,
     render_overlay_and_music_command,
 )
+from bulkvid.adapters.sheets import SheetsClient
 from bulkvid.adapters.storage import UploadResult
 from bulkvid.models.row import (
     STATUS_SUCCESS,
@@ -48,6 +50,7 @@ from bulkvid.orchestrator.row_processor_hook_card import (
     process_hook_card_row,
 )
 from bulkvid.orchestrator.runner import _TAB_HOOK_CARD, _tab_for_row
+from bulkvid.orchestrator.sheet_writer import PendingWrite
 from bulkvid.pipeline.card_renderer import render_hook_overlay_bytes
 from bulkvid.pipeline.cartoon_prompt import NO_BRANDING, REALISTIC_STYLE
 from bulkvid.pipeline.hook_card_copy import (
@@ -336,6 +339,8 @@ async def test_process_ai_path_generates_scenes_and_hook(
     assert isinstance(result, RowResult)
     assert result.status == STATUS_SUCCESS
     assert result.video_urls[0].startswith("https://storage.test/")
+    # No bundled track in this test -> the video name is tagged "no_music".
+    assert result.video_urls[0].endswith("v1_no_music.mp4")
     # 4 scenes -> 4 image gens -> 4 Ken Burns clips, then concat + silent overlay.
     assert len(captured["image_prompts"]) == 4
     assert captured["copy_kwargs"] == {"want_hook": True, "want_scenes": 4}
@@ -388,6 +393,8 @@ async def test_process_uses_music_when_track_available(
     assert "overlay_music" in rendi.kinds()
     assert "overlay_silent" not in rendi.kinds()
     assert any("hook_card_music" in k for k in storage.keys)
+    # The chosen track's name is tagged onto the video filename.
+    assert result.video_urls[0].endswith("v1_bed.mp4")
 
 
 async def test_process_fail_soft_on_rendi_error(
@@ -482,3 +489,55 @@ def test_track_choices_labels_each_variation(monkeypatch, tmp_path) -> None:
         _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
     )
     assert hcm.track_choices() == ["Piano 1", "Uplifting 1", "Uplifting 2"]
+
+
+# ── Ready Video write-back ──────────────────────────────────────────────────
+
+
+def _make_fake_sheets_client() -> tuple[MagicMock, dict]:
+    worksheets: dict = {}
+
+    def _open_by_key(sheet_id: str) -> MagicMock:
+        spreadsheet = MagicMock()
+
+        def _worksheet(name: str) -> MagicMock:
+            key = (sheet_id, name)
+            if key not in worksheets:
+                ws = MagicMock()
+                ws.batch_update = MagicMock(return_value=None)
+                worksheets[key] = ws
+            return worksheets[key]
+
+        spreadsheet.worksheet = MagicMock(side_effect=_worksheet)
+        return spreadsheet
+
+    client = MagicMock()
+    client.open_by_key = MagicMock(side_effect=_open_by_key)
+    return client, worksheets
+
+
+async def test_hook_card_video_writes_to_ready_video() -> None:
+    """Regression: hook_card was missing from the writer's tab dispatch, so the
+    video URL was dropped ("skip_unknown_tab_type") and Ready Video stayed empty.
+    It must land in the Ready Video column (resolved by header -> N)."""
+    client, worksheets = _make_fake_sheets_client()
+    ws = client.open_by_key("s").worksheet("Hook_Card")
+    ws.row_values = MagicMock(return_value=[
+        "Country", "Vertical", "Article", "Num of Images", "Text", "Music",
+        "Manual Image 1", "Manual Image 2", "Manual Image 3", "Manual Image 4",
+        "Manual Image 5", "Change Size", "Open Comments", "Ready Video",
+    ])
+    sc = SheetsClient(client=client)
+    n = await sc.batch_write_video_urls([
+        PendingWrite(
+            job_id="j", sheet_id="s", worksheet="Hook_Card",
+            tab_type=TAB_HOOK_CARD, row_num=2,
+            video_urls=["https://v/1_uplifting_2.mp4"], status=STATUS_SUCCESS,
+            error=None,
+        )
+    ])
+    ws = worksheets[("s", "Hook_Card")]
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    assert cells == {"N2": "https://v/1_uplifting_2.mp4"}
+    assert n == 1
