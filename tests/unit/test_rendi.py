@@ -128,6 +128,27 @@ def test_fit_video_command_does_blurred_fit_and_audio() -> None:
     assert "1080" in cmd and "1920" in cmd
 
 
+def test_fit_video_command_forces_exact_duration_when_total_set() -> None:
+    # The simple tab passes the played VO length so the clip ends with the VO.
+    # Rendi's ffmpeg ignores -shortest for a looped still (observed 2026-07-13:
+    # 15s clips with ~7s of frozen silence after an ~8s VO), so the duration is
+    # pinned with -t and -shortest is dropped.
+    cmd = render_fit_video_command(1080, 1920, total_video_seconds=7.5)
+    assert "-t 7.500" in cmd
+    assert "-shortest" not in cmd
+    assert "-t 15" not in cmd
+    # Same blurred-fit + sped-up VO composition otherwise.
+    assert "boxblur" in cmd
+    assert "atempo=" in cmd
+
+
+def test_fit_video_command_legacy_keeps_shortest_when_total_none() -> None:
+    # No total_video_seconds (the 4images path) must be untouched: 15s cap plus
+    # -shortest, exactly as before.
+    cmd = render_fit_video_command(1080, 1920)
+    assert "-t 15 -shortest" in cmd
+
+
 def test_fit_silent_command_has_no_audio() -> None:
     cmd = render_fit_silent_command(1080, 1350, seconds=8)
     assert "force_original_aspect_ratio=decrease" in cmd

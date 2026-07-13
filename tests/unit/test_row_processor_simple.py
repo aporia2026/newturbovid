@@ -19,7 +19,7 @@ from bulkvid.adapters.article_fetch import ArticleResult
 from bulkvid.adapters.gemini_tts import TTSResult
 from bulkvid.adapters.kie import KieClient, KiePool
 from bulkvid.adapters.openai_client import OpenAIClient
-from bulkvid.adapters.rendi import RendiClient
+from bulkvid.adapters.rendi import SPEECH_ATEMPO, RendiClient
 from bulkvid.adapters.storage import UploadResult
 from bulkvid.adapters.zapcap import ZapCapClient
 from bulkvid.models.row import (
@@ -216,6 +216,44 @@ async def test_simple_voice_over_no_produces_silent_video() -> None:
     assert result.status == STATUS_SUCCESS
     assert len(result.video_urls) == 1
     assert "vo_voice" not in result.metadata     # no voiceover was generated
+
+
+@respx.mock
+async def test_simple_video_duration_matches_voiceover_not_15s_cap() -> None:
+    # Regression (chat 2026-07-13): the simple tab shipped 15s clips that fell
+    # silent after the ~8s VO because Rendi's ffmpeg ignores -shortest on a
+    # looped still. The assembly command must now pin the clip to the played VO
+    # length (raw TTS / atempo) with -t and drop -shortest.
+    submitted: list[dict] = []
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        submitted.append(json.loads(request.content))
+        return httpx.Response(200, json={"command_id": f"cmd-{len(submitted)}"})
+
+    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
+    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(
+        side_effect=lambda r: httpx.Response(
+            200,
+            json={"status": "SUCCESS", "output_files": {
+                "out_1": {"storage_url": f"https://r.dev/{str(r.url).rsplit('/', 1)[-1]}.mp4"}}},
+        )
+    )
+    respx.delete(url__regex=r"https://api\.rendi\.dev/v1/commands/.+/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    _register_openai_routes()
+    _register_downloads()
+
+    result = await process_simple_row(_row(vo=True), _build_clients(), job_id="j")
+    assert result.status == STATUS_SUCCESS
+
+    # _FakeTTS reports a 0.5s raw VO; played length = 0.5 / atempo.
+    expected = f"-t {0.5 / SPEECH_ATEMPO:.3f}"
+    assembly = next(c for c in submitted if "boxblur" in c["ffmpeg_command"])
+    assert expected in assembly["ffmpeg_command"]
+    assert "-shortest" not in assembly["ffmpeg_command"]
+    assert "-t 15" not in assembly["ffmpeg_command"]
+    assert result.metadata["vo_played_seconds"] == round(0.5 / SPEECH_ATEMPO, 2)
 
 
 async def test_simple_bad_image_url_fails_fast() -> None:

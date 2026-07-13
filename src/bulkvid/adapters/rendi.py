@@ -298,12 +298,19 @@ _FIT_VIDEO_FILTER = (
     "[bg2][fg2]overlay=(W-w)/2:(H-h)/2[v]"
 )
 
+# ``__LENGTH_TAIL__`` is filled by ``render_fit_video_command``: either the
+# legacy ``-t 15 -shortest`` (15s cap, trust ``-shortest`` to trim to the VO) or,
+# when the caller knows the voiceover length, a hard ``-t <seconds>`` so the clip
+# ends exactly when the VO does. Rendi's ffmpeg does NOT honour ``-shortest`` for
+# a ``-loop 1`` still against a ``filter_complex`` audio output (observed
+# 2026-07-13: the simple tab shipped 15s clips with ~7s of frozen silence after
+# an ~8s VO), so the simple tab passes the explicit duration instead.
 _FIT_VIDEO_TEMPLATE = (
     "-loop 1 -framerate 30 -i {{in_1}} -i {{in_2}} "
     '-filter_complex "' + _FIT_VIDEO_FILTER + ';[1:a]atempo=__TEMPO__[a]" '
     '-map "[v]" -map "[a]" '
     "-c:v libx264 -tune stillimage -pix_fmt yuv420p "
-    "-c:a aac -b:a 192k -t 15 -shortest {{out_1}}"
+    "-c:a aac -b:a 192k __LENGTH_TAIL__ {{out_1}}"
 )
 
 _FIT_SILENT_TEMPLATE = (
@@ -452,13 +459,30 @@ def render_silent_video_command(
 
 
 def render_fit_video_command(
-    width: int = 1080, height: int = 1920, tempo: float = SPEECH_ATEMPO
+    width: int = 1080,
+    height: int = 1920,
+    tempo: float = SPEECH_ATEMPO,
+    *,
+    total_video_seconds: float | None = None,
 ) -> str:
+    """Blurred-background-fit image + voiceover -> one MP4.
+
+    ``total_video_seconds`` None → legacy ``-t 15 -shortest`` (15s cap, relies on
+    ``-shortest`` to trim to the VO). ``total_video_seconds`` set → force the
+    output to exactly that many seconds via ``-t`` and drop ``-shortest`` — used
+    by the simple tab, which knows the (sped-up) voiceover length and wants the
+    clip to end when the VO does, since Rendi's ffmpeg ignores ``-shortest`` here.
+    """
+    if total_video_seconds is None:
+        length_tail = "-t 15 -shortest"
+    else:
+        length_tail = f"-t {float(total_video_seconds):.3f}"
     return (
         _FIT_VIDEO_TEMPLATE
         .replace("__W__", str(width))
         .replace("__H__", str(height))
         .replace("__TEMPO__", str(tempo))
+        .replace("__LENGTH_TAIL__", length_tail)
     )
 
 
@@ -1034,6 +1058,7 @@ class RendiClient:
         *,
         aspect_ratio: str = "9:16",
         seconds: int = NO_VO_VIDEO_SECONDS,
+        total_video_seconds: float | None = None,
         max_attempts: int = 120,
         delay_seconds: float = 5.0,
     ) -> RendiOutput:
@@ -1044,13 +1069,21 @@ class RendiClient:
         sped up via atempo; ``audio_url=None`` yields a silent ``seconds`` clip.
         Replaces the resize-then-stills two-call path — one Rendi command, one
         queue wait. Auto-retried.
+
+        ``total_video_seconds`` (VO path only): force the output to exactly that
+        many seconds instead of the legacy ``-t 15 -shortest`` cap. Pass the
+        sped-up voiceover length so the clip ends with the VO — Rendi's ffmpeg
+        does not honour ``-shortest`` for a looped still, leaving trailing
+        silence otherwise. ``None`` keeps the legacy behaviour.
         """
         width, height = dimensions_for_ratio(aspect_ratio)
         if audio_url is None:
             command = render_fit_silent_command(width, height, seconds)
             inputs = {"in_1": image_url}
         else:
-            command = render_fit_video_command(width, height)
+            command = render_fit_video_command(
+                width, height, total_video_seconds=total_video_seconds
+            )
             inputs = {"in_1": image_url, "in_2": audio_url}
         url, command_id = await self._submit_and_poll(
             command,
