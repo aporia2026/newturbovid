@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from bulkvid.adapters.rendi import normalize_aspect_ratio
+from bulkvid.adapters.rendi import SPEECH_ATEMPO, normalize_aspect_ratio
 from bulkvid.http_download import download_image
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
@@ -187,6 +187,9 @@ async def process_simple_row(
         # ─── Stage 4: TTS + VO upload ───
 
         vo_url: str | None = None
+        # Played (sped-up) voiceover length. Drives the video duration below so
+        # the clip ends with the VO instead of running to a hard cap.
+        vo_seconds: float | None = None
         if row.voice_over:
             try:
                 tts = await clients.tts.synthesize(
@@ -204,8 +207,12 @@ async def process_simple_row(
                 )
                 costs.storage += vo_upload.cost_usd
                 vo_url = vo_upload.url
+                # atempo speeds the VO up by SPEECH_ATEMPO, so the played length
+                # is the raw TTS duration divided by that factor.
+                vo_seconds = tts.duration_seconds / SPEECH_ATEMPO
                 metadata["vo_voice"] = tts.voice
                 metadata["vo_duration_seconds"] = round(tts.duration_seconds, 2)
+                metadata["vo_played_seconds"] = round(vo_seconds, 2)
             except Exception as e:
                 return _fail(row, STATUS_TTS_FAILED, str(e), t0, costs, metadata)
 
@@ -217,6 +224,7 @@ async def process_simple_row(
                 audio_url=vo_url,    # None -> silent clip
                 output_filename="v1.mp4",
                 aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+                total_video_seconds=vo_seconds,    # end with the VO, no trailing silence
             )
             costs.rendi += video.cost_usd
         except Exception as e:
@@ -248,8 +256,10 @@ async def process_simple_row(
                     video_bytes=video_bytes,
                     language=lang.language,
                     filename="v1.mp4",
+                    # Honest per-second cost: the rendered clip is the played
+                    # (sped-up) VO length, not the raw TTS length.
                     video_duration_seconds=(
-                        tts.duration_seconds if row.voice_over else 10.0
+                        vo_seconds if vo_seconds is not None else 10.0
                     ),
                 )
                 costs.zapcap += cost
