@@ -311,6 +311,37 @@ class MotionAdsRow:
 
 
 @dataclass
+class HookCardRow:
+    """Hook_Card tab input row — a 9:16 slideshow with a fixed lower-third hook
+    box + background music (no voiceover).
+
+    Produces ONE short vertical video: 1-5 background scenes, each Ken Burns
+    zoomed, cut in sequence under a fixed black semi-transparent rounded box
+    holding one bold white hook line, with a bundled royalty-free track.
+
+      * ``num_images`` (col D) — 1..5, the AI scene count when generating.
+      * ``text`` (col E) — the hook; blank -> generate one from the article in
+        the market language.
+      * ``manual_image_urls`` (cols F-J) — any filled cells are used as the
+        scenes, in order; all blank -> generate ``num_images`` realistic images.
+
+    Only the article is required. Reuses the shared kie image + Rendi helpers;
+    every other pipeline is untouched. Plan
+    ``_plans/2026-07-13-hook-card-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    num_images: int                   # col D — 1..5 AI scenes when generating
+    text: str                         # col E — hook; blank → generate
+    manual_image_urls: list[str]      # cols F-J — filled cells used as scenes
+    aspect_ratio: str                 # col K "Change Size" — default 9:16
+    open_comments: str                # col L — context/directives
+
+
+@dataclass
 class FourImagesVO2Row:
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 

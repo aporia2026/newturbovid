@@ -31,6 +31,7 @@ from bulkvid.models.row import (
     CartoonRow,
     AvatarRow,
     FourImagesVO2Row,
+    HookCardRow,
     ImageVORow,
     MotionAdsRow,
     SimpleMotionRow,
@@ -52,6 +53,7 @@ from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
+    TAB_HOOK_CARD,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
     TAB_SIMPLE,
@@ -292,6 +294,27 @@ class MotionAdsRowIn(BaseModel):
     open_comments: str = ""
 
 
+class HookCardRowIn(BaseModel):
+    """Wire shape for the ``Hook_Card`` tab — a 9:16 hook-box slideshow with
+    background music.
+
+    Only ``article_url`` is required. ``manual_image_urls`` holds cols F-J (any
+    filled cells become the scenes, in order); when all are blank ``num_images``
+    (col D) realistic images are generated. ``text`` (col E) is the hook — blank
+    means generate one. Fields mirror ``HookCardRow`` so the route constructs it
+    directly. Plan ``_plans/2026-07-13-hook-card-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    num_images: int = Field(default=1, ge=1, le=5)
+    text: str = ""
+    manual_image_urls: list[str] = Field(default_factory=list, max_length=5)
+    aspect_ratio: str = "9:16"
+    open_comments: str = ""
+
+
 class SubmitJobIn(BaseModel):
     sheet_id: str
     worksheet: str
@@ -314,6 +337,8 @@ class SubmitJobIn(BaseModel):
     rows_avatar: list[AvatarRowIn] | None = None
     # Motion_Ads: silent motion-ad video + Headline/Description copy (plan 2026-07-08).
     rows_motion_ads: list[MotionAdsRowIn] | None = None
+    # Hook_Card: 9:16 hook-box slideshow + background music (plan 2026-07-13).
+    rows_hook_card: list[HookCardRowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -885,6 +910,12 @@ async def submit_job(
                 400, "rows_motion_ads is required for tab_type=motion_ads"
             )
         rows = [_build_motion_ads_row(r) for r in payload.rows_motion_ads]
+    elif payload.tab_type == TAB_HOOK_CARD:
+        if not payload.rows_hook_card:
+            raise HTTPException(
+                400, "rows_hook_card is required for tab_type=hook_card"
+            )
+        rows = [HookCardRow(**r.model_dump()) for r in payload.rows_hook_card]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

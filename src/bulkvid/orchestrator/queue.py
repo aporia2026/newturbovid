@@ -34,6 +34,7 @@ from bulkvid.models.row import (
     CardChoice,
     CartoonRow,
     FourImagesVO2Row,
+    HookCardRow,
     ImageVORow,
     MotionAdsRow,
     RowResult,
@@ -75,6 +76,7 @@ TAB_SIMPLE_X4 = "simple_x4"
 TAB_TEXT_ON_IMG = "text_on_img"
 TAB_AVATAR = "avatar"
 TAB_MOTION_ADS = "motion_ads"
+TAB_HOOK_CARD = "hook_card"
 
 # Idempotency-key replay window. A submit POST that PA's frontend dropped on
 # the way back to the client gets retried by the Apps Script, with the SAME
@@ -276,7 +278,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -1500,7 +1502,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -1521,4 +1523,6 @@ def payload_to_row(
         return AvatarRow(**payload)
     if tab == TAB_MOTION_ADS:
         return MotionAdsRow(**payload)
+    if tab == TAB_HOOK_CARD:
+        return HookCardRow(**payload)
     return ImageVORow(**payload)
