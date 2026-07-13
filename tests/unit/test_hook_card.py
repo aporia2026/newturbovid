@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import io
 import json
+import random
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
 import bulkvid.orchestrator.row_processor_hook_card as rphc
+import bulkvid.pipeline.hook_card_music as hcm
 from bulkvid.adapters.rendi import (
     RendiOutput,
     render_ken_burns_command,
@@ -65,6 +67,7 @@ def _row(**overrides) -> HookCardRow:
         article_url="https://example.com/a",
         num_images=4,
         text="",
+        music="",
         manual_image_urls=[],
         aspect_ratio="9:16",
         open_comments="",
@@ -320,7 +323,7 @@ def _patch_ai(monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setattr(rphc, "generate_hook_card_copy", _fake_copy)
     monkeypatch.setattr(rphc, "nano_banana_2_text_to_image", _fake_t2i)
     monkeypatch.setattr(rphc, "download_image", _fake_download)
-    monkeypatch.setattr(rphc, "select_track", lambda _seed: None)
+    monkeypatch.setattr(rphc, "select_track", lambda _music=None: None)
     return captured
 
 
@@ -377,7 +380,7 @@ async def test_process_uses_music_when_track_available(
     _patch_ai(monkeypatch)
     track = tmp_path / "bed.mp3"
     track.write_bytes(b"ID3fakeaudio")
-    monkeypatch.setattr(rphc, "select_track", lambda _seed: track)
+    monkeypatch.setattr(rphc, "select_track", lambda _music=None: track)
 
     storage, rendi = _FakeStorage(), _FakeRendi()
     result = await process_hook_card_row(_row(num_images=2), _clients(storage, rendi), job_id="j")
@@ -396,3 +399,54 @@ async def test_process_fail_soft_on_rendi_error(
     assert result.status == STATUS_VIDEO_ASSEMBLY_FAILED
     assert result.video_urls == []
     assert result.error    # never raises; carries the reason
+
+
+# ── Music selection ─────────────────────────────────────────────────────────
+
+
+def _pool(tmp_path, names: list[str]) -> object:
+    d = tmp_path / "music"
+    d.mkdir()
+    for n in names:
+        (d / n).write_bytes(b"x")
+    return d
+
+
+def test_track_names_are_distinct_and_sorted(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        hcm, "MUSIC_DIR",
+        _pool(tmp_path, ["Uplifting_1.mp3", "Uplifting_2.mp3", "piano_1.mp3"]),
+    )
+    assert hcm.track_names() == ["piano", "Uplifting"]
+
+
+def test_select_track_by_name(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        hcm, "MUSIC_DIR",
+        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
+    )
+    chosen = hcm.select_track("Uplifting", rng=random.Random(0))
+    assert chosen is not None and chosen.name.startswith("uplifting_")
+
+
+def test_select_track_name_is_normalized(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["lofi_1.mp3", "piano_1.mp3"]))
+    assert hcm.select_track("Lo-Fi", rng=random.Random(1)).name == "lofi_1.mp3"
+
+
+def test_select_track_unknown_name_falls_back_to_random(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["piano_1.mp3"]))
+    assert hcm.select_track("NoSuchName", rng=random.Random(2)).name == "piano_1.mp3"
+
+
+def test_select_track_blank_returns_a_track(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["a_1.mp3", "b_1.mp3"]))
+    pick = hcm.select_track("", rng=random.Random(3))
+    assert pick is not None and pick.suffix == ".mp3"
+
+
+def test_select_track_empty_pool_returns_none(monkeypatch, tmp_path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(hcm, "MUSIC_DIR", empty)
+    assert hcm.select_track("Uplifting") is None

@@ -322,7 +322,8 @@ class HookCardRow:
       * ``num_images`` (col D) — 1..5, the AI scene count when generating.
       * ``text`` (col E) — the hook; blank -> generate one from the article in
         the market language.
-      * ``manual_image_urls`` (cols F-J) — any filled cells are used as the
+      * ``music`` (col F) — a bundled track name to play; blank -> random track.
+      * ``manual_image_urls`` (cols G-K) — any filled cells are used as the
         scenes, in order; all blank -> generate ``num_images`` realistic images.
 
     Only the article is required. Reuses the shared kie image + Rendi helpers;
@@ -336,9 +337,10 @@ class HookCardRow:
     article_url: str
     num_images: int                   # col D — 1..5 AI scenes when generating
     text: str                         # col E — hook; blank → generate
-    manual_image_urls: list[str]      # cols F-J — filled cells used as scenes
-    aspect_ratio: str                 # col K "Change Size" — default 9:16
-    open_comments: str                # col L — context/directives
+    music: str                        # col F — track name; blank → random
+    manual_image_urls: list[str]      # cols G-K — filled cells used as scenes
+    aspect_ratio: str                 # col L "Change Size" — default 9:16
+    open_comments: str                # col M — context/directives
 
 
 @dataclass

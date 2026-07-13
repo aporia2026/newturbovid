@@ -24,13 +24,14 @@ Sheet columns (this exact order, matches the operator's tab):
 | C | Article | Source URL for AI hook + AI scenes |
 | D | Num of Images | Scene count, 1-5 (dropdown) |
 | E | Text | Hook verbatim if filled, else AI-generated |
-| F-J | Manual Image 1-5 | Background scenes if provided |
-| K | Change Size | Output aspect (default 9:16) |
-| L | Open Comments | Operator directives for AI copy |
-| M | Ready Video | Output URL |
+| F | Music | Track name to play; blank = random |
+| G-K | Manual Image 1-5 | Background scenes if provided |
+| L | Change Size | Output aspect (default 9:16) |
+| M | Open Comments | Operator directives for AI copy |
+| N | Ready Video | Output URL |
 
 Behavior:
-- Background: if any Manual Image (F-J) is filled, use those in order; else
+- Background: if any Manual Image (G-K) is filled, use those in order; else
   AI-generate `Num of Images` realistic photos from the article/topic
   (existing nano-banana pipeline). Motion = Ken Burns zoom, NOT per-clip AI
   animation.
@@ -38,7 +39,9 @@ Behavior:
   article in the market language.
 - Box: lower third, same bundled Inter Bold + auto-fit + multiscript machinery
   the card renderer already uses.
-- Music: bundled platform-cleared library, rotated per row.
+- Music: bundled instrumental pool generated once with Suno via kie.ai
+  (`tools/generate_hook_card_music.py`); the Music column (col F) picks a track
+  by name, blank = random.
 - Duration: 8s total, split evenly across scenes (Ken Burns each). Single
   scene = one 8s push.
 - Fail-soft like `motion_ads`: never raise, write partial results.
@@ -109,9 +112,9 @@ Assembly (staged, each stage ffprobe-validated before the next):
 
 ## Open questions
 
-- Music library: which cleared source + how many tracks to bundle (size vs
-  variety). Needs the operator's platform (Meta/TikTok/YouTube) to pick the
-  matching cleared library.
+- Music library: RESOLVED — a Suno-generated instrumental pool (9 named styles
+  x 2 variations) via kie.ai, picked by name in col F (blank = random). Suno
+  training-data litigation is a residual risk noted in the folder README.
 - Manual cell containing a video URL (mp4): v1 treats manual cells as images
   (Ken Burns). Auto-detecting a video URL and using it as the clip directly is
   a fast follow.
