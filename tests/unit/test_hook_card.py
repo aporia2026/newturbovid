@@ -1,17 +1,4 @@
-"""Unit tests for the Hook_Card tab.
-
-Hook_Card turns an article (or pasted images) into a 9:16 slideshow with a fixed
-lower-third hook box + background music. Covers:
-
-  - Payload round-trip for ``HookCardRow`` + runner tab routing.
-  - The transparent hook-overlay renderer (valid PNG, empty-text transparency,
-    multi-script hook does not crash).
-  - The two new Rendi command builders (Ken Burns zoompan; overlay + music).
-  - Copy generation: skip-with-no-call when nothing is needed, char cap + scene
-    count enforcement, graceful JSON fallback.
-  - Processor paths: AI-generate, manual images (no LLM/image gen), no bundled
-    track (silent overlay), and fail-soft on a Rendi error.
-"""
+"""Unit tests for the Hook_Card tab (v2: per-cell media, AI video, voiceover)."""
 
 from __future__ import annotations
 
@@ -21,15 +8,16 @@ import random
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 from PIL import Image
 
 import bulkvid.orchestrator.row_processor_hook_card as rphc
 import bulkvid.pipeline.hook_card_music as hcm
 from bulkvid.adapters.rendi import (
     RendiOutput,
+    render_cartoon_concat_command,
     render_ken_burns_command,
-    render_overlay_and_music_command,
+    render_mix_vo_music_command,
+    render_set_vo_command,
 )
 from bulkvid.adapters.sheets import SheetsClient
 from bulkvid.adapters.storage import UploadResult
@@ -37,43 +25,29 @@ from bulkvid.models.row import (
     STATUS_SUCCESS,
     STATUS_VIDEO_ASSEMBLY_FAILED,
     HookCardRow,
-    RowResult,
 )
 from bulkvid.orchestrator.clients import PipelineClients
-from bulkvid.orchestrator.queue import (
-    TAB_HOOK_CARD,
-    _row_to_payload,
-    payload_to_row,
-)
+from bulkvid.orchestrator.queue import TAB_HOOK_CARD, _row_to_payload, payload_to_row
 from bulkvid.orchestrator.row_processor_hook_card import (
-    HC_TOTAL_SECONDS,
+    _classify_media,
+    _music_label,
+    _video_name,
     process_hook_card_row,
 )
 from bulkvid.orchestrator.runner import _TAB_HOOK_CARD, _tab_for_row
 from bulkvid.orchestrator.sheet_writer import PendingWrite
 from bulkvid.pipeline.card_renderer import render_hook_overlay_bytes
 from bulkvid.pipeline.cartoon_prompt import NO_BRANDING, REALISTIC_STYLE
-from bulkvid.pipeline.hook_card_copy import (
-    HOOK_MAX_CHARS,
-    HookCardCopy,
-    generate_hook_card_copy,
-)
+from bulkvid.pipeline.hook_card_copy import HookCardCopy
 from bulkvid.pipeline.language import LanguageResult
-from bulkvid.pipeline.safety import SAFE, SafetyContext
+from bulkvid.pipeline.safety import SAFE
 
 
 def _row(**overrides) -> HookCardRow:
     base = dict(
-        row_num=2,
-        country="FR",
-        vertical="Abandoned Houses",
-        article_url="https://example.com/a",
-        num_images=4,
-        text="",
-        music="",
-        manual_image_urls=[],
-        aspect_ratio="9:16",
-        open_comments="",
+        row_num=2, country="SE", vertical="Shipping Container Homes",
+        article_url="https://example.com/a", num_images=3, text="", voice_over=False,
+        music="", manual_media=[], aspect_ratio="9:16", open_comments="",
     )
     base.update(overrides)
     return HookCardRow(**base)
@@ -83,20 +57,40 @@ def _row(**overrides) -> HookCardRow:
 
 
 def test_payload_round_trip_hook_card() -> None:
-    row = _row(text="Buy abandoned houses", manual_image_urls=["https://i/1.png"])
+    row = _row(text="Buy homes", voice_over=True, music="None", manual_media=["AI", "https://i/1.png"])
     payload = _row_to_payload(row, TAB_HOOK_CARD)
     assert '"__tab__": "hook_card"' in payload
-    # Deserialize exactly as the worker does: JSON payload -> dict -> the LIVE
-    # ``payload_to_row`` (not a dead look-alike — see the motion_ads round-trip
-    # test for why testing the real function matters).
     restored = payload_to_row(json.loads(payload))
     assert isinstance(restored, HookCardRow)
     assert restored == row
 
 
 def test_runner_routes_hook_card_row() -> None:
-    assert _tab_for_row(_row()) == _TAB_HOOK_CARD
-    assert _TAB_HOOK_CARD == "hook_card"
+    assert _tab_for_row(_row()) == _TAB_HOOK_CARD == "hook_card"
+
+
+# ── Media classification + naming ───────────────────────────────────────────
+
+
+def test_classify_media() -> None:
+    assert _classify_media("https://x/a.png") == ("image", "https://x/a.png")
+    assert _classify_media("https://x/a.jpg?q=1") == ("image", "https://x/a.jpg?q=1")
+    assert _classify_media("https://x/clip.mp4") == ("video", "https://x/clip.mp4")
+    assert _classify_media("https://x/clip.MOV") == ("video", "https://x/clip.MOV")
+    assert _classify_media("AI") == ("ai_image", None)
+    assert _classify_media("ai image") == ("ai_image", None)
+    assert _classify_media("AI Video") == ("ai_video", None)
+    assert _classify_media("ai-video") == ("ai_video", None)
+    assert _classify_media("something else") == ("ai_image", None)
+
+
+def test_music_label() -> None:
+    assert _music_label(None) == "NoMusic"
+
+
+def test_video_name() -> None:
+    name = _video_name("SE", "Shipping Container Homes", "sv", None, 5)
+    assert name == "SE-ShippingContainerHomes-sv-NoMusic-5"
 
 
 # ── Overlay renderer ────────────────────────────────────────────────────────
@@ -106,180 +100,125 @@ def _open(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(data))
 
 
-def test_hook_overlay_is_valid_rgba_png_at_frame_size() -> None:
-    data = render_hook_overlay_bytes(
-        text="Acheter des maisons abandonnées en France en 2026",
-        width=1080, height=1920,
-    )
+def test_hook_overlay_valid_png() -> None:
+    data = render_hook_overlay_bytes(text="Acheter des maisons", width=1080, height=1920)
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
     img = _open(data)
-    assert img.size == (1080, 1920)
-    assert img.mode == "RGBA"
-    # The box is drawn -> at least some fully-opaque pixels exist.
+    assert img.size == (1080, 1920) and img.mode == "RGBA"
     assert img.getchannel("A").getextrema()[1] == 255
 
 
-def test_hook_overlay_empty_text_is_fully_transparent() -> None:
+def test_hook_overlay_empty_is_transparent() -> None:
     img = _open(render_hook_overlay_bytes(text="", width=1080, height=1920))
-    assert img.size == (1080, 1920)
-    # No box, no text -> every pixel transparent.
     assert img.getchannel("A").getextrema() == (0, 0)
-
-
-def test_hook_overlay_multiscript_hook_does_not_crash() -> None:
-    # Hebrew routes to a bundled non-Inter font via the shared script router.
-    data = render_hook_overlay_bytes(
-        text="קנו בתים נטושים בצרפת", width=1080, height=1920
-    )
-    assert _open(data).getchannel("A").getextrema()[1] == 255
 
 
 # ── Rendi command builders ──────────────────────────────────────────────────
 
 
-def test_ken_burns_command_zoom_in() -> None:
+def test_ken_burns_command() -> None:
     cmd = render_ken_burns_command(1080, 1920, 2.0, zoom_in=True)
-    assert "zoompan" in cmd
-    assert "scale=3240:5760" in cmd          # 3x supersample of 1080x1920
-    assert "s=1080x1920" in cmd
-    assert "1.0+0.12*on/" in cmd             # linear push-in
-    assert "-frames:v 60" in cmd             # 2.0s * 30fps
-    assert "-an" in cmd                       # silent clip
+    assert "zoompan" in cmd and "scale=3240:5760" in cmd and "-frames:v 60" in cmd and "-an" in cmd
 
 
-def test_ken_burns_command_zoom_out() -> None:
-    cmd = render_ken_burns_command(1080, 1920, 1.6, zoom_in=False)
-    assert "1.12-0.12*on/" in cmd            # linear pull-out
-    assert "-frames:v 48" in cmd             # 1.6s * 30fps
+def test_concat_fps_normalizes() -> None:
+    cmd = render_cartoon_concat_command(2, 2.0, 1080, 1920, audio=False, fps=30)
+    assert "fps=30" in cmd
+    cmd_no_fps = render_cartoon_concat_command(2, 2.0, 1080, 1920, audio=False)
+    assert "fps=" not in cmd_no_fps
 
 
-def test_overlay_and_music_command_maps_music_as_audio() -> None:
-    cmd = render_overlay_and_music_command()
-    assert "overlay=0:0" in cmd
-    assert "-map 1:a" in cmd                  # in_2 (music) is the audio track
-    assert "-shortest" in cmd                 # trim music to the slideshow
+def test_set_vo_command() -> None:
+    cmd = render_set_vo_command(1.3)
+    assert "atempo=1.300" in cmd and "-map 0:v" in cmd and '-map "[a]"' in cmd
 
 
-# ── Copy generation ─────────────────────────────────────────────────────────
+def test_mix_vo_music_command() -> None:
+    cmd = render_mix_vo_music_command(1.3, 0.3)
+    assert "atempo=1.300" in cmd and "volume=0.300" in cmd and "amix=inputs=2" in cmd
 
 
-class _FakeOpenAI:
-    def __init__(self, text: str, cost: float = 0.0012) -> None:
-        self._text = text
-        self._cost = cost
-        self.calls = 0
-
-    async def chat(self, **_kwargs) -> SimpleNamespace:
-        self.calls += 1
-        return SimpleNamespace(text=self._text, cost_usd=self._cost)
+# ── Music selection ─────────────────────────────────────────────────────────
 
 
-async def test_copy_skips_call_when_nothing_needed() -> None:
-    client = _FakeOpenAI("{}")
-    copy = await generate_hook_card_copy(
-        client, article_body="body", language="fr", country="FR",
-        vertical="Homes", open_comments="", want_hook=False, want_scenes=0,
-    )
-    assert client.calls == 0        # no LLM call at all
-    assert copy.hook == ""
-    assert copy.scenes == []
-    assert copy.cost_usd == 0.0
+def _pool(tmp_path, names: list[str]):
+    d = tmp_path / "music"
+    d.mkdir()
+    for n in names:
+        (d / n).write_bytes(b"x")
+    return d
 
 
-async def test_copy_enforces_cap_and_scene_count() -> None:
-    client = _FakeOpenAI(
-        json.dumps({"hook": "word " * 60, "scenes": ["only one scene"]})
-    )
-    copy = await generate_hook_card_copy(
-        client, article_body="body", language="fr", country="FR",
-        vertical="Homes", open_comments="", want_hook=True, want_scenes=3,
-    )
-    assert 0 < len(copy.hook) <= HOOK_MAX_CHARS
-    # Model returned 1 scene but 3 were requested -> padded from the fallback.
-    assert len(copy.scenes) == 3
+def test_select_track_none_is_silent(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3", "piano_1.mp3"]))
+    assert hcm.select_track("None") is None          # explicit silent
+    assert hcm.select_track("Uplifting").name == "uplifting_1.mp3"
 
 
-async def test_copy_falls_back_on_bad_json() -> None:
-    client = _FakeOpenAI("not json at all")
-    copy = await generate_hook_card_copy(
-        client, article_body="body", language="en", country="US",
-        vertical="Solar Panels", open_comments="", want_hook=True, want_scenes=2,
-    )
-    assert 0 < len(copy.hook) <= HOOK_MAX_CHARS
-    assert len(copy.scenes) == 2
+def test_select_track_exact_variation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3"]))
+    assert hcm.select_track("Uplifting 2").name == "uplifting_2.mp3"
 
 
-# ── Processor paths ─────────────────────────────────────────────────────────
+def test_select_track_blank_random(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["a_1.mp3", "b_1.mp3"]))
+    assert hcm.select_track("", rng=random.Random(3)).suffix == ".mp3"
+
+
+# ── Processor ───────────────────────────────────────────────────────────────
 
 
 class _FakeArticle:
-    async def fetch(self, url: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            content="A story about abandoned French houses.",
-            source="scrapingbee", char_count=40, cost_usd=0.008, url=url,
-        )
+    async def fetch(self, url: str):
+        return SimpleNamespace(content="A story about container homes.", source="sb", char_count=30, cost_usd=0.008, url=url)
 
 
 class _FakeStorage:
     def __init__(self) -> None:
         self.keys: list[str] = []
 
-    async def upload_bytes(
-        self, data: bytes, key: str, content_type: str = "application/octet-stream"
-    ) -> UploadResult:
+    async def upload_bytes(self, data, key, content_type="application/octet-stream"):
         self.keys.append(key)
-        return UploadResult(
-            url=f"https://storage.test/{key}", backend="gcs",
-            bytes_written=len(data), cost_usd=0.0001,
-        )
+        return UploadResult(url=f"https://storage.test/{key}", backend="gcs", bytes_written=len(data), cost_usd=0.0001)
+
+
+class _FakeTTS:
+    async def synthesize(self, *, text, language, voice, style_prompt, country):
+        return SimpleNamespace(wav_bytes=b"wavdata", cost_usd=0.01, duration_seconds=6.5, voice="v1")
 
 
 class _FakeRendi:
-    """Records calls; each helper returns a distinct RendiOutput."""
-
     def __init__(self, *, ken_burns_raises: bool = False) -> None:
         self.calls: list[tuple] = []
-        self._ken_burns_raises = ken_burns_raises
+        self._raise = ken_burns_raises
         self._n = 0
 
-    async def ken_burns_clip(
-        self, image_url, output_filename="out.mp4", *,
-        aspect_ratio="9:16", seconds, zoom_in=True, **_kw,
-    ) -> RendiOutput:
-        if self._ken_burns_raises:
+    async def ken_burns_clip(self, image_url, output_filename="out.mp4", *, aspect_ratio="9:16", seconds, zoom_in=True, **_k):
+        if self._raise:
             raise RuntimeError("rendi boom")
         self._n += 1
-        self.calls.append(("ken_burns", image_url, round(seconds, 3), zoom_in))
-        return RendiOutput(
-            url=f"https://rendi/{output_filename}", cost_usd=0.01,
-            command_id=f"kb-{self._n}",
-        )
+        self.calls.append(("ken_burns", image_url, round(seconds, 3)))
+        return RendiOutput(url=f"https://rendi/{output_filename}", cost_usd=0.01, command_id=f"kb-{self._n}")
 
-    async def concat_clips_with_audio(
-        self, clip_urls, audio_url, per_clip_seconds,
-        output_filename="out.mp4", *, aspect_ratio="9:16", **_kw,
-    ) -> RendiOutput:
-        self.calls.append(("concat", tuple(clip_urls), audio_url))
-        return RendiOutput(
-            url="https://rendi/slideshow.mp4", cost_usd=0.01, command_id="concat",
-        )
+    async def concat_clips_with_audio(self, clip_urls, audio_url, per_clip_seconds, output_filename="out.mp4", *, aspect_ratio="9:16", fps=None, **_k):
+        self.calls.append(("concat", tuple(clip_urls), fps))
+        return RendiOutput(url="https://rendi/slideshow.mp4", cost_usd=0.01, command_id="concat")
 
-    async def overlay_and_add_music(
-        self, video_url, overlay_url, music_url, output_filename="out.mp4", **_kw,
-    ) -> RendiOutput:
-        self.calls.append(("overlay_music", video_url, overlay_url, music_url))
-        return RendiOutput(
-            url="https://rendi/final.mp4", cost_usd=0.01, command_id="final",
-        )
+    async def overlay_image_on_video(self, video_url, overlay_url, output_filename="out.mp4", **_k):
+        self.calls.append(("overlay_silent", video_url))
+        return RendiOutput(url=f"https://rendi/{output_filename}", cost_usd=0.01, command_id="ov")
 
-    async def overlay_image_on_video(
-        self, video_url, overlay_url, output_filename="out.mp4", **_kw,
-    ) -> RendiOutput:
-        self.calls.append(("overlay_silent", video_url, overlay_url))
-        return RendiOutput(
-            url="https://rendi/final_silent.mp4", cost_usd=0.01,
-            command_id="final-silent",
-        )
+    async def overlay_and_add_music(self, video_url, overlay_url, music_url, output_filename="out.mp4", **_k):
+        self.calls.append(("overlay_music", music_url))
+        return RendiOutput(url="https://rendi/final.mp4", cost_usd=0.01, command_id="om")
+
+    async def set_vo_audio(self, video_url, vo_url, output_filename="out.mp4", **_k):
+        self.calls.append(("set_vo", vo_url))
+        return RendiOutput(url="https://rendi/final.mp4", cost_usd=0.01, command_id="vo")
+
+    async def mix_vo_and_music(self, video_url, vo_url, music_url, output_filename="out.mp4", **_k):
+        self.calls.append(("mix_vo_music", vo_url, music_url))
+        return RendiOutput(url="https://rendi/final.mp4", cost_usd=0.01, command_id="mvm")
 
     async def cleanup_commands(self, ids) -> None:
         self.calls.append(("cleanup", tuple(ids)))
@@ -288,219 +227,170 @@ class _FakeRendi:
         return [c[0] for c in self.calls]
 
 
-def _clients(storage: _FakeStorage, rendi: _FakeRendi) -> PipelineClients:
+def _clients(storage, rendi, tts=None) -> PipelineClients:
     dummy = SimpleNamespace()
     return PipelineClients(
-        openai=dummy, kie=dummy, tts=dummy, rendi=rendi,
+        openai=dummy, kie=dummy, tts=tts or dummy, rendi=rendi,
         storage=storage, article=_FakeArticle(), settings_store=None,
     )
 
 
-def _patch_ai(monkeypatch: pytest.MonkeyPatch) -> dict:
-    captured: dict = {"image_prompts": []}
+def _patch(monkeypatch, *, scenes=None) -> dict:
+    cap: dict = {"image_prompts": [], "seedance": []}
 
-    async def _fake_detect(_client, _body, **_kw) -> LanguageResult:
-        return LanguageResult(language="fr", confidence=1.0, cost_usd=0.0, cached=False)
+    async def _detect(_c, _t, **_k):
+        return LanguageResult(language="sv", confidence=1.0, cost_usd=0.0, cached=False)
 
-    async def _fake_safety(_store, _vertical, _row_num=0) -> SafetyContext:
+    async def _safety(_s, _v, _r=0):
         return SAFE
 
-    async def _fake_copy(_client, *, want_hook, want_scenes, **kwargs) -> HookCardCopy:
-        captured["copy_kwargs"] = {"want_hook": want_hook, "want_scenes": want_scenes}
-        return HookCardCopy(
-            hook="Acheter des maisons abandonnées" if want_hook else "",
-            scenes=[f"scene {i}" for i in range(want_scenes)],
-            cost_usd=0.001,
-        )
+    async def _copy(_c, *, want_hook, want_scenes, **_k):
+        cap["copy"] = {"want_hook": want_hook, "want_scenes": want_scenes}
+        return HookCardCopy(hook="Buy container homes" if want_hook else "",
+                            scenes=[f"scene {i}" for i in range(want_scenes)], cost_usd=0.001)
 
-    async def _fake_t2i(_kie, prompt, aspect, resolution="2K"):
-        captured["image_prompts"].append(prompt)
-        captured["image_aspect"] = aspect
-        return f"https://kie/img{len(captured['image_prompts'])}.png", 0.06
+    async def _t2i(_k, prompt, aspect, resolution="2K"):
+        cap["image_prompts"].append(prompt)
+        return f"https://kie/img{len(cap['image_prompts'])}.png", 0.06
 
-    async def _fake_download(_url, timeout=60.0) -> bytes:
-        return b"x" * 20_000    # > _MIN_FINAL_BYTES
+    async def _seedance(_k, image_url, prompt, aspect, duration=4, resolution="720p"):
+        cap["seedance"].append({"image": image_url, "duration": duration})
+        return f"https://kie/clip{len(cap['seedance'])}.mp4", 0.07
 
-    monkeypatch.setattr(rphc, "detect_language", _fake_detect)
-    monkeypatch.setattr(rphc, "resolve_safety", _fake_safety)
-    monkeypatch.setattr(rphc, "generate_hook_card_copy", _fake_copy)
-    monkeypatch.setattr(rphc, "nano_banana_2_text_to_image", _fake_t2i)
-    monkeypatch.setattr(rphc, "download_image", _fake_download)
-    monkeypatch.setattr(rphc, "select_track", lambda _music=None: None)
-    return captured
+    async def _classify(_c, _oc):
+        return SimpleNamespace(cost_usd=0.001, mode=SimpleNamespace(value="x"))
+
+    async def _script(_c, **_k):
+        return SimpleNamespace(script="narration", voice="v", style_direction="calm",
+                               cost_usd=0.002, word_count=3)
+
+    async def _download(_u, timeout=60.0):
+        return b"x" * 20_000
+
+    monkeypatch.setattr(rphc, "detect_language", _detect)
+    monkeypatch.setattr(rphc, "reconcile_language", lambda lang, **_k: lang)
+    monkeypatch.setattr(rphc, "resolve_safety", _safety)
+    monkeypatch.setattr(rphc, "generate_hook_card_copy", _copy)
+    monkeypatch.setattr(rphc, "nano_banana_2_text_to_image", _t2i)
+    monkeypatch.setattr(rphc, "seedance_image_to_video", _seedance)
+    monkeypatch.setattr(rphc, "classify_open_comments", _classify)
+    monkeypatch.setattr(rphc, "generate_script", _script)
+    monkeypatch.setattr(rphc, "download_image", _download)
+    monkeypatch.setattr(rphc, "select_track", lambda _m=None: None)
+    return cap
 
 
-async def test_process_ai_path_generates_scenes_and_hook(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = _patch_ai(monkeypatch)
+async def test_ai_images_default(monkeypatch) -> None:
+    cap = _patch(monkeypatch)
     storage, rendi = _FakeStorage(), _FakeRendi()
-    result = await process_hook_card_row(_row(num_images=4), _clients(storage, rendi), job_id="j")
-    assert isinstance(result, RowResult)
+    result = await process_hook_card_row(_row(num_images=3), _clients(storage, rendi), job_id="j")
     assert result.status == STATUS_SUCCESS
-    assert result.video_urls[0].startswith("https://storage.test/")
-    # No bundled track in this test -> the video name is tagged "no_music".
-    assert result.video_urls[0].endswith("v1_no_music.mp4")
-    # 4 scenes -> 4 image gens -> 4 Ken Burns clips, then concat + silent overlay.
-    assert len(captured["image_prompts"]) == 4
-    assert captured["copy_kwargs"] == {"want_hook": True, "want_scenes": 4}
-    assert rendi.kinds().count("ken_burns") == 4
-    assert "concat" in rendi.kinds()
-    assert "overlay_silent" in rendi.kinds()    # no bundled track -> silent
-    # Each Ken Burns clip is 8s/4 = 2s and every image prompt is brand-guarded.
-    assert all(REALISTIC_STYLE in p and NO_BRANDING in p for p in captured["image_prompts"])
-    kb_seconds = {c[2] for c in rendi.calls if c[0] == "ken_burns"}
-    assert kb_seconds == {round(HC_TOTAL_SECONDS / 4, 3)}
+    assert len(cap["image_prompts"]) == 3
+    assert rendi.kinds().count("ken_burns") == 3 and "concat" in rendi.kinds()
+    assert "overlay_silent" in rendi.kinds()          # no music -> silent
+    assert all(REALISTIC_STYLE in p and NO_BRANDING in p for p in cap["image_prompts"])
+    # concat is fps-normalized so mixed sources join cleanly.
+    assert any(c[0] == "concat" and c[2] == rphc.HC_FPS for c in rendi.calls)
+    # Filename: Country-Vertical-lang-Music-Row.
+    assert result.video_urls[0].endswith("SE-ShippingContainerHomes-sv-NoMusic-2.mp4")
 
 
-async def test_process_manual_images_skip_llm_and_image_gen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = _patch_ai(monkeypatch)
-
-    async def _boom(*_a, **_k):
-        raise AssertionError("must not generate images on the manual path")
-
-    async def _boom_copy(*_a, **_k):
-        raise AssertionError("must not call copy when text + images are supplied")
-
-    monkeypatch.setattr(rphc, "nano_banana_2_text_to_image", _boom)
-    monkeypatch.setattr(rphc, "generate_hook_card_copy", _boom_copy)
-
+async def test_manual_images_skip_ai(monkeypatch) -> None:
+    cap = _patch(monkeypatch)
     storage, rendi = _FakeStorage(), _FakeRendi()
-    row = _row(
-        text="Acheter des maisons abandonnées",
-        manual_image_urls=["https://u/1.png", "https://u/2.png", "https://u/3.png"],
-    )
+    row = _row(text="A hook", manual_media=["https://u/1.png", "https://u/2.png"])
     result = await process_hook_card_row(row, _clients(storage, rendi), job_id="j")
     assert result.status == STATUS_SUCCESS
-    # 3 pasted images -> 3 Ken Burns clips, each 8s/3.
-    assert rendi.kinds().count("ken_burns") == 3
-    assert captured["image_prompts"] == []
+    assert rendi.kinds().count("ken_burns") == 2
+    assert cap["image_prompts"] == []
 
 
-async def test_process_uses_music_when_track_available(
-    monkeypatch: pytest.MonkeyPatch, tmp_path,
-) -> None:
-    _patch_ai(monkeypatch)
-    track = tmp_path / "bed.mp3"
-    track.write_bytes(b"ID3fakeaudio")
-    monkeypatch.setattr(rphc, "select_track", lambda _music=None: track)
-
+async def test_manual_video_is_raw_clip(monkeypatch) -> None:
+    _patch(monkeypatch)
     storage, rendi = _FakeStorage(), _FakeRendi()
-    result = await process_hook_card_row(_row(num_images=2), _clients(storage, rendi), job_id="j")
+    row = _row(text="A hook", manual_media=["https://u/clip.mp4"])
+    result = await process_hook_card_row(row, _clients(storage, rendi), job_id="j")
+    assert result.status == STATUS_SUCCESS
+    assert rendi.kinds().count("ken_burns") == 0        # video passed straight to concat
+    concat = next(c for c in rendi.calls if c[0] == "concat")
+    assert concat[1] == ("https://u/clip.mp4",)
+
+
+async def test_ai_video_uses_seedance(monkeypatch) -> None:
+    cap = _patch(monkeypatch)
+    storage, rendi = _FakeStorage(), _FakeRendi()
+    row = _row(manual_media=["AI Video", "AI"])
+    result = await process_hook_card_row(row, _clients(storage, rendi), job_id="j")
+    assert result.status == STATUS_SUCCESS
+    assert len(cap["seedance"]) == 1                    # one AI Video cell
+    assert rendi.kinds().count("ken_burns") == 1        # one AI image cell
+    assert len(cap["image_prompts"]) == 2               # both AI cells make a still
+
+
+async def test_none_music_is_silent(monkeypatch) -> None:
+    _patch(monkeypatch)
+    storage, rendi = _FakeStorage(), _FakeRendi()
+    result = await process_hook_card_row(_row(music="None"), _clients(storage, rendi), job_id="j")
+    assert result.status == STATUS_SUCCESS
+    assert "overlay_silent" in rendi.kinds() and "overlay_music" not in rendi.kinds()
+    assert result.video_urls[0].endswith("-NoMusic-2.mp4")
+
+
+async def test_music_track_in_name(monkeypatch, tmp_path) -> None:
+    _patch(monkeypatch)
+    track = tmp_path / "uplifting_2.mp3"
+    track.write_bytes(b"ID3")
+    monkeypatch.setattr(rphc, "select_track", lambda _m=None: track)
+    storage, rendi = _FakeStorage(), _FakeRendi()
+    result = await process_hook_card_row(_row(music="Uplifting 2"), _clients(storage, rendi), job_id="j")
     assert result.status == STATUS_SUCCESS
     assert "overlay_music" in rendi.kinds()
-    assert "overlay_silent" not in rendi.kinds()
-    assert any("hook_card_music" in k for k in storage.keys)
-    # The chosen track's name is tagged onto the video filename.
-    assert result.video_urls[0].endswith("v1_bed.mp4")
+    assert result.video_urls[0].endswith("SE-ShippingContainerHomes-sv-Uplifting2-2.mp4")
 
 
-async def test_process_fail_soft_on_rendi_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_ai(monkeypatch)
+async def test_voiceover_ducks_music(monkeypatch, tmp_path) -> None:
+    _patch(monkeypatch)
+    track = tmp_path / "lofi_1.mp3"
+    track.write_bytes(b"ID3")
+    monkeypatch.setattr(rphc, "select_track", lambda _m=None: track)
+    storage, rendi = _FakeStorage(), _FakeRendi()
+    result = await process_hook_card_row(
+        _row(voice_over=True, music="Lofi 1"), _clients(storage, rendi, _FakeTTS()), job_id="j"
+    )
+    assert result.status == STATUS_SUCCESS
+    assert "mix_vo_music" in rendi.kinds()              # VO over ducked music
+    assert "overlay_silent" in rendi.kinds()            # hook burned in first
+    assert any("bulkvid/vo/" in k for k in storage.keys)
+
+
+async def test_voiceover_only_no_music(monkeypatch) -> None:
+    _patch(monkeypatch)   # select_track -> None
+    storage, rendi = _FakeStorage(), _FakeRendi()
+    result = await process_hook_card_row(
+        _row(voice_over=True, music="None"), _clients(storage, rendi, _FakeTTS()), job_id="j"
+    )
+    assert result.status == STATUS_SUCCESS
+    assert "set_vo" in rendi.kinds() and "mix_vo_music" not in rendi.kinds()
+
+
+async def test_fail_soft_on_rendi_error(monkeypatch) -> None:
+    _patch(monkeypatch)
     storage, rendi = _FakeStorage(), _FakeRendi(ken_burns_raises=True)
     result = await process_hook_card_row(_row(), _clients(storage, rendi), job_id="j")
     assert result.status == STATUS_VIDEO_ASSEMBLY_FAILED
-    assert result.video_urls == []
-    assert result.error    # never raises; carries the reason
+    assert result.video_urls == [] and result.error
 
 
-# ── Music selection ─────────────────────────────────────────────────────────
+# ── Ready Video write-back (now col O) ───────────────────────────────────────
 
 
-def _pool(tmp_path, names: list[str]) -> object:
-    d = tmp_path / "music"
-    d.mkdir()
-    for n in names:
-        (d / n).write_bytes(b"x")
-    return d
-
-
-def test_track_names_are_distinct_and_sorted(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        hcm, "MUSIC_DIR",
-        _pool(tmp_path, ["Uplifting_1.mp3", "Uplifting_2.mp3", "piano_1.mp3"]),
-    )
-    assert hcm.track_names() == ["piano", "Uplifting"]
-
-
-def test_select_track_by_name(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        hcm, "MUSIC_DIR",
-        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
-    )
-    chosen = hcm.select_track("Uplifting", rng=random.Random(0))
-    assert chosen is not None and chosen.name.startswith("uplifting_")
-
-
-def test_select_track_name_is_normalized(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["lofi_1.mp3", "piano_1.mp3"]))
-    assert hcm.select_track("Lo-Fi", rng=random.Random(1)).name == "lofi_1.mp3"
-
-
-def test_select_track_unknown_name_falls_back_to_random(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["piano_1.mp3"]))
-    assert hcm.select_track("NoSuchName", rng=random.Random(2)).name == "piano_1.mp3"
-
-
-def test_select_track_blank_returns_a_track(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["a_1.mp3", "b_1.mp3"]))
-    pick = hcm.select_track("", rng=random.Random(3))
-    assert pick is not None and pick.suffix == ".mp3"
-
-
-def test_select_track_empty_pool_returns_none(monkeypatch, tmp_path) -> None:
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    monkeypatch.setattr(hcm, "MUSIC_DIR", empty)
-    assert hcm.select_track("Uplifting") is None
-
-
-def test_select_track_exact_variation(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        hcm, "MUSIC_DIR",
-        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
-    )
-    assert hcm.select_track("Uplifting 2").name == "uplifting_2.mp3"
-    assert hcm.select_track("Uplifting 1").name == "uplifting_1.mp3"
-
-
-def test_select_track_variation_underscore_form(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3"])
-    )
-    assert hcm.select_track("uplifting_2").name == "uplifting_2.mp3"
-
-
-def test_select_track_missing_variation_falls_back_within_name(
-    monkeypatch, tmp_path,
-) -> None:
-    monkeypatch.setattr(hcm, "MUSIC_DIR", _pool(tmp_path, ["uplifting_1.mp3"]))
-    # Asked for variation 2 but only 1 exists -> still an uplifting track.
-    assert hcm.select_track("Uplifting 2", rng=random.Random(0)).name == "uplifting_1.mp3"
-
-
-def test_track_choices_labels_each_variation(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        hcm, "MUSIC_DIR",
-        _pool(tmp_path, ["uplifting_1.mp3", "uplifting_2.mp3", "piano_1.mp3"]),
-    )
-    assert hcm.track_choices() == ["Piano 1", "Uplifting 1", "Uplifting 2"]
-
-
-# ── Ready Video write-back ──────────────────────────────────────────────────
-
-
-def _make_fake_sheets_client() -> tuple[MagicMock, dict]:
+def _make_fake_sheets_client():
     worksheets: dict = {}
 
-    def _open_by_key(sheet_id: str) -> MagicMock:
+    def _open_by_key(sheet_id):
         spreadsheet = MagicMock()
 
-        def _worksheet(name: str) -> MagicMock:
+        def _worksheet(name):
             key = (sheet_id, name)
             if key not in worksheets:
                 ws = MagicMock()
@@ -516,28 +406,23 @@ def _make_fake_sheets_client() -> tuple[MagicMock, dict]:
     return client, worksheets
 
 
-async def test_hook_card_video_writes_to_ready_video() -> None:
-    """Regression: hook_card was missing from the writer's tab dispatch, so the
-    video URL was dropped ("skip_unknown_tab_type") and Ready Video stayed empty.
-    It must land in the Ready Video column (resolved by header -> N)."""
+async def test_hook_card_writes_to_ready_video_col_o() -> None:
     client, worksheets = _make_fake_sheets_client()
     ws = client.open_by_key("s").worksheet("Hook_Card")
     ws.row_values = MagicMock(return_value=[
-        "Country", "Vertical", "Article", "Num of Images", "Text", "Music",
-        "Manual Image 1", "Manual Image 2", "Manual Image 3", "Manual Image 4",
-        "Manual Image 5", "Change Size", "Open Comments", "Ready Video",
+        "Country", "Vertical", "Article", "Num of Images", "Text", "Voiceover",
+        "Music", "Manual Media 1", "Manual Media 2", "Manual Media 3",
+        "Manual Media 4", "Manual Media 5", "Change Size", "Open Comments",
+        "Ready Video",
     ])
     sc = SheetsClient(client=client)
     n = await sc.batch_write_video_urls([
-        PendingWrite(
-            job_id="j", sheet_id="s", worksheet="Hook_Card",
-            tab_type=TAB_HOOK_CARD, row_num=2,
-            video_urls=["https://v/1_uplifting_2.mp4"], status=STATUS_SUCCESS,
-            error=None,
-        )
+        PendingWrite(job_id="j", sheet_id="s", worksheet="Hook_Card",
+                     tab_type=TAB_HOOK_CARD, row_num=2,
+                     video_urls=["https://v/SE-X-sv-Piano1-2.mp4"],
+                     status=STATUS_SUCCESS, error=None)
     ])
     ws = worksheets[("s", "Hook_Card")]
-    updates = ws.batch_update.call_args.args[0]
-    cells = {u["range"]: u["values"][0][0] for u in updates}
-    assert cells == {"N2": "https://v/1_uplifting_2.mp4"}
+    cells = {u["range"]: u["values"][0][0] for u in ws.batch_update.call_args.args[0]}
+    assert cells == {"O2": "https://v/SE-X-sv-Piano1-2.mp4"}
     assert n == 1

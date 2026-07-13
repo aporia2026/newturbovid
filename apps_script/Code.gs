@@ -212,23 +212,23 @@ const MOTION_ADS_COLS = {
 };
 
 // Hook_Card layout: Country / Vertical / Article / Num of Images / Text /
-// Music, then FIVE Manual Image columns, then Change Size / Open Comments,
-// then ONE Ready Video. Read BY HEADER NAME (mirrors motion_ads) so
-// inserting/moving columns can't corrupt the read; these positional values are
-// the fallback.
+// Voiceover / Music, then FIVE Manual Media columns (H-L), then Change Size /
+// Open Comments, then ONE Ready Video (O). Read BY HEADER NAME (mirrors
+// motion_ads) so inserting/moving columns can't corrupt the read; these
+// positional values are the fallback.
 const HOOK_CARD_COLS = {
   country: 1, vertical: 2, article: 3,
-  numImages: 4, text: 5, music: 6,
-  manualImage1: 7, manualImage2: 8, manualImage3: 9,
-  manualImage4: 10, manualImage5: 11,
-  aspectRatio: 12, openComments: 13,
-  readyVideo1: 14,
-  lastInputCol: 13,
+  numImages: 4, text: 5, voiceover: 6, music: 7,
+  manualMedia1: 8, manualMedia2: 9, manualMedia3: 10,
+  manualMedia4: 11, manualMedia5: 12,
+  aspectRatio: 13, openComments: 14,
+  readyVideo1: 15,
+  lastInputCol: 14,
 };
 
-// Pickable names for the Music column (col F) dropdown. MUST match the track
+// Pickable names for the Music column (col G) dropdown. MUST match the track
 // file names produced by tools/generate_hook_card_music.py (a blank cell = a
-// random track). Applied via applyHookCardMusicDropdown().
+// random track; "None" = silent). Applied via applyHookCardMusicDropdown().
 const HOOK_CARD_MUSIC_NAMES = [
   'Uplifting', 'Cinematic', 'Piano', 'Lofi', 'Acoustic',
   'Energetic', 'Ambient', 'Electronic', 'Indie',
@@ -263,7 +263,7 @@ function onOpen() {
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
     .addItem('Apply Motion_Ads dropdowns', 'applyMotionAdsDropdowns')
-    .addItem('Apply Hook_Card music dropdown', 'applyHookCardMusicDropdown')
+    .addItem('Apply Hook_Card dropdowns', 'applyHookCardMusicDropdown')
     .addItem('Preview Hook_Card music…', 'showHookCardMusicPreview')
     .addItem('Add "use this script" tips', 'applyOpenCommentsTips')
     .addItem('Configure backend URL', 'configureBackendUrl')
@@ -606,12 +606,13 @@ function _readMotionAdsRow(sheet, rowNum) {
 
 
 function _readHookCardRow(sheet, rowNum) {
-  // Hook_Card: Country / Vertical / Article / Num of Images / Text, then FIVE
-  // Manual Image columns, then Change Size / Open Comments. Resolved by HEADER
-  // NAME first (mirrors _readMotionAdsRow) so inserting/moving columns can't
-  // corrupt the read; HOOK_CARD_COLS is the positional fallback. Filled Manual
-  // Image cells become the scenes; all blank -> the backend generates Num of
-  // Images realistic images. Only the article is required (see validate).
+  // Hook_Card: Country / Vertical / Article / Num of Images / Text / Voiceover /
+  // Music, then FIVE Manual Media columns, then Change Size / Open Comments.
+  // Resolved by HEADER NAME first (mirrors _readMotionAdsRow) so inserting/
+  // moving columns can't corrupt the read; HOOK_CARD_COLS is the positional
+  // fallback. Each Manual Media cell is a URL (image/video) or the keyword
+  // "AI" / "AI Video"; all blank -> the backend generates Num of Images images.
+  // Only the article is required (see validate).
   const cols = HOOK_CARD_COLS;
   const headerMap = _buildHeaderColMap(sheet);
   const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
@@ -622,16 +623,17 @@ function _readHookCardRow(sheet, rowNum) {
   const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
   const cNumImages    = _colForHeaders(headerMap, ['Num of Images', 'Number of Images', 'Num Images'], cols.numImages);
   const cText         = _colForHeaders(headerMap, ['Text'], cols.text);
+  const cVoiceover    = _colForHeaders(headerMap, ['Voiceover', 'Voice Over'], cols.voiceover);
   const cMusic        = _colForHeaders(headerMap, ['Music'], cols.music);
   const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
   const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
 
-  const manualImageUrls = [
-    _colForHeaders(headerMap, ['Manual Image 1'], cols.manualImage1),
-    _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2),
-    _colForHeaders(headerMap, ['Manual Image 3'], cols.manualImage3),
-    _colForHeaders(headerMap, ['Manual Image 4'], cols.manualImage4),
-    _colForHeaders(headerMap, ['Manual Image 5'], cols.manualImage5),
+  const manualMedia = [
+    _colForHeaders(headerMap, ['Manual Media 1', 'Manual Image 1'], cols.manualMedia1),
+    _colForHeaders(headerMap, ['Manual Media 2', 'Manual Image 2'], cols.manualMedia2),
+    _colForHeaders(headerMap, ['Manual Media 3', 'Manual Image 3'], cols.manualMedia3),
+    _colForHeaders(headerMap, ['Manual Media 4', 'Manual Image 4'], cols.manualMedia4),
+    _colForHeaders(headerMap, ['Manual Media 5', 'Manual Image 5'], cols.manualMedia5),
   ].map(function (c) { return _cell(values, c); })
    .filter(function (u) { return !!u; });
 
@@ -644,8 +646,9 @@ function _readHookCardRow(sheet, rowNum) {
     article_url: _cell(values, cArticle),
     num_images: numImages,
     text: _cell(values, cText),
+    voice_over: _yes(_cell(values, cVoiceover), false),
     music: _cell(values, cMusic),
-    manual_image_urls: manualImageUrls,
+    manual_media: manualMedia,
     aspect_ratio: _cell(values, cAspectRatio) || '9:16',
     open_comments: _cell(values, cOpenComments),
   };
@@ -850,11 +853,13 @@ function _validateMotionAds(r) {
 
 function _validateHookCard(r) {
   // The article is required whenever the backend must GENERATE something: a
-  // blank Text needs it for the hook, and no Manual Images needs it for the
-  // scenes. A row that supplies BOTH the Text and >=1 Manual Image needs none.
+  // blank Text needs it for the hook, no Manual Media needs it for the scenes,
+  // and Voiceover needs it for the script. A row that supplies the Text, >=1
+  // Manual Media cell, and no Voiceover needs no article.
   if (!r.article_url) {
+    if (r.voice_over) return 'article URL missing (needed for the voiceover script)';
     if (!r.text) return 'article URL missing (needed to write the hook)';
-    if (!r.manual_image_urls.length) return 'article URL missing (needed to generate images)';
+    if (!r.manual_media.length) return 'article URL missing (needed to generate media)';
   }
   return null;
 }
@@ -1537,7 +1542,7 @@ function applyYtCartoonDropdowns() {
  *  _2.mp3). A bare style name (random variation) and a blank cell (random
  *  track) also work — both handled server-side. */
 function _hookCardMusicChoices() {
-  const out = [];
+  const out = ['None'];    // "None" = silent video
   HOOK_CARD_MUSIC_NAMES.forEach(function (name) {
     out.push(name + ' 1');
     out.push(name + ' 2');
@@ -1546,11 +1551,11 @@ function _hookCardMusicChoices() {
 }
 
 
-/** One-shot: (re)apply the Music dropdown on every Hook_Card tab. Resolves the
- *  Music column BY HEADER NAME (positional fallback = col F) so it follows the
- *  header wherever it sits. Non-strict: a blank cell = a random track, and a
- *  stray value falls back to random server-side. Keep HOOK_CARD_MUSIC_NAMES in
- *  sync with tools/generate_hook_card_music.py. */
+/** One-shot: (re)apply the Music, Voiceover and Manual Media dropdowns on every
+ *  Hook_Card tab. Every column is resolved BY HEADER NAME (positional fallback)
+ *  so it follows the header wherever it sits. All are non-strict (allowInvalid)
+ *  so a pasted URL or blank is accepted. Keep HOOK_CARD_MUSIC_NAMES in sync with
+ *  tools/generate_hook_card_music.py. */
 function applyHookCardMusicDropdown() {
   const ui = SpreadsheetApp.getUi();
   const updated = [];
@@ -1560,23 +1565,40 @@ function applyHookCardMusicDropdown() {
     const firstData = 2;
     const maxRow = sheet.getMaxRows();
     if (maxRow < firstData) return;
-    const col = _colForHeaders(headerMap, ['Music'], HOOK_CARD_COLS.music);
-    if (!col) return;
-    const validation = SpreadsheetApp.newDataValidation()
-      .requireValueInList(_hookCardMusicChoices(), true)
-      .setAllowInvalid(true)    // blank = random; a bare style name = random variation
-      .setHelpText('Pick a track (e.g. "Uplifting 2"), a style name for a random '
-        + 'variation, or leave blank for a random track.')
-      .build();
-    sheet.getRange(firstData, col, maxRow - firstData + 1, 1)
-      .setDataValidation(validation);
+    const nRows = maxRow - firstData + 1;
+
+    function applyList(headers, positional, options, help) {
+      const col = _colForHeaders(headerMap, headers, positional);
+      if (!col) return;
+      const v = SpreadsheetApp.newDataValidation()
+        .requireValueInList(options, true)
+        .setAllowInvalid(true)
+        .setHelpText(help)
+        .build();
+      sheet.getRange(firstData, col, nRows, 1).setDataValidation(v);
+    }
+
+    applyList(['Music'], HOOK_CARD_COLS.music, _hookCardMusicChoices(),
+      'Pick a track (e.g. "Uplifting 2"), "None" for silent, a style name for a '
+      + 'random variation, or blank for a random track.');
+    applyList(['Voiceover', 'Voice Over'], HOOK_CARD_COLS.voiceover, ['Yes', 'No'],
+      'Yes narrates the article (the length follows the narration and music is '
+      + 'ducked under it). Blank = No.');
+    const mediaCols = ['manualMedia1', 'manualMedia2', 'manualMedia3',
+                       'manualMedia4', 'manualMedia5'];
+    for (var i = 0; i < 5; i++) {
+      applyList(['Manual Media ' + (i + 1), 'Manual Image ' + (i + 1)],
+        HOOK_CARD_COLS[mediaCols[i]], ['AI', 'AI Video'],
+        'Paste an image or video URL, or pick "AI" / "AI Video" to generate this '
+        + 'scene. All blank -> Num of Images AI images.');
+    }
     updated.push(sheet.getName());
   });
 
   ui.alert(
-    'Hook_Card music dropdown',
+    'Hook_Card dropdowns',
     updated.length
-      ? 'Applied to:\n\n• ' + updated.join('\n• ')
+      ? 'Music, Voiceover and Manual Media dropdowns applied to:\n\n• ' + updated.join('\n• ')
       : 'No Hook_Card tab found. Name a tab to contain "hook card" and re-run.',
     ui.ButtonSet.OK
   );

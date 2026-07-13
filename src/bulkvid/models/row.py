@@ -319,15 +319,19 @@ class HookCardRow:
     zoomed, cut in sequence under a fixed black semi-transparent rounded box
     holding one bold white hook line, with a bundled royalty-free track.
 
-      * ``num_images`` (col D) — 1..5, the AI scene count when generating.
-      * ``text`` (col E) — the hook; blank -> generate one from the article in
-        the market language.
-      * ``music`` (col F) — a bundled track name to play; blank -> random track.
-      * ``manual_image_urls`` (cols G-K) — any filled cells are used as the
-        scenes, in order; all blank -> generate ``num_images`` realistic images.
+      * ``num_images`` (col D) — AI image count when ALL media cells are blank.
+      * ``text`` (col E) — the hook; blank -> generate one in the market language.
+      * ``voice_over`` (col F) — Yes -> narrate a script from the article (like
+        the other tabs); the music is ducked under the narration and the
+        narration drives the video length.
+      * ``music`` (col G) — a bundled track ("Uplifting 2"); "None" -> silent;
+        blank -> random.
+      * ``manual_media`` (cols H-L) — per cell: an image URL (Ken Burns), a video
+        URL (used as a clip), ``"AI"`` (AI image) or ``"AI Video"`` (Seedance
+        clip). All blank -> ``num_images`` AI images.
 
-    Only the article is required. Reuses the shared kie image + Rendi helpers;
-    every other pipeline is untouched. Plan
+    Only the article is required. Reuses the shared kie image + Rendi + script/
+    TTS helpers; every other pipeline is untouched. Plan
     ``_plans/2026-07-13-hook-card-tab.md``.
     """
 
@@ -335,12 +339,13 @@ class HookCardRow:
     country: str
     vertical: str
     article_url: str
-    num_images: int                   # col D — 1..5 AI scenes when generating
+    num_images: int                   # col D — AI image count when media blank
     text: str                         # col E — hook; blank → generate
-    music: str                        # col F — track name; blank → random
-    manual_image_urls: list[str]      # cols G-K — filled cells used as scenes
-    aspect_ratio: str                 # col L "Change Size" — default 9:16
-    open_comments: str                # col M — context/directives
+    voice_over: bool                  # col F — Yes → narrate the article
+    music: str                        # col G — track; "None" silent; blank random
+    manual_media: list[str]           # cols H-L — URL (image/video) or AI keyword
+    aspect_ratio: str                 # col M "Change Size" — default 9:16
+    open_comments: str                # col N — context/directives
 
 
 @dataclass

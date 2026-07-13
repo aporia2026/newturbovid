@@ -298,12 +298,12 @@ class HookCardRowIn(BaseModel):
     """Wire shape for the ``Hook_Card`` tab — a 9:16 hook-box slideshow with
     background music.
 
-    Only ``article_url`` is required. ``manual_image_urls`` holds cols G-K (any
-    filled cells become the scenes, in order); when all are blank ``num_images``
-    (col D) realistic images are generated. ``text`` (col E) is the hook — blank
-    means generate one. ``music`` (col F) is a bundled track name — blank means
-    a random track. Fields mirror ``HookCardRow`` so the route constructs it
-    directly. Plan ``_plans/2026-07-13-hook-card-tab.md``."""
+    Only ``article_url`` is required. ``manual_media`` holds cols H-L (per cell:
+    an image/video URL or the keyword ``AI`` / ``AI Video``); all blank ->
+    ``num_images`` (col D) AI images. ``text`` (col E) is the hook — blank means
+    generate one. ``voice_over`` (col F) narrates the article like the other
+    tabs. ``music`` (col G) is a bundled track / ``None`` / blank(random). Fields
+    mirror ``HookCardRow``. Plan ``_plans/2026-07-13-hook-card-tab.md``."""
 
     row_num: int = Field(ge=1)
     country: str = ""
@@ -311,8 +311,9 @@ class HookCardRowIn(BaseModel):
     article_url: str
     num_images: int = Field(default=1, ge=1, le=5)
     text: str = ""
+    voice_over: bool = False
     music: str = ""
-    manual_image_urls: list[str] = Field(default_factory=list, max_length=5)
+    manual_media: list[str] = Field(default_factory=list, max_length=5)
     aspect_ratio: str = "9:16"
     open_comments: str = ""
 

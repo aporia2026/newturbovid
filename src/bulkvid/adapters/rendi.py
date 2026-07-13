@@ -507,6 +507,7 @@ def render_cartoon_concat_command(
     audio: bool = True,
     tempo: float = SPEECH_ATEMPO,
     total_video_seconds: float | None = None,
+    fps: int | None = None,
 ) -> str:
     """Build the cartoon-mode stitch command for a VARIABLE number of clips.
 
@@ -545,10 +546,13 @@ def render_cartoon_concat_command(
     if audio:
         inputs += f"-i {{{{in_{num_clips + 1}}}}} "
 
+    # Normalizing fps lets clips from DIFFERENT sources (Ken Burns stills, pasted
+    # videos, Seedance) concat cleanly — the hook_card tab mixes all three.
+    fps_clause = f",fps={fps}" if fps else ""
     trims = "".join(
         f"[{i}:v]trim=start=0:duration={per_durations[i]:.3f},setpts=PTS-STARTPTS,"
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},setsar=1[v{i}];"
+        f"crop={width}:{height},setsar=1{fps_clause}[v{i}];"
         for i in range(num_clips)
     )
     concat_inputs = "".join(f"[v{i}]" for i in range(num_clips))
@@ -646,6 +650,40 @@ def render_ken_burns_command(
 
 def render_overlay_and_music_command() -> str:
     return _OVERLAY_AND_MUSIC_TEMPLATE
+
+
+# Set a voiceover as the ONLY audio of a (hook-overlaid, silent) video, sped up
+# by atempo (Gemini TTS reads slowly). Used by hook_card when Voiceover=Yes and
+# no music. in_1 = video, in_2 = VO. Video copied; the VO drives length.
+_SET_VO_TEMPLATE = (
+    "-i {{in_1}} -i {{in_2}} "
+    '-filter_complex "[1:a]atempo=__TEMPO__[a]" '
+    '-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest {{out_1}}'
+)
+
+# Voiceover (atempo'd, full volume) mixed OVER ducked background music. Used by
+# hook_card when Voiceover=Yes AND a music track is set. in_1 = video, in_2 =
+# VO, in_3 = music. ``duration=first`` keys the mix to the VO; music is trimmed.
+_MIX_VO_MUSIC_TEMPLATE = (
+    "-i {{in_1}} -i {{in_2}} -i {{in_3}} "
+    '-filter_complex "[1:a]atempo=__TEMPO__[vo];[2:a]volume=__MVOL__[m];'
+    '[vo][m]amix=inputs=2:duration=first[a]" '
+    '-map 0:v -map "[a]" -c:v copy -c:a aac -b:a 192k -shortest {{out_1}}'
+)
+
+
+def render_set_vo_command(tempo: float = SPEECH_ATEMPO) -> str:
+    return _SET_VO_TEMPLATE.replace("__TEMPO__", f"{tempo:.3f}")
+
+
+def render_mix_vo_music_command(
+    tempo: float = SPEECH_ATEMPO, music_volume: float = 0.3
+) -> str:
+    return (
+        _MIX_VO_MUSIC_TEMPLATE
+        .replace("__TEMPO__", f"{tempo:.3f}")
+        .replace("__MVOL__", f"{music_volume:.3f}")
+    )
 
 
 # ── Result ───────────────────────────────────────────────────────────────────
@@ -1124,6 +1162,7 @@ class RendiClient:
         aspect_ratio: str = "9:16",
         total_video_seconds: float | None = None,
         atempo: float = SPEECH_ATEMPO,
+        fps: int | None = None,
         max_attempts: int = 120,
         delay_seconds: float = 5.0,
     ) -> RendiOutput:
@@ -1149,6 +1188,7 @@ class RendiClient:
             audio=audio_url is not None,
             tempo=atempo,
             total_video_seconds=total_video_seconds,
+            fps=fps,
         )
         inputs = {f"in_{i + 1}": url for i, url in enumerate(clip_urls)}
         if audio_url is not None:
@@ -1213,6 +1253,52 @@ class RendiClient:
         url, command_id = await self._submit_and_poll(
             render_overlay_and_music_command(),
             {"in_1": video_url, "in_2": music_url, "in_3": overlay_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def set_vo_audio(
+        self,
+        video_url: str,
+        vo_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        tempo: float = SPEECH_ATEMPO,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Set ``vo_url`` (sped up by ``tempo``) as the only audio of a silent,
+        hook-overlaid video. hook_card Voiceover=Yes with no music. Auto-retried."""
+        url, command_id = await self._submit_and_poll(
+            render_set_vo_command(tempo),
+            {"in_1": video_url, "in_2": vo_url},
+            {"out_1": output_filename},
+            max_attempts=max_attempts,
+            delay_seconds=delay_seconds,
+        )
+        return RendiOutput(url=url, cost_usd=COST_RENDI_COMMAND_USD, command_id=command_id)
+
+    async def mix_vo_and_music(
+        self,
+        video_url: str,
+        vo_url: str,
+        music_url: str,
+        output_filename: str = "out.mp4",
+        *,
+        tempo: float = SPEECH_ATEMPO,
+        music_volume: float = 0.3,
+        max_attempts: int = 120,
+        delay_seconds: float = 5.0,
+    ) -> RendiOutput:
+        """Mix ``vo_url`` (atempo'd, full) OVER ``music_url`` (ducked to
+        ``music_volume``) as the audio of a silent, hook-overlaid video.
+        hook_card Voiceover=Yes with a music track; the VO drives length.
+        Auto-retried."""
+        url, command_id = await self._submit_and_poll(
+            render_mix_vo_music_command(tempo, music_volume),
+            {"in_1": video_url, "in_2": vo_url, "in_3": music_url},
             {"out_1": output_filename},
             max_attempts=max_attempts,
             delay_seconds=delay_seconds,

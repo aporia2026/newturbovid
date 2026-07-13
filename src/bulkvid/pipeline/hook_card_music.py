@@ -7,6 +7,7 @@ The sheet's Music column (col F) selects one:
 
   - ``"Uplifting 2"`` (name + variation) -> that exact track.
   - ``"Uplifting"``   (name only)        -> a random variation of that style.
+  - ``"None"``                            -> no music (silent video).
   - blank                                 -> a random track from the whole pool.
 
 An unknown name (typo) also falls back to a random track. Name matching is
@@ -113,16 +114,19 @@ def select_track(name: str | None = None, *, rng: random.Random | None = None) -
     """Pick a bundled track for a Music-column value.
 
     ``"<name> <n>"`` -> that exact variation; ``"<name>"`` -> a random variation
-    of that style; blank/None -> a random track from the whole pool. An unknown
-    name, or a variation that does not exist, falls back to a random choice.
-    Returns None when no tracks are bundled.
+    of that style; ``"None"`` -> no music (silent); blank -> a random track from
+    the whole pool. An unknown name, or a variation that does not exist, falls
+    back to a random choice. Returns None when the operator chose "None" or no
+    tracks are bundled.
     """
+    key, variation = _parse_request(name or "")
+    if key == "none":
+        return None    # operator picked "None" -> silent video
     tracks = list_tracks()
     if not tracks:
         _log.warning("hook_card_music_empty", music_dir=str(MUSIC_DIR))
         return None
     chooser = rng or random
-    key, variation = _parse_request(name or "")
     if key:
         by_name = [p for p in tracks if _name_key(_base_name(p)) == key]
         if by_name:
