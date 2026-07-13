@@ -361,14 +361,14 @@ MOTION_ADS_COLS = _MotionAdsCols()
 class _HookCardCols:
     """Layout for the ``Hook_Card`` tab (2026-07-13).
 
-    Country / Vertical / Article / Num of Images / Text / Music, then FIVE
-    Manual Image columns (G-K), Change Size (L), Open Comments (M), and one
-    Ready Video (N). The writer only needs the output column: the video URL is
-    resolved by the "Ready Video" header at write time, with this as the
+    Country / Vertical / Article / Num of Images / Text / Voiceover / Music,
+    then FIVE Manual Media columns (H-L), Change Size (M), Open Comments (N),
+    and one Ready Video (O). The writer only needs the output column: the video
+    URL is resolved by the "Ready Video" header at write time, with this as the
     positional fallback. Plan ``_plans/2026-07-13-hook-card-tab.md``.
     """
 
-    ready_video_start: int = 13   # N = 0-indexed col 13
+    ready_video_start: int = 14   # O = 0-indexed col 14
 
 
 HOOK_CARD_COLS = _HookCardCols()

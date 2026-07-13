@@ -126,3 +126,31 @@ Assembly (staged, each stage ffprobe-validated before the next):
 Prove the two net-new ffmpeg graphs + the overlay locally (local ffmpeg, no
 Rendi spend) into a real 8s 9:16 sample before wiring the tab. POC:
 `scratchpad/hook_card_poc.py`.
+
+
+## v2 (2026-07-13): per-cell media, AI video, voiceover, naming
+
+Column layout (v2): A Country · B Vertical · C Article · D Num of Images ·
+E Text · F Voiceover · G Music · H-L Manual Media 1-5 · M Change Size ·
+N Open Comments · O Ready Video.
+
+- **Per-cell media** — each Manual Media cell (H-L) independently: image URL
+  (Ken Burns), video URL (raw clip), `AI` (AI image), `AI Video` (Seedance).
+  All blank -> `Num of Images` AI images. `_classify_media` decides per cell.
+- **AI video** — `AI Video` cells generate a still (nano-banana) then animate it
+  with Seedance (a per-scene paid cost; the operator opts in per cell).
+- **Voiceover (col F)** — Yes -> a script from the article (reuses
+  `classify_open_comments` + `generate_script` + TTS like the other tabs). The
+  narration drives the video length; music is **ducked** under it (VO 100% /
+  music ~30%). New Rendi commands: `set_vo` (VO-only) and `mix_vo_music`.
+- **Mixed-fps concat** — `render_cartoon_concat_command` gained an optional
+  `fps` param so Ken Burns / pasted-video / Seedance clips (any fps) join
+  cleanly. hook_card passes `fps=30`; every other tab is unchanged.
+- **Music `None`** — `select_track("None")` returns silent.
+- **Output name** — `Country-Vertical-<langISO>-Music-RowNumber`
+  (e.g. `SE-ShippingContainerHomes-sv-Piano1-5`). Language from detection
+  (from the article, or the Text cell for fully-manual rows).
+- **Write-back** — Ready Video is now col O (`sheets._HookCardCols`).
+
+New ffmpeg graphs verified with local ffmpeg (VO mix drives length via
+`amix duration=first`; fps-normalized concat merges 30fps + 24fps sources).
