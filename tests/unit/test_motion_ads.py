@@ -318,8 +318,14 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, *, scene: str = "a container 
         captured["image_aspect"] = aspect
         return "https://kie/img.png", 0.06
 
-    async def _fake_seedance(_kie, image_url, motion, aspect, duration=4, resolution="720p"):
-        captured["seedance"] = {"image_url": image_url, "duration": duration, "aspect": aspect}
+    async def _fake_seedance(
+        _kie, image_url, motion, aspect, duration=4, resolution="720p",
+        generate_audio=False,
+    ):
+        captured["seedance"] = {
+            "image_url": image_url, "duration": duration, "aspect": aspect,
+            "generate_audio": generate_audio,
+        }
         return "https://kie/clip.mp4", 0.21
 
     async def _fake_download(_url, timeout=60.0) -> bytes:
@@ -352,6 +358,8 @@ async def test_process_generated_image_apple_sets_no_people(
     assert REALISTIC_STYLE in captured["image_prompt"]
     # Always a 12s clip.
     assert captured["seedance"]["duration"] == MA_VIDEO_DURATION_SECONDS == 12
+    # Motion Ads are SILENT by spec — Seedance 1.5 Pro audio is explicitly off.
+    assert captured["seedance"]["generate_audio"] is False
     # Apple flag was threaded into the copy call too.
     assert captured["copy_kwargs"]["apple"] is True
 

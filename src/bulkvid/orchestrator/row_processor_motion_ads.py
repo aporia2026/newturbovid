@@ -250,6 +250,9 @@ async def process_motion_ads_row(
             clip_url, clip_cost = await seedance_image_to_video(
                 clients.kie, image_url, MOTION_PROMPT, aspect,
                 duration=MA_VIDEO_DURATION_SECONDS, resolution=MA_VIDEO_RESOLUTION,
+                # Seedance 1.5 Pro generates audio unless told not to; a Motion
+                # Ad is SILENT by spec (no VO, no music, no ambient track).
+                generate_audio=False,
             )
             costs.seedance += clip_cost
         except Exception as e:

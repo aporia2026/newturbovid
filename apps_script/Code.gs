@@ -388,6 +388,23 @@ function _cell(values, idx1based) {
   return v == null ? '' : String(v).trim();
 }
 
+/** Read a "Change Size" cell into a ratio string the backend can parse.
+ *  Google Sheets casts a typed ratio like "9:16" to a TIME value (09:16), so
+ *  getValues() hands back a Date and String(date) is a full date string
+ *  ("Sat Dec 30 1899 09:16:00 GMT…") the backend can't parse — it then falls
+ *  back to the tab default, so a picked 9:16 silently became the default
+ *  (16:9 on Motion_Ads). Recover the ratio from the Date's hours:minutes,
+ *  which round-trips every dropdown option exactly (9:16, 16:9, 4:5, 21:9…).
+ *  A plain string (blank, or a free-typed "1080x1350") passes straight
+ *  through unchanged. */
+function _aspectCell(values, idx1based) {
+  const v = values[idx1based - 1];
+  if (v instanceof Date) {
+    return v.getHours() + ':' + v.getMinutes();
+  }
+  return v == null ? '' : String(v).trim();
+}
+
 function _yes(value, def) {
   const v = String(value || '').toLowerCase();
   if (!v) return def;
@@ -471,7 +488,7 @@ function _readImageVORow(sheet, rowNum) {
     // manual image's native pixel dimensions instead of silently
     // defaulting to 9:16. Plan
     // _plans/2026-06-14-blank-size-uses-native-image.md.
-    aspect_ratio: _cell(values, cols.aspectRatio),
+    aspect_ratio: _aspectCell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -499,7 +516,7 @@ function _readFourImagesRow(sheet, rowNum) {
     image_urls: imageUrls,
     zapcap: _yes(_cell(values, cols.zapcap), false),
     // Blank → backend probes image_urls[0] for native dims. See _readImageVORow.
-    aspect_ratio: _cell(values, cols.aspectRatio),
+    aspect_ratio: _aspectCell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -520,7 +537,7 @@ function _readCartoonRow(sheet, rowNum) {
     article_url: _cell(values, cols.article),
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
-    aspect_ratio: _cell(values, cols.aspectRatio) || '9:16',
+    aspect_ratio: _aspectCell(values, cols.aspectRatio) || '9:16',
     script_pattern: _cell(values, cols.scriptPattern),
     cta_enabled: _yes(_cell(values, cols.ctaEnabled), false),
     cta_text: _cell(values, cols.ctaText).slice(0, 80),    // bound at 80 chars
@@ -563,7 +580,7 @@ function _readSimpleMotionRow(sheet, rowNum) {
     manual_image_2: _cell(values, cManualImage2),
     voice_over: _yes(_cell(values, cVoiceOver), true),
     zapcap: _yes(_cell(values, cZapcap), false),
-    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
     script_pattern: _cell(values, cScriptPat),
     cta_enabled: _yes(_cell(values, cCtaEnabled), false),
     cta_text: _cell(values, cCtaText).slice(0, 80),
@@ -599,7 +616,7 @@ function _readMotionAdsRow(sheet, rowNum) {
     article_url: _cell(values, cArticle),
     manual_image_url: _cell(values, cManualImage),
     apple: _yes(_cell(values, cApple), false),
-    aspect_ratio: _cell(values, cAspectRatio) || '16:9',
+    aspect_ratio: _aspectCell(values, cAspectRatio) || '16:9',
     open_comments: _cell(values, cOpenComments),
   };
 }
@@ -649,7 +666,7 @@ function _readHookCardRow(sheet, rowNum) {
     voice_over: _yes(_cell(values, cVoiceover), false),
     music: _cell(values, cMusic),
     manual_media: manualMedia,
-    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
     open_comments: _cell(values, cOpenComments),
   };
 }
@@ -689,7 +706,7 @@ function _readYtCartoonRow(sheet, rowNum) {
     article_url: _cell(values, cArticle),
     voice_over: _yes(_cell(values, cVoiceOver), true),
     zapcap: _yes(_cell(values, cZapcap), false),
-    aspect_ratio: _cell(values, cAspectRatio) || '9:16',
+    aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
     script_pattern: _cell(values, cScriptPat),
     cta_enabled: _yes(_cell(values, cCtaEnabled), false),
     cta_text: _cell(values, cCtaText).slice(0, 80),
@@ -753,7 +770,7 @@ function _readAvatarRow(sheet, rowNum) {
     zapcap: _yes(_cell(values, cZapcap), false),
     // Blank → backend probes manual_image_url (or kie text-to-image fallback
     // → 9:16). See _readImageVORow.
-    aspect_ratio: _cell(values, cAspectRatio),
+    aspect_ratio: _aspectCell(values, cAspectRatio),
     script_pattern: _cell(values, cScriptPat),
     cta_enabled: _yes(_cell(values, cCtaEnabled), false),
     cta_text: _cell(values, cCtaText).slice(0, 80),
@@ -780,7 +797,7 @@ function _readTextOnImgRow(sheet, rowNum) {
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
     // Blank → backend probes manual_image_url for native dims. See _readImageVORow.
-    aspect_ratio: _cell(values, cols.aspectRatio),
+    aspect_ratio: _aspectCell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     open_comments: _cell(values, cols.openComments),
   };
@@ -812,7 +829,7 @@ function _readSimpleX4Row(sheet, rowNum) {
     voice_over: _yes(_cell(values, cols.voiceOver), true),
     zapcap: _yes(_cell(values, cols.zapcap), false),
     // Blank → backend probes manual_image_url for native dims. See _readImageVORow.
-    aspect_ratio: _cell(values, cols.aspectRatio),
+    aspect_ratio: _aspectCell(values, cols.aspectRatio),
     script_pattern: _cell(values, cols.scriptPattern),
     cards: cards,
     open_comments: _cell(values, cols.openComments),

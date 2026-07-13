@@ -803,6 +803,7 @@ async def seedance_image_to_video(
     aspect_ratio: str,
     duration: int = 4,
     resolution: str = "720p",
+    generate_audio: bool = False,
     max_attempts: int = 120,
     delay_seconds: float = 5.0,
     retries: int = 1,
@@ -811,8 +812,14 @@ async def seedance_image_to_video(
 
     ``duration`` must be 4, 8, or 12 (the only values the model accepts) and is
     sent as a STRING — the API rejects an integer ("duration it must be a
-    string"). Audio generation is left off (VO is added downstream). Returns
-    ``(video_url, cost_usd)`` with the cost matching the duration tier.
+    string"). Returns ``(video_url, cost_usd)`` with the cost matching the
+    duration tier.
+
+    ``generate_audio`` defaults to False. Seedance **1.5 Pro** is a native
+    audio-visual model (unlike 1.0), so it will synthesize a soundtrack unless
+    told not to; every caller here adds its own audio downstream (or wants pure
+    silence — Motion_Ads), so we send ``generate_audio=false`` explicitly rather
+    than trust the provider default, which is both cheaper and guaranteed silent.
 
     Resilience: submit + poll are retried ``retries`` extra times (default 1)
     on a genuine ``KieTimeoutError`` (task never finished / poll couldn't
@@ -841,6 +848,7 @@ async def seedance_image_to_video(
         "aspect_ratio": seedance_aspect,
         "resolution": resolution,
         "duration": str(duration),
+        "generate_audio": generate_audio,
     }
     # Cost by duration tier (plan §11; verify next live run). The 12s tier is
     # used by the Motion_Ads tab (always-12s silent clip); billing it at the 8s

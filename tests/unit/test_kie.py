@@ -782,6 +782,22 @@ async def test_seedance_sends_duration_as_string() -> None:
     # The API rejects an integer duration — it MUST be a string.
     assert body["input"]["duration"] == "4"
     assert isinstance(body["input"]["duration"], str)
+    # Seedance 1.5 Pro is a native audio-visual model; audio is OFF unless a
+    # caller opts in, so every clip is silent by default (cheaper + on-spec).
+    assert body["input"]["generate_audio"] is False
+
+
+@respx.mock
+async def test_seedance_generate_audio_opt_in() -> None:
+    captured = _capture_submit_then_succeed("https://cdn/clip.mp4")
+    pool = KiePool(keys=[KEY_A])
+    async with KieClient(pool=pool, base_url=KIE_BASE) as client:
+        await seedance_image_to_video(
+            client, image_url="https://cdn/shot1.png", prompt="gentle motion",
+            aspect_ratio="9:16", duration=4, resolution="720p",
+            generate_audio=True, max_attempts=2, delay_seconds=0.0,
+        )
+    assert captured[0]["input"]["generate_audio"] is True
 
 
 @respx.mock
