@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -104,15 +105,44 @@ DEFAULT_DIMENSIONS_BY_RATIO: dict[str, tuple[int, int]] = {
 }
 
 
+# Google Sheets time-casts a typed ratio like "9:16" to a TIME value (09:16).
+# When Apps Script serializes that cell with String(), the payload carries the
+# whole JS Date string, e.g. "Sat Dec 30 1899 09:16:00 GMT+0200 (Israel Standard
+# Time)". The HOURS:MINUTES of that embedded time ARE the operator's W:H, so we
+# recover them. A real ratio ("9:16") or a pixel value ("1080x1350") has no
+# seconds, so the HH:MM:SS pattern only ever matches the date-string form — it
+# can't misfire on a legitimate input. Belt-and-suspenders with the Apps Script
+# ``_aspectCell`` fix: the size stays correct even when the sheet ships the raw
+# Date (e.g. the bound script has not been re-pasted yet).
+_TIME_CAST_RE = re.compile(r"\b(\d{1,2}):(\d{2}):\d{2}\b")
+
+
+def _recover_time_cast_ratio(s: str) -> str | None:
+    """Recover a ``"H:M"`` ratio from a time-cast Sheets cell that arrived as a
+    JS Date string. Returns None when ``s`` carries no embedded ``HH:MM:SS``."""
+    m = _TIME_CAST_RE.search(s)
+    if not m:
+        return None
+    hours, minutes = int(m.group(1)), int(m.group(2))
+    if hours <= 0 or minutes <= 0:
+        return None
+    return f"{hours}:{minutes}"
+
+
 def dimensions_for_ratio(aspect_ratio: str) -> tuple[int, int]:
     """Return ``(width, height)`` for a Sheet aspect-ratio string.
 
     Handles ``9:16``, ``09:16`` (Sheets time-cast: a leading-zero like cell),
-    and ``WxH`` pixel format. Falls back to 9:16 for unrecognised inputs.
+    a full JS Date string (the time-cast cell serialized raw), and ``WxH`` pixel
+    format. Falls back to 9:16 for unrecognised inputs.
     """
     s = (aspect_ratio or "").strip().lower()
     if not s or s == "auto":
         return DEFAULT_DIMENSIONS_BY_RATIO["9:16"]
+
+    recovered = _recover_time_cast_ratio(s)
+    if recovered is not None:
+        s = recovered
 
     # W:H — normalise by stripping leading zeros on each side.
     if ":" in s:
@@ -142,7 +172,8 @@ VALID_RATIO_STRINGS: frozenset[str] = frozenset(
 def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
     """Map a sheet-entered size to a valid model ``aspect_ratio`` string.
 
-    Handles ``09:16`` (Sheets time-cast), ``9:16``, and ``WxH`` pixel inputs.
+    Handles ``09:16`` (Sheets time-cast), ``9:16``, a full JS Date string (the
+    time-cast cell serialized raw), and ``WxH`` pixel inputs.
 
     When the input names an EXACT ratio outside ``VALID_RATIO_STRINGS`` (e.g.
     ``"7:3"``), or a ``WxH`` whose GCD-reduced ratio isn't in the valid set
@@ -157,6 +188,10 @@ def normalize_aspect_ratio(aspect_ratio: str, default: str = "9:16") -> str:
     s = (aspect_ratio or "").strip().lower()
     if not s or s == "auto":
         return default
+
+    recovered = _recover_time_cast_ratio(s)
+    if recovered is not None:
+        s = recovered
 
     if ":" in s:
         parts = s.split(":")

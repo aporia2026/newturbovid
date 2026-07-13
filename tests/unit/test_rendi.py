@@ -64,6 +64,9 @@ BASE = "https://api.rendi.dev"
         ("1080x1920", (1080, 1920)),      # explicit pixel format
         ("1920x1080", (1920, 1080)),
         ("0x0", (1080, 1920)),            # invalid pixel format -> default
+        # A time-cast cell serialized raw as a JS Date string: recover H:M.
+        ("Sat Dec 30 1899 09:16:00 GMT+0200 (Israel Standard Time)", (1080, 1920)),
+        ("Sat Dec 30 1899 16:09:00 GMT+0200 (Israel Standard Time)", (1920, 1080)),
     ],
 )
 def test_dimensions_for_ratio(input_str: str, expected: tuple[int, int]) -> None:
@@ -556,6 +559,10 @@ async def test_mix_music_returns_url_and_cost() -> None:
         ("5:7", "3:4"),              # 0.714 closer to 3:4 (0.75) than 2:3 (0.667)
         ("1234x567", "21:9"),       # 2.18 closer to 21:9 (2.33) than 16:9 (1.78)
         ("1080x1620", "2:3"),        # GCD-reduces straight to 2:3 (in valid set)
+        # A time-cast cell serialized raw as a JS Date string: recover H:M then
+        # normalize (this is the Motion_Ads "picked 9:16, got 16:9" bug).
+        ("Sat Dec 30 1899 09:16:00 GMT+0200 (Israel Standard Time)", "9:16"),
+        ("Sat Dec 30 1899 16:09:00 GMT+0200 (Israel Standard Time)", "16:9"),
     ],
 )
 def test_normalize_aspect_ratio(raw: str, expected: str) -> None:
@@ -567,6 +574,17 @@ def test_normalize_aspect_ratio_custom_default() -> None:
     # ``auto``, or unparseable garbage). A valid-format input still snaps to
     # the closest model ratio.
     assert normalize_aspect_ratio("nonsense", default="1:1") == "1:1"
+
+
+def test_normalize_aspect_ratio_time_cast_beats_default() -> None:
+    # The exact operator failure: Sheets time-casts a picked "9:16" to 09:16,
+    # Apps Script ships the raw JS Date string, and Motion_Ads (default 16:9)
+    # fell back to 16:9. The recovered hours:minutes must win over the default,
+    # so a picked 9:16 renders 9:16 even before the bound script is re-pasted.
+    js_9_16 = "Sat Dec 30 1899 09:16:00 GMT+0200 (Israel Standard Time)"
+    assert normalize_aspect_ratio(js_9_16, default="16:9") == "9:16"
+    # A legitimate input carrying no HH:MM:SS is untouched by the recovery.
+    assert normalize_aspect_ratio("1080x1350", default="16:9") == "4:5"
 
 
 # ── Auto-retry (_submit_and_poll) ────────────────────────────────────────────
