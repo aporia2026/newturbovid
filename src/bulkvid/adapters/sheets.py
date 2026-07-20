@@ -40,6 +40,7 @@ from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
+    TAB_GOOGLE_SIMPLE_MOTION,
     TAB_HOOK_CARD,
     TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
@@ -277,6 +278,41 @@ SIMPLE_MOTION_COLS = _SimpleMotionCols()
 
 
 @dataclass(frozen=True)
+class _GoogleSimpleMotionCols:
+    """Layout for the ``google-simple-motion`` tab (2026-07-20).
+
+    Image-VO columns A-C, then TWO Manual Image columns (D/E), Number of Videos
+    (F), Voice Over / ZapCap (G/H), FOUR Change Size columns (I-L, one per
+    output video), Script Pattern (M), CTA + CTA Text (N/O), Open Comments (P),
+    then FOUR Ready Video columns (Q-T). A row writes ``num_videos`` URLs starting
+    at Ready Video 1 (col Q); the write-back resolves the column by header first,
+    but this positional value is the fallback AND the gate that lets the write run
+    at all. Plan ``_plans/2026-07-20-google-simple-motion-tab.md``.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image_1: int = 3   # D
+    manual_image_2: int = 4   # E
+    num_videos: int = 5       # F
+    voice_over: int = 6       # G
+    zapcap: int = 7           # H
+    aspect_1: int = 8         # I  (Change Size 1)
+    aspect_2: int = 9         # J  (Change Size 2)
+    aspect_3: int = 10        # K  (Change Size 3)
+    aspect_4: int = 11        # L  (Change Size 4)
+    script_pattern: int = 12  # M
+    cta_enabled: int = 13     # N
+    cta_text: int = 14        # O
+    open_comments: int = 15   # P
+    ready_video_start: int = 16   # Q = 0-indexed col 16
+
+
+GOOGLE_SIMPLE_MOTION_COLS = _GoogleSimpleMotionCols()
+
+
+@dataclass(frozen=True)
 class _YtCartoonCols:
     """Layout for the ``yt-cartoon`` tab (2026-06-17).
 
@@ -392,6 +428,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_FOUR_IMAGES: 1,
     TAB_SIMPLE: 1,
     TAB_SIMPLE_MOTION: 1,
+    TAB_GOOGLE_SIMPLE_MOTION: 1,
     TAB_CARTOON: 1,
     TAB_YT_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
@@ -580,6 +617,8 @@ class SheetsClient:
             col = IMAGE_VO_COLS.ready_video_start
         elif layout == TAB_SIMPLE_MOTION:
             col = SIMPLE_MOTION_COLS.ready_video_start
+        elif layout == TAB_GOOGLE_SIMPLE_MOTION:
+            col = GOOGLE_SIMPLE_MOTION_COLS.ready_video_start
         elif layout == TAB_CARTOON:
             col = CARTOON_COLS.ready_video_start
         elif layout == TAB_YT_CARTOON:
@@ -990,6 +1029,8 @@ class SheetsClient:
                 if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
                 else SIMPLE_MOTION_COLS.ready_video_start
                 if tab_type == TAB_SIMPLE_MOTION
+                else GOOGLE_SIMPLE_MOTION_COLS.ready_video_start
+                if tab_type == TAB_GOOGLE_SIMPLE_MOTION
                 else CARTOON_COLS.ready_video_start
                 if tab_type == TAB_CARTOON
                 else YT_CARTOON_COLS.ready_video_start

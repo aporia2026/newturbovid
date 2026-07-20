@@ -313,6 +313,45 @@ class SimpleMotionRow:
 
 
 @dataclass
+class GoogleSimpleMotionRow:
+    """google-simple-motion tab input row — N size-variant fixed-script motion ads.
+
+    A sibling of :class:`SimpleMotionRow`. Instead of an article-driven voiceover,
+    every video speaks the SAME fixed, localized two-sentence script
+    (``pipeline.google_simple_motion``) with a 3s silence between the sentences,
+    floored at 11s. A row produces ``num_videos`` (1-4) videos; slot ``i`` is
+    rendered at ``aspect_ratios[i]`` (Change Size ``i+1``) and written to Ready
+    Video ``i+1`` (cols Q-T). The source image per slot:
+
+      * slot 1 → Manual Image 1 (col D) as-is; blank → generated realistic scene
+      * slot 2 → Manual Image 2 (col E) as-is; blank → generated realistic scene
+      * slot 3 → AI image, image-to-image using Manual Image 1 as reference
+      * slot 4 → AI image, image-to-image using Manual Image 2 as reference
+
+    ``aspect_ratios`` is always length 4 (Change Size 1-4); slots beyond
+    ``num_videos`` are ignored, and a blank entry within range defaults to 9:16.
+    The subject, opening (random of Explore/Learn/Read more), script, and
+    voiceover audio are generated ONCE and shared across all N videos. Plan
+    ``_plans/2026-07-20-google-simple-motion-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_1: str               # col D — slot 1 base; blank → generate
+    manual_image_2: str               # col E — slot 2 base; blank → generate
+    num_videos: int                   # col F — how many videos (1-4)
+    voice_over: bool                  # col G — No → silent motion videos
+    zapcap: bool                      # col H
+    aspect_ratios: list[str]          # cols I-L (Change Size 1-4); slot i uses [i]
+    script_pattern: str               # col M
+    open_comments: str                # col P — context for scene generation
+    cta_enabled: bool = False         # col N — Yes/No pill
+    cta_text: str = ""                # col O — operator text; empty → per-language default
+
+
+@dataclass
 class MotionAdsRow:
     """Motion_Ads tab input row — a silent motion-ad video + ad copy.
 

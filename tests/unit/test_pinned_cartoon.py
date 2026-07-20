@@ -33,6 +33,7 @@ from bulkvid.adapters.storage import UploadResult
 from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.pinned_cartoon import (
     PinnedShotSpec,
+    PrebuiltVoiceover,
     build_pinned_cartoon_video,
 )
 
@@ -311,3 +312,58 @@ async def test_pinned_empty_shots_errors() -> None:
     )
     assert res.final_url is None
     assert "no shots" in (res.error or "")
+
+
+# ── prebuilt_vo + min_video_seconds (google-simple-motion) ───────────────────
+
+
+@respx.mock
+async def test_prebuilt_vo_skips_tts_and_floors_length(monkeypatch) -> None:
+    """A caller-supplied VO is used verbatim: no internal TTS, no TTS cost, and
+    the video is floored at ``min_video_seconds`` when the audio is shorter."""
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _clients(tts_duration=999.0)               # would blow the budget if called
+
+    shots = [
+        PinnedShotSpec(scene="s", motion="pan", manual_image_url="https://img.test/a.png"),
+        PinnedShotSpec(scene="gen", motion="push"),      # generated + chained shot 2
+    ]
+    res = await build_pinned_cartoon_video(
+        clients=clients, slug="g1", pinned_script="unused when prebuilt",
+        style_direction="x", shots=shots, language="de", country="DE",
+        aspect="9:16", voice_over=True, fixed_shots=True,
+        prebuilt_vo=PrebuiltVoiceover(wav_bytes=_wav_bytes(), duration_seconds=6.0),
+        min_video_seconds=11.0,
+    )
+    assert res.final_url is not None
+    assert clients.tts.calls == 0                        # internal TTS skipped
+    assert res.cost_tts == 0.0                           # caller counted it
+    # 6s audio + 0.5 dwell = 6.5 < 11 floor → clamped up to 11.0, words never cut.
+    assert clients.rendi.concat_calls[0]["total"] == pytest.approx(11.0, abs=0.01)
+    assert clients.rendi.concat_calls[0]["atempo"] == pytest.approx(1.0)
+    # The supplied WAV was uploaded as the voiceover.
+    assert any(k.endswith("/pinned.wav") for k, _ in clients.storage.calls)
+
+
+@respx.mock
+async def test_prebuilt_vo_longer_than_floor_follows_audio(monkeypatch) -> None:
+    """When the supplied audio exceeds the floor, length follows it (never cut)."""
+    _patch_kie(monkeypatch)
+    _register_downloads()
+    clients = _clients(tts_duration=999.0)
+
+    shots = [
+        PinnedShotSpec(scene="s", motion="pan", manual_image_url="https://img.test/a.png"),
+        PinnedShotSpec(scene="gen", motion="push"),
+    ]
+    res = await build_pinned_cartoon_video(
+        clients=clients, slug="g2", pinned_script="unused",
+        style_direction="x", shots=shots, language="en", country="US",
+        aspect="1:1", voice_over=True, fixed_shots=True,
+        prebuilt_vo=PrebuiltVoiceover(wav_bytes=_wav_bytes(), duration_seconds=13.0),
+        min_video_seconds=11.0,
+    )
+    assert res.final_url is not None
+    # 13s + 0.5 dwell = 13.5 (> 11 floor) → length follows the audio.
+    assert clients.rendi.concat_calls[0]["total"] == pytest.approx(13.5, abs=0.01)

@@ -85,6 +85,24 @@ class PinnedShotSpec:
 
 
 @dataclass
+class PrebuiltVoiceover:
+    """A voiceover the CALLER already synthesized, handed to the builder instead
+    of a script string to TTS internally.
+
+    Used by the google-simple-motion tab, which speaks a two-sentence fixed
+    script with a 3s silence spliced between the sentences (see
+    ``pipeline.audio_gap``) — the audio can't be produced by a single
+    ``synthesize`` call, so the processor builds it and passes it here. The
+    builder uploads ``wav_bytes`` and sizes the video against ``duration_seconds``
+    exactly as it would a fresh TTS. The caller has already accounted for the TTS
+    cost, so the builder does NOT add to ``cost_tts`` on this path.
+    """
+
+    wav_bytes: bytes
+    duration_seconds: float
+
+
+@dataclass
 class PinnedVideoResult:
     """Outcome of one pinned build. Cost fields fold into the caller's ``_Costs``."""
 
@@ -141,6 +159,8 @@ async def build_pinned_cartoon_video(
     cta_overlay_url: str | None = None,
     zapcap_enabled: bool = False,
     zapcap_render_options: ZapCapRenderOptions | None = None,
+    prebuilt_vo: PrebuiltVoiceover | None = None,
+    min_video_seconds: float = MIN_VIDEO_SECONDS,
 ) -> PinnedVideoResult:
     """Build ONE video whose voiceover is the operator's pinned script, verbatim.
 
@@ -149,6 +169,13 @@ async def build_pinned_cartoon_video(
     ``plan_pinned_shots`` and slices ``shots`` to it (cartoon / yt-cartoon).
     Never raises — returns a result with ``final_url=None`` and a populated
     ``error`` on failure so the caller can surface it like a dropped idea.
+
+    ``prebuilt_vo`` (google-simple-motion): when set, the caller supplies the
+    voiceover WAV + duration instead of ``pinned_script`` being TTS'd here — used
+    for the two-sentence-plus-3s-gap fixed script. ``min_video_seconds`` overrides
+    the video-length floor (default ``MIN_VIDEO_SECONDS``) for BOTH the voiced and
+    the silent paths; google-simple-motion passes 11.0. Existing callers pass
+    neither, so their behaviour is unchanged.
     """
     res = PinnedVideoResult(final_url=None)
     if not shots:
@@ -159,16 +186,24 @@ async def build_pinned_cartoon_video(
         # ── 1. Voiceover (verbatim — no shorten, no cap) + render geometry ──
         vo_url: str | None = None
         if voice_over:
-            tts = await clients.tts.synthesize(
-                text=pinned_script,
-                language=language,
-                style_prompt=style_direction,
-                country=country,
-            )
-            res.cost_tts += tts.cost_usd
-            raw = float(tts.duration_seconds)
+            # A caller-supplied voiceover (google-simple-motion's two-sentence +
+            # 3s-gap WAV) skips the internal TTS; its cost is already counted by
+            # the caller. Otherwise TTS the pinned script here as before.
+            if prebuilt_vo is not None:
+                vo_wav_bytes = prebuilt_vo.wav_bytes
+                raw = float(prebuilt_vo.duration_seconds)
+            else:
+                tts = await clients.tts.synthesize(
+                    text=pinned_script,
+                    language=language,
+                    style_prompt=style_direction,
+                    country=country,
+                )
+                res.cost_tts += tts.cost_usd
+                vo_wav_bytes = tts.wav_bytes
+                raw = float(tts.duration_seconds)
             vo_up = await clients.storage.upload_bytes(
-                tts.wav_bytes,
+                vo_wav_bytes,
                 key=f"bulkvid/vo/{slug}/pinned.wav",
                 content_type="audio/wav",
             )
@@ -177,9 +212,10 @@ async def build_pinned_cartoon_video(
 
             if fixed_shots:
                 # Keep the operator's exact shots; stretch them to the audio.
-                # Same MIN floor as the variable path; no upper cap (audio wins).
+                # Floor at ``min_video_seconds`` (6 by default; 11 for
+                # google-simple-motion); no upper cap (audio wins).
                 num_shots = len(shots)
-                total = max(MIN_VIDEO_SECONDS, round(raw + VO_TAIL_SECONDS, 3))
+                total = max(min_video_seconds, round(raw + VO_TAIL_SECONDS, 3))
                 per_clip = _even_clips(total, num_shots)
                 seedance_durations = [_smallest_legal_duration(p) for p in per_clip]
             else:
@@ -194,7 +230,7 @@ async def build_pinned_cartoon_video(
             _log.warning("pinned_script_but_vo_off", slug=slug)
             raw = 0.0
             num_shots = len(shots) if fixed_shots else PINNED_MIN_SHOTS
-            total = float(num_shots * SILENT_SHOT_SECONDS)
+            total = max(min_video_seconds, float(num_shots * SILENT_SHOT_SECONDS))
             per_clip = _even_clips(total, num_shots)
             seedance_durations = [_smallest_legal_duration(p) for p in per_clip]
 

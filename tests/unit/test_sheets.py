@@ -31,6 +31,7 @@ from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
 from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_FOUR_IMAGES,
+    TAB_GOOGLE_SIMPLE_MOTION,
     TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_YT_CARTOON,
@@ -474,6 +475,62 @@ async def test_yt_cartoon_writes_to_columns_P_and_Q() -> None:
     cells = {u["range"]: u["values"][0][0] for u in updates}
     # yt-cartoon: ready videos start at col P (1-indexed col 16), 0-indexed 15.
     assert cells == {"P2": "u1", "Q2": "u2"}
+
+
+async def test_google_simple_motion_writes_to_columns_Q_through_T() -> None:
+    """Regression for the silent-drop trap (memory ``adding-a-tab-wiring-
+    checklist``): a tab missing its branch in ``batch_write_video_urls``'s
+    positional_fallback chain hits ``else None`` and the write is SKIPPED — the
+    finished videos never land. With no header row in the fake client, the write
+    MUST fall back to the positional column (Ready Video 1 = col Q, 0-indexed 16)
+    and write ALL N size-variant videos to Q..T."""
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+
+    n = await sc.batch_write_video_urls(
+        [
+            _write(
+                sheet_id="sheet-G",
+                worksheet="google-simple-motion",
+                tab_type=TAB_GOOGLE_SIMPLE_MOTION,
+                row_num=2,
+                video_urls=["u1", "u2", "u3", "u4"],   # Number of Videos = 4
+            )
+        ]
+    )
+    assert n == 4
+
+    ws = worksheets[("sheet-G", "google-simple-motion")]
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # google-simple-motion: Ready Video 1 at col Q (1-indexed 17), 0-indexed 16.
+    assert cells == {"Q2": "u1", "R2": "u2", "S2": "u3", "T2": "u4"}
+
+
+async def test_google_simple_motion_slot_aligned_partial() -> None:
+    """A failed size leaves its Ready Video cell empty; the others keep their
+    slot (video_urls carries "" for the failed slot, and the writer skips it)."""
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+
+    n = await sc.batch_write_video_urls(
+        [
+            _write(
+                sheet_id="sheet-G2",
+                worksheet="google-simple-motion",
+                tab_type=TAB_GOOGLE_SIMPLE_MOTION,
+                row_num=5,
+                video_urls=["u1", "", "u3"],   # slot 2 failed
+            )
+        ]
+    )
+    assert n == 2
+
+    ws = worksheets[("sheet-G2", "google-simple-motion")]
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # u1 → Q (slot 1), "" skipped (slot 2 stays empty), u3 → S (slot 3).
+    assert cells == {"Q5": "u1", "S5": "u3"}
 
 
 async def test_image_resize_writes_to_column_K() -> None:

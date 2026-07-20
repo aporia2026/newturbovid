@@ -15,6 +15,7 @@ const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_SIMPLE_MOTION = 'simple_motion';
+const TAB_GOOGLE_SIMPLE_MOTION = 'google_simple_motion';
 const TAB_CARTOON = 'cartoon';
 const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
@@ -22,6 +23,7 @@ const TAB_TEXT_ON_IMG = 'text_on_img';
 const TAB_AVATAR = 'avatar';
 const TAB_MOTION_ADS = 'motion_ads';
 const TAB_HOOK_CARD = 'hook_card';
+const TAB_IMAGE_RESIZE = 'image_resize';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -77,7 +79,7 @@ const SIZE_DROPDOWN_OPTIONS = [
 // operator sees the active model and its sizes at pick time. Keep
 // SEEDANCE_SIZE_OPTIONS in sync with SEEDANCE_ALLOWED_ASPECT_RATIOS in
 // src/bulkvid/adapters/kie.py.
-const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
+const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_GOOGLE_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
 const ACTIVE_VIDEO_MODEL_LABEL = 'Seedance 1.5 Pro';
 const SEEDANCE_SIZE_OPTIONS = ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'];
 
@@ -153,6 +155,23 @@ const SIMPLE_MOTION_COLS = {
   lastInputCol: 12,
 };
 
+// google-simple-motion tab (2026-07-20): N size-variant fixed-script motion ads.
+// Two Manual Image cols (D/E), Number of Videos (F), Voice Over / ZapCap (G/H),
+// FOUR Change Size cols (I-L, one per output video), Script Pattern (M), CTA +
+// CTA Text (N/O), Open Comments (P), then FOUR Ready Video cols (Q-T). Read by
+// HEADER NAME first (like simple-motion) with these positional values as the
+// fallback. Change Size i sets the aspect of Ready Video i.
+const GOOGLE_SIMPLE_MOTION_COLS = {
+  country: 1, vertical: 2, article: 3,
+  manualImage1: 4, manualImage2: 5,
+  numVideos: 6, voiceOver: 7, zapcap: 8,
+  aspect1: 9, aspect2: 10, aspect3: 11, aspect4: 12,
+  scriptPattern: 13, ctaEnabled: 14, ctaText: 15,
+  openComments: 16,
+  readyVideo1: 17, readyVideo2: 18, readyVideo3: 19, readyVideo4: 20,
+  lastInputCol: 16,
+};
+
 // yt-cartoon tab (2026-06-17): the cartoon layout PLUS four new columns
 // inserted after ZapCap (F) — Tone (G), Cap Position (H), CTA Position (I),
 // Vid Length (J) — which shift Change Size..Ready Video right by 4. Read by
@@ -173,6 +192,19 @@ const YT_CARTOON_COLS = {
 // E (the overlay text), then the standard F-J input columns shifted right
 // by 1. One video per row, so Ready Video lands at K.
 const TEXT_ON_IMG_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  text: 5,
+  voiceOver: 6, zapcap: 7, aspectRatio: 8, scriptPattern: 9,
+  openComments: 10,
+  readyVideo1: 11,
+  lastInputCol: 10,
+};
+
+// image_resize (2026-07-20): Yoav cloned the text_on_img layout, so the columns
+// are identical — Manual Image (D) reframed to Change Size (H), result written
+// to Ready Image (K). Text (E) is present but ignored: the text this tab
+// preserves is baked into the image, not typed by the operator.
+const IMAGE_RESIZE_COLS = {
   country: 1, vertical: 2, article: 3, manualImage: 4,
   text: 5,
   voiceOver: 6, zapcap: 7, aspectRatio: 8, scriptPattern: 9,
@@ -331,11 +363,27 @@ function _detectTabType(sheet) {
   if (name.indexOf('text on img') !== -1 || name.indexOf('paste text') !== -1) {
     return TAB_TEXT_ON_IMG;
   }
+  // "image_resize" -> reframe the Manual Image to a new size, keeping the design
+  // and any baked-in text (2026-07-20). MUST be checked by NAME before the
+  // generic "manual image" header fallback below, which would otherwise misroute
+  // this tab to image_vo (it shares the Manual Image header).
+  if (name.indexOf('image_resize') !== -1 || name.indexOf('image resize') !== -1
+      || name.indexOf('image-resize') !== -1) {
+    return TAB_IMAGE_RESIZE;
+  }
   // "simple x4" -> needs disambiguation: post-migration it has 2 header rows
   // and the new Template/CTA columns; pre-migration it's the legacy image_vo
   // shape. Must be checked BEFORE plain "simple" since the name contains it.
   if (name.indexOf('x4') !== -1) {
     return _isSimpleX4Migrated(sheet) ? TAB_SIMPLE_X4 : TAB_IMAGE_VO;
+  }
+  // "google-simple-motion" -> N size-variant fixed-script motion ads (2026-07-20).
+  // MUST be checked BEFORE "simple-motion" (and "simple"), since the name
+  // "google-simple-motion" CONTAINS "simple-motion" — without this it would
+  // misroute to the simple-motion tab and drop the multi-video columns.
+  if (name.indexOf('google-simple-motion') !== -1
+      || name.indexOf('google simple motion') !== -1) {
+    return TAB_GOOGLE_SIMPLE_MOTION;
   }
   // "simple-motion" -> animate super-realistic images (manual D/E or generated).
   // MUST be checked BEFORE the generic "simple" match below, since the name
@@ -589,6 +637,61 @@ function _readSimpleMotionRow(sheet, rowNum) {
 }
 
 
+function _readGoogleSimpleMotionRow(sheet, rowNum) {
+  // google-simple-motion: two Manual Image columns (D/E), Number of Videos (F),
+  // Voice Over / ZapCap, FOUR Change Size columns (I-L, one per output video),
+  // Script Pattern, CTA + CTA Text, Open Comments. Resolved by HEADER NAME first
+  // (mirrors _readSimpleMotionRow) with GOOGLE_SIMPLE_MOTION_COLS as the fallback.
+  // Number of Videos → num_videos (1-4); the four Change Size cells →
+  // aspect_ratios[0..3], slot i rendered at Change Size i (blank → 9:16 server-side).
+  const cols = GOOGLE_SIMPLE_MOTION_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage1 = _colForHeaders(headerMap, ['Manual Image 1', 'Manual Image'], cols.manualImage1);
+  const cManualImage2 = _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2);
+  const cNumVideos    = _colForHeaders(headerMap, ['Number of Videos', 'Number Of Videos', 'Num of Videos'], cols.numVideos);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cAspect1      = _colForHeaders(headerMap, ['Change Size 1', 'Change Size'], cols.aspect1);
+  const cAspect2      = _colForHeaders(headerMap, ['Change Size 2'], cols.aspect2);
+  const cAspect3      = _colForHeaders(headerMap, ['Change Size 3'], cols.aspect3);
+  const cAspect4      = _colForHeaders(headerMap, ['Change Size 4'], cols.aspect4);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  const numVideos = Math.max(1, Math.min(4, parseInt(_cell(values, cNumVideos), 10) || 1));
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_1: _cell(values, cManualImage1),
+    manual_image_2: _cell(values, cManualImage2),
+    num_videos: numVideos,
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratios: [
+      _aspectCell(values, cAspect1),
+      _aspectCell(values, cAspect2),
+      _aspectCell(values, cAspect3),
+      _aspectCell(values, cAspect4),
+    ],
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
 function _readMotionAdsRow(sheet, rowNum) {
   // Motion_Ads: Country / Vertical / Article, then TWO OUTPUT columns the backend
   // fills (Headline D, Description E) which are NOT read here, then Manual Image /
@@ -804,6 +907,30 @@ function _readTextOnImgRow(sheet, rowNum) {
 }
 
 
+function _readImageResizeRow(sheet, rowNum) {
+  // image_resize: column-identical to text_on_img. We reframe Manual Image (D)
+  // to Change Size (H). Text (E) is read for wire compatibility but ignored by
+  // the backend (the preserved text is baked into the image). Unlike the other
+  // manual-image tabs, a BLANK Change Size is NOT "use native" here — a resize
+  // with no target is a no-op, so the backend rejects it with a clear message.
+  const cols = IMAGE_RESIZE_COLS;
+  const values = sheet.getRange(rowNum, 1, 1, cols.lastInputCol).getValues()[0];
+  return {
+    row_num: rowNum,
+    country: _cell(values, cols.country),
+    vertical: _cell(values, cols.vertical),
+    article_url: _cell(values, cols.article),
+    manual_image_url: _cell(values, cols.manualImage),
+    text: _cell(values, cols.text).slice(0, 240),
+    voice_over: _yes(_cell(values, cols.voiceOver), true),
+    zapcap: _yes(_cell(values, cols.zapcap), false),
+    aspect_ratio: _aspectCell(values, cols.aspectRatio),
+    script_pattern: _cell(values, cols.scriptPattern),
+    open_comments: _cell(values, cols.openComments),
+  };
+}
+
+
 function _readSimpleX4Row(sheet, rowNum) {
   // Post-migration simple_x4 layout: same A-H as image_vo + 4 (template, cta)
   // pairs + open_comments at col Q. Backend rejects Template* values that
@@ -854,6 +981,15 @@ function _validateSimpleMotion(r) {
   // Only the article is required (it drives the voiceover + any generated
   // scenes). Both Manual Image columns are optional — a blank cell is
   // auto-generated, a filled cell is animated as-is.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
+function _validateGoogleSimpleMotion(r) {
+  // Only the article is required (it drives the subject + any generated scenes).
+  // Manual images are optional (blank → generated). Number of Videos / Change
+  // Size default sensibly server-side, so they never block a row.
   if (!r.article_url) return 'article URL missing';
   return null;
 }
@@ -913,6 +1049,16 @@ function _validateTextOnImg(r) {
   // Empty Text is allowed (the renderer ships the image as-is). Length is
   // bounded by _readTextOnImgRow's .slice(0, 240) above — no upper-bound
   // check needed here.
+  return null;
+}
+
+
+function _validateImageResize(r) {
+  // The image itself is the only hard requirement. Change Size is validated
+  // separately (blank is caught fast here so the operator doesn't wait for the
+  // backend's 400) — a resize with no target size is a no-op.
+  if (!r.manual_image_url) return 'manual image URL missing';
+  if (!r.aspect_ratio) return 'Change Size missing — pick a target size (col H)';
   return null;
 }
 
@@ -985,6 +1131,7 @@ function _unprocessedRowNumbers(sheet, readyVideoCol1, tabType) {
 // ─── Menu actions ───────────────────────────────────────────────────────────
 
 function generateSelected() {
+  if (!_ensureAuthorized_()) return;
   const sheet = SpreadsheetApp.getActiveSheet();
   const tabType = _detectTabType(sheet);
   if (!tabType) {
@@ -1003,6 +1150,7 @@ function generateSelected() {
 
 
 function generateAllUnprocessed() {
+  if (!_ensureAuthorized_()) return;
   const sheet = SpreadsheetApp.getActiveSheet();
   const tabType = _detectTabType(sheet);
   if (!tabType) {
@@ -1015,12 +1163,14 @@ function generateAllUnprocessed() {
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
+    : tabType === TAB_GOOGLE_SIMPLE_MOTION ? GOOGLE_SIMPLE_MOTION_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
     : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
     : tabType === TAB_AVATAR ? AVATAR_COLS
     : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
     : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
+    : tabType === TAB_IMAGE_RESIZE ? IMAGE_RESIZE_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -1045,22 +1195,26 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
     : tabType === TAB_SIMPLE_MOTION ? _readSimpleMotionRow
+    : tabType === TAB_GOOGLE_SIMPLE_MOTION ? _readGoogleSimpleMotionRow
     : tabType === TAB_YT_CARTOON ? _readYtCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
     : tabType === TAB_AVATAR ? _readAvatarRow
     : tabType === TAB_MOTION_ADS ? _readMotionAdsRow
     : tabType === TAB_HOOK_CARD ? _readHookCardRow
+    : tabType === TAB_IMAGE_RESIZE ? _readImageResizeRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
     : tabType === TAB_SIMPLE_MOTION ? _validateSimpleMotion
+    : tabType === TAB_GOOGLE_SIMPLE_MOTION ? _validateGoogleSimpleMotion
     : tabType === TAB_YT_CARTOON ? _validateYtCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
     : tabType === TAB_AVATAR ? _validateAvatar
     : tabType === TAB_MOTION_ADS ? _validateMotionAds
     : tabType === TAB_HOOK_CARD ? _validateHookCard
+    : tabType === TAB_IMAGE_RESIZE ? _validateImageResize
     : _validateImageVO;
 
   let rows = [];
@@ -1088,12 +1242,14 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
+      : tabType === TAB_GOOGLE_SIMPLE_MOTION ? GOOGLE_SIMPLE_MOTION_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
       : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
       : tabType === TAB_AVATAR ? AVATAR_COLS
       : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
       : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
+      : tabType === TAB_IMAGE_RESIZE ? IMAGE_RESIZE_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -1133,6 +1289,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_SIMPLE_MOTION) payload.rows_simple_motion = rows;
+  else if (tabType === TAB_GOOGLE_SIMPLE_MOTION) payload.rows_google_simple_motion = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_YT_CARTOON) payload.rows_yt_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
@@ -1140,6 +1297,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_AVATAR) payload.rows_avatar = rows;
   else if (tabType === TAB_MOTION_ADS) payload.rows_motion_ads = rows;
   else if (tabType === TAB_HOOK_CARD) payload.rows_hook_card = rows;
+  else if (tabType === TAB_IMAGE_RESIZE) payload.rows_image_resize = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);
@@ -1725,7 +1883,7 @@ function applyOpenCommentsTips() {
     var tabType = _detectTabType(sheet);
     // No voiceover on these tabs, so the "use this script:" marker does nothing.
     if (tabType === TAB_TEXT_ON_IMG || tabType === TAB_MOTION_ADS
-        || tabType === TAB_HOOK_CARD) return;
+        || tabType === TAB_HOOK_CARD || tabType === TAB_IMAGE_RESIZE) return;
     // Headers sit on row 1 everywhere except migrated simple_x4 tabs, where
     // row 1 is the template-preview band and row 2 holds them (mirrors
     // applySizeDropdowns).
@@ -1762,9 +1920,145 @@ function applyOpenCommentsTips() {
 // ─── Sidebar ────────────────────────────────────────────────────────────────
 
 function showJobsSidebar() {
+  // Opened both after a submit (already authorized by then) and standalone from
+  // the menu. Gate the standalone case so an unauthorized user gets the re-auth
+  // prompt instead of a sidebar that just spins on failed backend polls.
+  if (!_ensureAuthorized_()) return;
   const html = HtmlService.createHtmlOutputFromFile('Sidebar')
     .setTitle('Aporia Bulk Video');
   SpreadsheetApp.getUi().showSidebar(html);
+}
+
+
+// ─── Authorization ───────────────────────────────────────────────────────────
+
+/** True when the active user has already granted every scope the script
+ *  currently needs — in particular script.external_request, without which the
+ *  backend calls throw "You do not have permission to call UrlFetchApp.fetch".
+ *
+ *  This gate exists because a returning user whose grant predates a manifest
+ *  scope change is NOT re-prompted when they click a menu item: the function
+ *  runs under the stale grant and only dies deep inside UrlFetchApp. Checking
+ *  AuthMode.FULL up front lets us hand them a one-click re-auth link instead of
+ *  a cryptic failure (chat 2026-07-20, the Or.Eckstein incident). */
+function _isAuthorized_() {
+  try {
+    const info = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL);
+    return info.getAuthorizationStatus() !== ScriptApp.AuthorizationStatus.REQUIRED;
+  } catch (e) {
+    // getAuthorizationInfo shouldn't throw; if it somehow does, don't block the
+    // user — let the real backend call surface whatever the actual problem is.
+    console.info('[bulkvid auth] status check failed', { err: String((e && e.message) || e) });
+    return true;
+  }
+}
+
+
+/** Preflight for the menu entry points: returns true if the user is good to go,
+ *  otherwise shows the re-authorization dialog and returns false so the caller
+ *  aborts before doing any work. */
+function _ensureAuthorized_() {
+  if (_isAuthorized_()) return true;
+  _showReauthorizeDialog_();
+  return false;
+}
+
+
+/** Public poll target for the re-authorization dialog. The dialog can't call
+ *  the private _isAuthorized_ — google.script.run refuses underscore-suffixed
+ *  functions — so this thin wrapper exposes the same signal. The dialog polls
+ *  it after the user clicks through to Google's consent screen and closes
+ *  itself once this flips to true, so the prompt doesn't linger in the sheet
+ *  after the grant is already in place (chat 2026-07-20). */
+function pollAuthorizationStatus() {
+  return _isAuthorized_();
+}
+
+
+/** Clear, clickable "please authorize" dialog. Shown by the preflight and by
+ *  the fetch layer when a stale grant slips through and UrlFetchApp throws the
+ *  external_request permission error. The button opens the user-specific Google
+ *  consent URL in a new tab; granting there fixes the user for good. Falls back
+ *  to written instructions if the consent URL can't be minted.
+ *
+ *  The dialog polls the server after it opens and closes itself once the grant
+ *  lands, so it doesn't sit in the sheet still asking for permission after the
+ *  user has already authorized in the other tab (chat 2026-07-20). */
+function _showReauthorizeDialog_() {
+  var url = '';
+  try {
+    url = ScriptApp.getAuthorizationInfo(ScriptApp.AuthMode.FULL).getAuthorizationUrl() || '';
+  } catch (e) {
+    console.info('[bulkvid auth] url mint failed', { err: String((e && e.message) || e) });
+  }
+
+  const body = url
+    ? '<p class="sub">This tool needs your one-time permission to reach the '
+      + 'video backend (the "connect to an external service" permission). '
+      + 'Google did not ask for it when you opened the sheet, so the submit '
+      + 'cannot go through yet.</p>'
+      + '<a class="btn" href="' + _escapeHtml_(url) + '" target="_blank" '
+      + 'rel="noopener">Authorize this tool</a>'
+      + '<p class="foot">Sign in as <b>your own work account</b>, click '
+      + '<b>Allow</b>, then run the menu again. You only do this once.</p>'
+    : '<p class="sub">This tool needs your one-time permission to reach the '
+      + 'video backend, and the consent link could not be generated '
+      + 'automatically.</p>'
+      + '<p class="foot">Open <b>Extensions &rarr; Apps Script</b>, click '
+      + '<b>Run</b> on any function, accept the permission prompts, then run '
+      + 'the menu again.</p>';
+
+  const html =
+    '<!DOCTYPE html><html><head><base target="_top"><meta charset="utf-8"><style>' +
+    '*{box-sizing:border-box}' +
+    'body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;' +
+    'color:#1b2733;background:#fff;font-size:13px;line-height:1.5}' +
+    '.wrap{padding:18px 20px 20px}' +
+    'h1{margin:0 0 8px;font-size:16px;font-weight:600}' +
+    'h1.ok{color:#128a3a}' +
+    '.sub{margin:0 0 16px;color:#6b7684;font-size:12.5px}' +
+    '.btn{display:inline-block;padding:9px 16px;border-radius:8px;background:#2f6bff;' +
+    'color:#fff;font-weight:600;text-decoration:none}' +
+    '.btn:hover{background:#255ae0}' +
+    '.foot{margin:16px 0 0;color:#6b7684;font-size:12px}' +
+    '.foot b{color:#1b2733}' +
+    '</style></head><body><div class="wrap">' +
+    '<div id="ask"><h1>Authorization needed</h1>' + body + '</div>' +
+    '<div id="done" style="display:none">' +
+    '<h1 class="ok">&#10003; Authorized</h1>' +
+    '<p class="sub">All set. You can run the menu again now.</p>' +
+    '</div>' +
+    '</div>' +
+    // Poll the server once the dialog is up. The user authorizes in the new tab
+    // opened by the button above; each google.script.run call is a fresh
+    // execution, so it sees the freshly granted scope. Once authorized we swap
+    // in the confirmation and close, so the prompt never lingers after the fact.
+    '<script>' +
+    'function bvDone(){' +
+    'document.getElementById("ask").style.display="none";' +
+    'document.getElementById("done").style.display="block";' +
+    'setTimeout(function(){google.script.host.close();},1200);}' +
+    'function bvPoll(){google.script.run' +
+    '.withSuccessHandler(function(ok){if(ok){bvDone();}else{setTimeout(bvPoll,1500);}})' +
+    '.withFailureHandler(function(){setTimeout(bvPoll,2500);})' +
+    '.pollAuthorizationStatus();}' +
+    'setTimeout(bvPoll,2500);' +
+    '</script>' +
+    '</body></html>';
+
+  const out = HtmlService.createHtmlOutput(html).setWidth(420).setHeight(240);
+  SpreadsheetApp.getUi().showModalDialog(out, 'Authorization needed');
+}
+
+
+/** Minimal HTML escaper for values interpolated into dialog markup. */
+function _escapeHtml_(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 
@@ -1814,7 +2108,20 @@ function _fetchJson(path, options, retryOpts) {
       if (onAttempt) onAttempt(attempt, 'retry', code);
     } catch (e) {
       if (e && e.permanent) throw e;
-      lastErr = String((e && e.message) || e);
+      const emsg = String((e && e.message) || e);
+      // A missing script.external_request grant makes UrlFetchApp throw BEFORE
+      // any HTTP round-trip. Retrying can't help (the grant won't appear
+      // mid-loop) and it is NOT a backend overload — tag it permanent so the
+      // caller shows the re-auth dialog instead of the misleading "Backend is
+      // busy" one (chat 2026-07-20, the Or.Eckstein incident).
+      if (emsg.indexOf('permission to call UrlFetchApp') !== -1
+          || emsg.indexOf('script.external_request') !== -1) {
+        const authErr = new Error(emsg);
+        authErr.permanent = true;
+        authErr.needsAuth = true;
+        throw authErr;
+      }
+      lastErr = emsg;
       if (onAttempt) onAttempt(attempt, 'error', 0);
     }
     if (attempt < maxAttempts) {
@@ -1895,6 +2202,15 @@ function _submitJobWithRetry_(payload) {
     } catch (e) {
       console.info('[bulkvid submit] final-fail', { err: String((e && e.message) || e) });
       const ui = SpreadsheetApp.getUi();
+      if (e && e.needsAuth) {
+        // Missing script.external_request grant — a client-side authorization
+        // gap, not a backend problem. Show the one-click re-auth dialog rather
+        // than "Submit rejected" or "Backend is busy". The pending idempotency
+        // key stays stashed, so the next click after authorizing resumes the
+        // same submit with no duplicate job.
+        _showReauthorizeDialog_();
+        return null;
+      }
       if (e && e.permanent) {
         // 4xx — auth or validation. Retrying the same payload cannot succeed,
         // so surface the real reason instead of the busy dialog. The pending
@@ -1934,10 +2250,11 @@ function _submitJobWithRetry_(payload) {
 
 function _rowCountForPayload_(payload) {
   return (payload.rows_image_vo || payload.rows_four_images
-    || payload.rows_simple || payload.rows_cartoon || payload.rows_yt_cartoon
-    || payload.rows_simple_x4 || payload.rows_text_on_img
+    || payload.rows_simple || payload.rows_simple_motion
+    || payload.rows_google_simple_motion || payload.rows_cartoon
+    || payload.rows_yt_cartoon || payload.rows_simple_x4 || payload.rows_text_on_img
     || payload.rows_avatar || payload.rows_motion_ads
-    || payload.rows_hook_card || []).length;
+    || payload.rows_hook_card || payload.rows_image_resize || []).length;
 }
 
 

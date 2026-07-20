@@ -312,6 +312,10 @@ SETTING_ROW_TIMEOUT_YT_CARTOON = "row_timeout_yt_cartoon_seconds"
 # simple-motion runs cartoon's pipeline but with ONE idea (1 video, ≤2 generated
 # images) — same multi-shot ceiling as cartoon is plenty of headroom.
 SETTING_ROW_TIMEOUT_SIMPLE_MOTION = "row_timeout_simple_motion_seconds"
+# google-simple-motion renders up to 4 size-variant videos per row (concurrent,
+# but sharing the KIE / Rendi / ZapCap rate limits), so it gets a larger budget
+# than the single-video simple-motion tab.
+SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION = "row_timeout_google_simple_motion_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -478,6 +482,19 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "Hard wall-clock budget for a simple-motion-tab row (planner + 2 "
             "shots, image-gen and/or manual-image re-upload). Env "
             "BULKVID_ROW_TIMEOUT_SECONDS_SIMPLE_MOTION overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION,
+        label="Row timeout: google-simple-motion (seconds)",
+        default="1800",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a google-simple-motion-tab row (fixed "
+            "script + up to 4 size-variant videos, each 2 shots with image-gen + "
+            "Seedance + ZapCap, sharing provider rate limits). Larger than "
+            "simple-motion. Env BULKVID_ROW_TIMEOUT_SECONDS_GOOGLE_SIMPLE_MOTION "
+            "overrides."
         ),
     ),
     SettingDef(

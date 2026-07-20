@@ -31,6 +31,7 @@ from bulkvid.models.row import (
     CartoonRow,
     AvatarRow,
     FourImagesVO2Row,
+    GoogleSimpleMotionRow,
     HookCardRow,
     ImageResizeRow,
     ImageVORow,
@@ -57,6 +58,7 @@ from bulkvid.orchestrator.queue import (
     TAB_HOOK_CARD,
     TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
+    TAB_GOOGLE_SIMPLE_MOTION,
     TAB_MOTION_ADS,
     TAB_SIMPLE,
     TAB_SIMPLE_MOTION,
@@ -175,6 +177,31 @@ class SimpleMotionRowIn(BaseModel):
     voice_over: bool = True
     zapcap: bool = False
     aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
+class GoogleSimpleMotionRowIn(BaseModel):
+    """Wire shape for the ``google-simple-motion`` tab.
+
+    Two Manual Image columns (D/E), Number of Videos (F, 1-4), Voice Over/ZapCap,
+    FOUR Change Size columns (I-L) sent as ``aspect_ratios``, Script Pattern, CTA
+    toggle + text, Open Comments. ``num_videos`` / ``aspect_ratios`` are coerced
+    defensively server-side so a lazy/garbage cell never 400s the batch. Plan
+    ``_plans/2026-07-20-google-simple-motion-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_1: str = ""     # col D — slot 1 base; blank → generate
+    manual_image_2: str = ""     # col E — slot 2 base; blank → generate
+    num_videos: int = 1          # col F — 1..4
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratios: list[str] = Field(default_factory=list)   # cols I-L (Change Size 1-4)
     script_pattern: str = ""
     cta_enabled: bool = False
     cta_text: str = ""
@@ -353,6 +380,8 @@ class SubmitJobIn(BaseModel):
     rows_cartoon: list[CartoonRowIn] | None = None
     # simple-motion: animate super-realistic images (manual D/E or generated).
     rows_simple_motion: list[SimpleMotionRowIn] | None = None
+    # google-simple-motion: N size-variant fixed-script motion ads (plan 2026-07-20).
+    rows_google_simple_motion: list[GoogleSimpleMotionRowIn] | None = None
     # yt-cartoon: engaging, variable-length cartoon videos (plan 2026-06-17).
     rows_yt_cartoon: list[YtCartoonRowIn] | None = None
     # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
@@ -545,6 +574,37 @@ def _build_simple_motion_row(r: SimpleMotionRowIn) -> SimpleMotionRow:
         voice_over=r.voice_over,
         zapcap=r.zapcap,
         aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
+        open_comments=r.open_comments,
+    )
+
+
+def _build_google_simple_motion_row(
+    r: GoogleSimpleMotionRowIn,
+) -> GoogleSimpleMotionRow:
+    """Coerce a GoogleSimpleMotionRowIn into a GoogleSimpleMotionRow.
+
+    Server-side hardening: ``num_videos`` clamped to 1-4; ``aspect_ratios`` padded
+    to length 4 (blank entries flow through as "" so the processor defaults them
+    to 9:16); manual image URLs trimmed and passed through (downloaded + re-
+    uploaded like the simple-motion tab); ``cta_text`` bounded at 80 chars.
+    """
+    n = max(1, min(4, int(r.num_videos or 1)))
+    aspects = [(a or "").strip() for a in (r.aspect_ratios or [])][:4]
+    aspects += [""] * (4 - len(aspects))
+    return GoogleSimpleMotionRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_1=(r.manual_image_1 or "").strip(),
+        manual_image_2=(r.manual_image_2 or "").strip(),
+        num_videos=n,
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratios=aspects,
         script_pattern=r.script_pattern,
         cta_enabled=r.cta_enabled,
         cta_text=(r.cta_text or "")[:80],
@@ -926,6 +986,17 @@ async def submit_job(
                 400, "rows_simple_motion is required for tab_type=simple_motion"
             )
         rows = [_build_simple_motion_row(r) for r in payload.rows_simple_motion]
+    elif payload.tab_type == TAB_GOOGLE_SIMPLE_MOTION:
+        if not payload.rows_google_simple_motion:
+            raise HTTPException(
+                400,
+                "rows_google_simple_motion is required for "
+                "tab_type=google_simple_motion",
+            )
+        rows = [
+            _build_google_simple_motion_row(r)
+            for r in payload.rows_google_simple_motion
+        ]
     elif payload.tab_type == TAB_YT_CARTOON:
         if not payload.rows_yt_cartoon:
             raise HTTPException(
