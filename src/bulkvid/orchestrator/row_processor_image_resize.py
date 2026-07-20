@@ -11,19 +11,27 @@ Pipeline:
   1. Validate the manual image URL and the target size (blank size → soft error;
      a resize with no target size is meaningless and we won't pay to regenerate
      an image at its own ratio).
-  2. Reframe with ``edit_with_fallback`` (Nano Banana 2 → GPT Image 2 → Atlas)
+  2. Fetch the Manual Image ourselves and re-host it on our storage. The image
+     model downloads its source URL server-side, and Facebook's ad endpoint
+     (``facebook.com/ads/image/?d=...``) drops any client whose TLS fingerprint
+     isn't a real browser — the model host included. ``download_image`` gets it
+     (curl_cffi impersonates Chrome for FB/IG); the model then receives a plain
+     URL it can actually fetch. Mirrors simple_x4's source pre-upload.
+  3. Reframe with ``edit_with_fallback`` (Nano Banana 2 → GPT Image 2 → Atlas)
      at the target ratio, 2K, with a prompt that forbids changing the text.
-  3. Download the result (kie URLs are ephemeral).
-  4. If the operator asked for exact pixels (``WxH``), crop+resize to that exact
+  4. Download the result (kie URLs are ephemeral).
+  5. If the operator asked for exact pixels (``WxH``), crop+resize to that exact
      size; otherwise cap the model's ratio output under 2 MB.
-  5. Upload to our storage and return the stable URL.
+  6. Upload to our storage and return the stable URL.
 
 The ``text`` / ``article_url`` / ``voice_over`` / ``zapcap`` / ``script_pattern``
 / ``open_comments`` fields on :class:`ImageResizeRow` are carried for Apps Script
 payload compatibility but ignored here — the text this tab preserves already
 lives in the image pixels.
 
-Plan: ``_plans/2026-07-20-image-resize-tab.md``.
+Plans:
+  - ``_plans/2026-07-20-image-resize-tab.md`` (this tab)
+  - ``_plans/2026-06-30-facebook-tls-fingerprint.md`` (why we re-host the source)
 """
 
 from __future__ import annotations
@@ -128,6 +136,23 @@ def _image_object_key(
     return f"bulkvid/image_resize/{fname}"
 
 
+def _source_object_key(row: ImageResizeRow, *, now: datetime | None = None) -> str:
+    """Storage key for the operator's re-hosted Manual Image (the model's input).
+
+    We re-host the source on our own storage so the image model gets a URL it can
+    actually fetch — Facebook's ad endpoint rejects the model host's TLS
+    fingerprint (see the module docstring). Shape mirrors :func:`_image_object_key`
+    but marks the object ``src`` under an ``image_resize/sources/`` prefix so
+    re-hosted inputs are easy to sweep/expire apart from the deliverables."""
+    n = now or datetime.now(timezone.utc)
+    country = _country_code(row.country)
+    vertical = _slug_segment(row.vertical, fallback="general")[:40]
+    date_part = n.strftime("%Y-%m-%d")
+    short = uuid.uuid4().hex[:6]
+    fname = f"{country}_{vertical}_src_{date_part}_r{row.row_num}_{short}.png"
+    return f"bulkvid/image_resize/sources/{fname}"
+
+
 def _is_valid_http_url(url: str) -> bool:
     return isinstance(url, str) and url.strip().startswith(("http://", "https://"))
 
@@ -228,12 +253,40 @@ async def process_image_resize_row(
     metadata["model_aspect"] = model_aspect
 
     try:
-        # ─── Stage 1: reframe to the new aspect ratio ───
+        # ─── Stage 1: fetch the Manual Image ourselves and re-host it ───
+        # The image model fetches its source URL server-side, and Facebook's ad
+        # endpoint (facebook.com/ads/image/?d=...) drops any client whose TLS
+        # fingerprint isn't a real browser — the model host included. We pull it
+        # through ``download_image`` (curl_cffi impersonates Chrome for FB/IG)
+        # and re-upload to our storage, so the model always gets a URL it can
+        # actually fetch. Plan: ``_plans/2026-06-30-facebook-tls-fingerprint.md``.
+        try:
+            source_bytes = await download_image(row.manual_image_url, timeout=60.0)
+            metadata["source_image_bytes"] = len(source_bytes)
+        except Exception as e:
+            err_str = str(e) or repr(e) or type(e).__name__
+            return _fail(
+                row, STATUS_IMAGE_DOWNLOAD_FAILED,
+                f"Manual Image download failed ({type(e).__name__}): {err_str}",
+                t0, costs, metadata,
+            )
+        try:
+            source_upload = await clients.storage.upload_bytes(
+                source_bytes,
+                key=_source_object_key(row),
+                content_type="image/png",
+            )
+            costs.storage += source_upload.cost_usd
+            source_url = source_upload.url
+        except Exception as e:
+            return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
+
+        # ─── Stage 2: reframe to the new aspect ratio ───
         try:
             reframed_url, gen_cost = await edit_with_fallback(
                 kie=clients.kie,
                 atlas=clients.atlas,
-                source_image_url=row.manual_image_url,
+                source_image_url=source_url,
                 prompt=REFRAME_PROMPT,
                 aspect_ratio=model_aspect,
                 resolution=RESIZE_RESOLUTION,
@@ -246,7 +299,7 @@ async def process_image_resize_row(
                 t0, costs, metadata,
             )
 
-        # ─── Stage 2: download the reframed image (kie URLs are ephemeral) ───
+        # ─── Stage 3: download the reframed image (kie URLs are ephemeral) ───
         try:
             reframed_bytes = await download_image(reframed_url, timeout=120.0)
         except Exception as e:
@@ -259,7 +312,7 @@ async def process_image_resize_row(
                 t0, costs, metadata,
             )
 
-        # ─── Stage 3: fit to exact pixels (if asked) + cap size ───
+        # ─── Stage 4: fit to exact pixels (if asked) + cap size ───
         try:
             # Pillow work is CPU-bound — offload so the event loop keeps
             # advancing other rows during the crop/optimize.
@@ -275,7 +328,7 @@ async def process_image_resize_row(
                 t0, costs, metadata,
             )
 
-        # ─── Stage 4: upload to our storage ───
+        # ─── Stage 5: upload to our storage ───
         ext = "jpg" if content_type == "image/jpeg" else "png"
         try:
             upload = await clients.storage.upload_bytes(

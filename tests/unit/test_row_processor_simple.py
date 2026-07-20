@@ -1,7 +1,10 @@
 """Integration-style tests for the simple row processor.
 
-Covers:
+The simple tab first fetches the manual image itself and re-hosts it on our
+storage, so Rendi gets a URL it can fetch (Facebook's ad endpoint rejects
+Rendi's TLS fingerprint). Covers:
   - Happy path -> exactly 1 video URL, STATUS_SUCCESS, no image generation (kie)
+  - Facebook source URL -> we fetch + re-host it; Rendi never sees facebook.com
   - Invalid manual image URL -> STATUS_IMAGE_DOWNLOAD_FAILED before any work
   - Article fetch failure -> STATUS_ARTICLE_FETCH_FAILED
   - ZapCap=Yes -> captioned single URL
@@ -34,6 +37,10 @@ from bulkvid.orchestrator.row_processor_simple import process_simple_row
 OPENAI_BASE = "https://api.openai.com/v1"
 RENDI_BASE = "https://api.rendi.dev"
 ZAPCAP_BASE = "https://api.zapcap.ai"
+# Matches the default Manual Image URL in ``_row``. The processor now downloads
+# this itself (Stage 2) and re-hosts it before Rendi, so every pipeline test
+# must mock a 200 here.
+SOURCE_IMAGE_URL = "https://example.com/ad.png"
 
 
 class _FakeArticleFetcher:
@@ -140,6 +147,11 @@ def _register_rendi_routes() -> None:
 
 
 def _register_downloads() -> None:
+    # The re-hosted manual image (Stage 2) — the processor downloads this before
+    # anything else and hands Rendi the resulting storage URL.
+    respx.get(SOURCE_IMAGE_URL).mock(
+        return_value=httpx.Response(200, content=b"\x00fake-source-image")
+    )
     respx.get(url__regex=r"https://r\.dev/.+\.mp4").mock(
         return_value=httpx.Response(200, content=b"\x00fake-mp4")
     )
@@ -165,7 +177,7 @@ def _build_clients(*, article_fail: bool = False, with_zapcap: bool = False) -> 
 
 
 def _row(
-    *, image_url: str = "https://example.com/ad.png", zapcap: bool = False, vo: bool = True
+    *, image_url: str = SOURCE_IMAGE_URL, zapcap: bool = False, vo: bool = True
 ) -> SimpleRow:
     return SimpleRow(
         row_num=2, country="MX", vertical="automotive",
@@ -188,6 +200,61 @@ async def test_simple_happy_path_returns_one_video() -> None:
     assert result.status == STATUS_SUCCESS
     assert len(result.video_urls) == 1
     assert result.metadata["tab"] == "simple"
+
+
+@respx.mock
+async def test_simple_facebook_source_is_fetched_by_us_not_rendi(monkeypatch) -> None:
+    """A Facebook ad URL must be downloaded by US (``download_image`` routes
+    FB/IG through curl_cffi's Chrome TLS impersonation) and re-hosted, so Rendi
+    receives our storage URL — never the raw facebook.com URL it cannot fetch.
+
+    ``download_image`` is patched (not respx-mocked) because the FB path uses
+    curl_cffi, which bypasses httpx/respx entirely."""
+    import bulkvid.orchestrator.row_processor_simple as simple_mod
+
+    fb_url = (
+        "https://www.facebook.com/ads/image/?d=AQIh5ZL3ZRw1rFiD3skQO3SV3qPwXiCD"
+        "Ab2VuUfwUk85DbVE4DREouKUkzWnDEYSWpOnNoqlLu57zRO89q3Rb7Fgu6wbH"
+    )
+    downloaded: list[str] = []
+
+    async def _fake_download(url: str, **kwargs: object) -> bytes:
+        downloaded.append(url)
+        return b"\x00fake-image-bytes"
+
+    monkeypatch.setattr(simple_mod, "download_image", _fake_download)
+
+    _register_openai_routes()
+    submitted: list[dict] = []
+
+    def _submit(request: httpx.Request) -> httpx.Response:
+        submitted.append(json.loads(request.content))
+        return httpx.Response(200, json={"command_id": f"cmd-{len(submitted)}"})
+
+    respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(side_effect=_submit)
+    respx.get(url__regex=r"https://api\.rendi\.dev/v1/commands/.+").mock(
+        side_effect=lambda r: httpx.Response(
+            200,
+            json={"status": "SUCCESS", "output_files": {
+                "out_1": {"storage_url": f"https://r.dev/{str(r.url).rsplit('/', 1)[-1]}.mp4"}}},
+        )
+    )
+    respx.delete(url__regex=r"https://api\.rendi\.dev/v1/commands/.+/files").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    # vo=False keeps the flow lean (no TTS) — the source re-host is what matters.
+    result = await process_simple_row(
+        _row(image_url=fb_url, vo=False), _build_clients(), job_id="j"
+    )
+
+    assert result.status == STATUS_SUCCESS
+    # We fetched the FB URL ourselves (the curl_cffi path inside download_image).
+    assert fb_url in downloaded
+    # Rendi got OUR re-hosted URL, never the un-fetchable facebook.com URL.
+    in_1 = submitted[0]["input_files"]["in_1"]
+    assert in_1.startswith("https://storage.test/bulkvid/sources/")
+    assert "facebook.com" not in in_1
 
 
 @respx.mock

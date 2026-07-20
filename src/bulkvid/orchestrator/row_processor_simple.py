@@ -7,17 +7,25 @@ is written back.
 
 Pipeline:
   1. Validate the manual image URL
-  2. Article fetch
-  3. language detect -> classify Open Comments -> script gen
-  4. Gemini TTS -> upload VO
-  5. Rendi/ffmpeg image_to_video_fit (manual image + VO) -> 1 video, in ONE
+  2. Fetch the manual image ourselves and re-host it on our storage. Rendi
+     downloads ``image_url`` server-side, and Facebook's ad endpoint
+     (``facebook.com/ads/image/?d=...``) drops any client whose TLS fingerprint
+     isn't a real browser — Rendi's host included. ``download_image`` gets it
+     (curl_cffi impersonates Chrome for FB/IG); Rendi then receives a URL it can
+     actually fetch. Mirrors the other manual-image tabs.
+  3. Article fetch
+  4. language detect -> classify Open Comments -> script gen
+  5. Gemini TTS -> upload VO
+  6. Rendi/ffmpeg image_to_video_fit (re-hosted image + VO) -> 1 video, in ONE
      command: blurred-background fit (no cropping of the ad's text/CTA) + the
      voiceover muxed in. No separate resize call.
-  6. Upload video to storage
-  7. Free Rendi storage (best-effort)
-  8. If ZapCap=Yes: caption the video
+  7. Upload video to storage
+  8. Free Rendi storage (best-effort)
+  9. If ZapCap=Yes: caption the video
 
 No kie.ai, no GPT-4o description, no collage method.
+
+Plan: ``_plans/2026-06-30-facebook-tls-fingerprint.md`` (why we re-host the source).
 """
 
 from __future__ import annotations
@@ -129,7 +137,35 @@ async def process_simple_row(
         )
 
     try:
-        # ─── Stage 2: article fetch ───
+        # ─── Stage 2: fetch the manual image ourselves and re-host it ───
+        # Rendi fetches image_url server-side, and Facebook's ad endpoint
+        # (facebook.com/ads/image/?d=...) drops any client whose TLS fingerprint
+        # isn't a real browser — Rendi's host included. We pull it through
+        # ``download_image`` (curl_cffi impersonates Chrome for FB/IG) and
+        # re-upload to our storage, so Rendi always gets a URL it can actually
+        # fetch. Plan: ``_plans/2026-06-30-facebook-tls-fingerprint.md``.
+        try:
+            source_bytes = await download_image(row.manual_image_url, timeout=60.0)
+            metadata["source_image_bytes"] = len(source_bytes)
+        except Exception as e:
+            err_str = str(e) or repr(e) or type(e).__name__
+            return _fail(
+                row, STATUS_IMAGE_DOWNLOAD_FAILED,
+                f"manual image download failed ({type(e).__name__}): {err_str}",
+                t0, costs, metadata,
+            )
+        try:
+            source_upload = await clients.storage.upload_bytes(
+                source_bytes,
+                key=f"bulkvid/sources/{slug}.png",
+                content_type="image/png",
+            )
+            costs.storage += source_upload.cost_usd
+            source_url = source_upload.url
+        except Exception as e:
+            return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
+
+        # ─── Stage 3: article fetch ───
 
         try:
             art = await clients.article.fetch(row.article_url)
@@ -140,7 +176,7 @@ async def process_simple_row(
         except Exception as e:
             return _fail(row, STATUS_ARTICLE_FETCH_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 3: language detect -> classify -> script ───
+        # ─── Stage 4: language detect -> classify -> script ───
 
         try:
             lang = await detect_language(clients.openai, article_body)
@@ -184,7 +220,7 @@ async def process_simple_row(
         except Exception as e:
             return _fail(row, STATUS_INTERNAL_ERROR, str(e), t0, costs, metadata)
 
-        # ─── Stage 4: TTS + VO upload ───
+        # ─── Stage 5: TTS + VO upload ───
 
         vo_url: str | None = None
         # Played (sped-up) voiceover length. Drives the video duration below so
@@ -216,11 +252,11 @@ async def process_simple_row(
             except Exception as e:
                 return _fail(row, STATUS_TTS_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 5: one-shot image -> video (fit + VO in a single command) ───
+        # ─── Stage 6: one-shot image -> video (fit + VO in a single command) ───
 
         try:
             video = await clients.rendi.image_to_video_fit(
-                image_url=row.manual_image_url,
+                image_url=source_url,
                 audio_url=vo_url,    # None -> silent clip
                 output_filename="v1.mp4",
                 aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
@@ -230,7 +266,7 @@ async def process_simple_row(
         except Exception as e:
             return _fail(row, STATUS_VIDEO_ASSEMBLY_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 6: persist video to storage ───
+        # ─── Stage 7: persist video to storage ───
 
         try:
             data = await download_image(video.url, timeout=180.0)
@@ -244,10 +280,10 @@ async def process_simple_row(
         except Exception as e:
             return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
 
-        # ─── Stage 6b: free Rendi storage (best-effort) ───
+        # ─── Stage 7b: free Rendi storage (best-effort) ───
         await clients.rendi.cleanup_commands([video.command_id])
 
-        # ─── Stage 7 (optional): ZapCap ───
+        # ─── Stage 8 (optional): ZapCap ───
 
         if row.zapcap and clients.zapcap is not None:
             try:

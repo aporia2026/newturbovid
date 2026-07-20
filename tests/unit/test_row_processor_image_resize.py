@@ -1,11 +1,16 @@
 """Tests for the image_resize row processor.
 
 The image_resize tab reframes the operator's Manual Image to a new aspect ratio
-with Nano Banana 2 (image-to-image) and writes back a single image URL. Covers:
+with Nano Banana 2 (image-to-image) and writes back a single image URL. The tab
+first fetches the Manual Image itself and re-hosts it on our storage, so the
+model receives a URL it can fetch (Facebook's ad endpoint rejects the model
+host's TLS fingerprint). Covers:
   - Happy path (ratio target)  -> STATUS_SUCCESS + exactly 1 image URL
   - Pixel target (WxH)         -> the uploaded image is exactly that size
+  - Facebook source URL        -> we fetch + re-host it; model never sees FB
   - Blank / unparseable size   -> soft error, model never called, no spend
   - Bad manual_image_url       -> STATUS_IMAGE_DOWNLOAD_FAILED, model not called
+  - Source download failure    -> STATUS_IMAGE_DOWNLOAD_FAILED, model not called
   - Reframe failure            -> STATUS_IMAGE_GEN_FAILED
   - Reframed-URL download 5xx  -> STATUS_IMAGE_DOWNLOAD_FAILED
   - Cost breakdown             -> image_gen + storage only
@@ -50,6 +55,10 @@ TTS_BASE = "https://generativelanguage.googleapis.com"
 SCRAPINGBEE_BASE = "https://app.scrapingbee.com"
 
 REFRAMED_URL = "https://kie.test/reframed.png"
+# Matches the default Manual Image URL in ``_row``. The processor now downloads
+# this itself (Stage 1) and re-hosts it before calling the model, so every test
+# that reaches the model must mock a 200 here.
+SOURCE_IMAGE_URL = "https://example.com/ad.png"
 
 
 class _FakeStorageClient:
@@ -93,7 +102,7 @@ def _build_clients(storage: _FakeStorageClient | None = None) -> PipelineClients
 
 def _row(
     *,
-    image_url: str = "https://example.com/ad.png",
+    image_url: str = SOURCE_IMAGE_URL,
     aspect_ratio: str = "9:16",
 ) -> ImageResizeRow:
     return ImageResizeRow(
@@ -131,9 +140,11 @@ def _install_fake_reframe(monkeypatch, *, cost: float = 0.06, raises: bool = Fal
 
 @respx.mock
 async def test_happy_path_ratio_returns_one_image_url(monkeypatch) -> None:
-    """Ratio target: reframe, download the result, upload one image, SUCCESS.
-    The storage key carries country / vertical / date / size / row / hex."""
+    """Ratio target: re-host the source, reframe, download the result, upload the
+    reframed image, SUCCESS. The result key carries country / vertical / date /
+    size / row / hex; the model receives our re-hosted URL, not the raw source."""
     calls = _install_fake_reframe(monkeypatch)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
     respx.get(REFRAMED_URL).mock(return_value=httpx.Response(200, content=_src_png()))
 
     storage = _FakeStorageClient()
@@ -145,15 +156,19 @@ async def test_happy_path_ratio_returns_one_image_url(monkeypatch) -> None:
     assert result.metadata["tab"] == "image_resize"
     assert result.metadata["target_type"] == "ratio"
     assert result.metadata["final_image_bytes"] > 1024
-    # The model was asked to reframe the operator's image at the target ratio.
+    assert result.metadata["source_image_bytes"] > 1024
+    # The model was asked to reframe our RE-HOSTED image (not the raw source URL)
+    # at the target ratio — the source pre-upload is what makes FB URLs work.
     assert len(calls) == 1
-    assert calls[0]["source_image_url"] == "https://example.com/ad.png"
+    assert calls[0]["source_image_url"].startswith("https://storage.test/")
+    assert calls[0]["source_image_url"] != "https://example.com/ad.png"
     assert calls[0]["aspect_ratio"] == "9:16"
     assert calls[0]["resolution"] == "2K"
-    # Exactly ONE storage upload — the reframed image.
-    assert len(storage.calls) == 1
-    key = storage.calls[0][0]
-    filename = key.rsplit("/", 1)[-1]
+    # TWO storage uploads: the re-hosted source first, the reframed image last.
+    assert len(storage.calls) == 2
+    source_key, result_key = storage.calls[0][0], storage.calls[-1][0]
+    assert source_key.startswith("bulkvid/image_resize/sources/")
+    filename = result_key.rsplit("/", 1)[-1]
     assert filename.startswith("DE_sleepwear-pr_resize_")
     assert "_9x16_" in filename
     assert "_r2_" in filename
@@ -164,6 +179,7 @@ async def test_pixel_target_produces_exact_dimensions(monkeypatch) -> None:
     """A WxH target crops+resizes to exactly that pixel size, regardless of the
     model output's aspect. The uploaded bytes decode to 1080x1350."""
     _install_fake_reframe(monkeypatch)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
     respx.get(REFRAMED_URL).mock(
         return_value=httpx.Response(200, content=_src_png(1600, 900)),
     )
@@ -175,8 +191,47 @@ async def test_pixel_target_produces_exact_dimensions(monkeypatch) -> None:
 
     assert result.status == STATUS_SUCCESS
     assert result.metadata["target_type"] == "pixels"
+    # last_bytes is the reframed RESULT (uploaded last, after the source).
     with Image.open(io.BytesIO(storage.last_bytes)) as out:
         assert out.size == (1080, 1350)
+
+
+async def test_facebook_source_is_fetched_by_us_not_the_model(monkeypatch) -> None:
+    """A Facebook ad URL must be downloaded by US (``download_image`` routes
+    FB/IG hosts through curl_cffi's Chrome TLS impersonation) and re-hosted, so
+    the image model receives our storage URL — never the raw facebook.com URL it
+    cannot fetch. This is the regression this tab's source pre-upload fixes.
+
+    ``download_image`` is patched (not respx-mocked) because the FB path uses
+    curl_cffi, which bypasses httpx/respx entirely."""
+    fb_url = (
+        "https://www.facebook.com/ads/image/?d=AQIh5ZL3ZRw1rFiD3skQO3SV3qPwXiCD"
+        "Ab2VuUfwUk85DbVE4DREouKUkzWnDEYSWpOnNoqlLu57zRO89q3Rb7Fgu6wbH"
+    )
+    calls = _install_fake_reframe(monkeypatch)
+
+    downloaded: list[str] = []
+
+    async def _fake_download(url: str, **kwargs: Any) -> bytes:
+        downloaded.append(url)
+        return _src_png()
+
+    monkeypatch.setattr(mod, "download_image", _fake_download)
+
+    storage = _FakeStorageClient()
+    result = await process_image_resize_row(
+        _row(image_url=fb_url), _build_clients(storage), job_id="j"
+    )
+
+    assert result.status == STATUS_SUCCESS
+    # We fetched the FB URL ourselves (the curl_cffi path inside download_image).
+    assert fb_url in downloaded
+    # The model got OUR re-hosted URL, never the un-fetchable facebook.com URL.
+    assert len(calls) == 1
+    assert calls[0]["source_image_url"].startswith("https://storage.test/")
+    assert "facebook.com" not in calls[0]["source_image_url"]
+    # Source re-hosted first, reframed result uploaded last.
+    assert storage.calls[0][0].startswith("bulkvid/image_resize/sources/")
 
 
 @respx.mock
@@ -228,8 +283,10 @@ async def test_bad_image_url_fails_fast(monkeypatch) -> None:
 
 @respx.mock
 async def test_reframe_failure_maps_to_image_gen_failed(monkeypatch) -> None:
-    """Every image backend failing surfaces as STATUS_IMAGE_GEN_FAILED."""
+    """Every image backend failing surfaces as STATUS_IMAGE_GEN_FAILED (the
+    source re-host must succeed first so the reframe is actually reached)."""
     _install_fake_reframe(monkeypatch, raises=True)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
 
     result = await process_image_resize_row(_row(), _build_clients(), job_id="j")
 
@@ -239,10 +296,27 @@ async def test_reframe_failure_maps_to_image_gen_failed(monkeypatch) -> None:
 
 
 @respx.mock
+async def test_source_download_failure_maps_to_image_download_failed(monkeypatch) -> None:
+    """A 5xx fetching the operator's Manual Image surfaces as
+    IMAGE_DOWNLOAD_FAILED before any model spend — the reframe never runs."""
+    calls = _install_fake_reframe(monkeypatch)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(500, content=b"boom"))
+
+    result = await process_image_resize_row(_row(), _build_clients(), job_id="j")
+
+    assert result.status == STATUS_IMAGE_DOWNLOAD_FAILED
+    assert result.video_urls == []
+    assert result.error is not None and "Manual Image download failed" in result.error
+    assert calls == []                 # model never called — no wasted spend
+    assert result.cost_usd == 0.0
+
+
+@respx.mock
 async def test_reframed_download_failure(monkeypatch) -> None:
     """A 5xx fetching the reframed image surfaces as IMAGE_DOWNLOAD_FAILED with
     a useful error (exception class + URL host)."""
     _install_fake_reframe(monkeypatch)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
     respx.get(REFRAMED_URL).mock(return_value=httpx.Response(500, content=b"boom"))
 
     result = await process_image_resize_row(_row(), _build_clients(), job_id="j")
@@ -254,8 +328,10 @@ async def test_reframed_download_failure(monkeypatch) -> None:
 
 @respx.mock
 async def test_cost_breakdown_image_gen_and_storage(monkeypatch) -> None:
-    """The lean pipeline has exactly two cost sources: image_gen + storage."""
+    """The lean pipeline has exactly two cost sources: image_gen + storage
+    (storage now covers BOTH the re-hosted source and the reframed result)."""
     _install_fake_reframe(monkeypatch, cost=0.06)
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
     respx.get(REFRAMED_URL).mock(return_value=httpx.Response(200, content=_src_png()))
 
     result = await process_image_resize_row(_row(), _build_clients(), job_id="j")
@@ -287,6 +363,7 @@ async def test_no_external_pipeline_clients_called(monkeypatch) -> None:
     scrapingbee_route = respx.get(url__regex=rf"{SCRAPINGBEE_BASE}/.*").mock(
         return_value=httpx.Response(200, text="article body"),
     )
+    respx.get(SOURCE_IMAGE_URL).mock(return_value=httpx.Response(200, content=_src_png()))
     respx.get(REFRAMED_URL).mock(return_value=httpx.Response(200, content=_src_png()))
 
     result = await process_image_resize_row(_row(), _build_clients(), job_id="j")
