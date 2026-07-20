@@ -32,6 +32,7 @@ from bulkvid.models.row import (
     AvatarRow,
     FourImagesVO2Row,
     HookCardRow,
+    ImageResizeRow,
     ImageVORow,
     MotionAdsRow,
     SimpleMotionRow,
@@ -54,6 +55,7 @@ from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_HOOK_CARD,
+    TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
     TAB_SIMPLE,
@@ -275,6 +277,27 @@ class TextOnImgRowIn(BaseModel):
     open_comments: str = ""
 
 
+class ImageResizeRowIn(BaseModel):
+    """Wire shape for the ``image_resize`` tab — the Manual Image reframed to the
+    target size (``aspect_ratio``). Column-identical to ``text_on_img``: the same
+    fields ride the wire, but ``text`` (the inherited col E) and ``article_url`` /
+    ``voice_over`` / ``zapcap`` / ``script_pattern`` / ``open_comments`` are
+    accepted for Apps Script payload compatibility and ignored by the processor
+    (the text preserved on this tab is baked into the image, not overlaid)."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str = ""
+    manual_image_url: str
+    text: str = ""
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    open_comments: str = ""
+
+
 class MotionAdsRowIn(BaseModel):
     """Wire shape for the ``Motion_Ads`` tab — a silent motion-ad video plus
     Headline / Description ad copy generated from the article.
@@ -342,6 +365,8 @@ class SubmitJobIn(BaseModel):
     rows_motion_ads: list[MotionAdsRowIn] | None = None
     # Hook_Card: 9:16 hook-box slideshow + background music (plan 2026-07-13).
     rows_hook_card: list[HookCardRowIn] | None = None
+    # image_resize: reframe the Manual Image to a new size (plan 2026-07-20).
+    rows_image_resize: list[ImageResizeRowIn] | None = None
     # Client-generated opaque key (UUID-ish) that lets the Apps Script retry
     # the POST safely when PA's frontend drops the response — the server
     # returns the SAME job_id for a key it has already seen for this user.
@@ -464,6 +489,30 @@ def _build_text_on_img_row(r: TextOnImgRowIn) -> TextOnImgRow:
     a still PNG with no script or VO.
     """
     return TextOnImgRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=r.manual_image_url,
+        text=(r.text or "").strip()[:240],
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        open_comments=r.open_comments,
+    )
+
+
+def _build_image_resize_row(r: ImageResizeRowIn) -> ImageResizeRow:
+    """Coerce an ImageResizeRowIn from the wire into an ImageResizeRow.
+
+    ``text`` is bounded at 240 chars purely to keep the queue payload small —
+    it is ignored downstream (the text preserved on this tab is baked into the
+    image, not overlaid). ``article_url`` / ``voice_over`` / ``zapcap`` /
+    ``script_pattern`` / ``open_comments`` are passed through but likewise
+    ignored by the processor.
+    """
+    return ImageResizeRow(
         row_num=r.row_num,
         country=r.country,
         vertical=r.vertical,
@@ -919,6 +968,12 @@ async def submit_job(
                 400, "rows_hook_card is required for tab_type=hook_card"
             )
         rows = [HookCardRow(**r.model_dump()) for r in payload.rows_hook_card]
+    elif payload.tab_type == TAB_IMAGE_RESIZE:
+        if not payload.rows_image_resize:
+            raise HTTPException(
+                400, "rows_image_resize is required for tab_type=image_resize"
+            )
+        rows = [_build_image_resize_row(r) for r in payload.rows_image_resize]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

@@ -31,6 +31,7 @@ from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
+    TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_SIMPLE,
     TAB_SIMPLE_X4,
@@ -186,6 +187,32 @@ def _simple_x4_payload(
     }
 
 
+def _image_resize_payload() -> dict:
+    """Minimal valid image_resize submit body — the Manual Image reframed to a
+    target size. Mirrors the text_on_img wire shape (Text/article/etc. ride the
+    wire but are ignored by the processor)."""
+    return {
+        "sheet_id": "sheet-IR",
+        "worksheet": "image_resize",
+        "tab_type": TAB_IMAGE_RESIZE,
+        "rows_image_resize": [
+            {
+                "row_num": 2,
+                "country": "DE",
+                "vertical": "Sleepwear PR",
+                "article_url": "",
+                "manual_image_url": "https://example.com/ad.png",
+                "text": "",
+                "voice_over": True,
+                "zapcap": False,
+                "aspect_ratio": "9:16",
+                "script_pattern": "",
+                "open_comments": "",
+            }
+        ],
+    }
+
+
 def _cartoon_payload() -> dict:
     return {
         "sheet_id": "sheet-C",
@@ -315,6 +342,21 @@ def test_submit_cartoon_returns_job_id(client: TestClient) -> None:
 def test_submit_cartoon_without_rows_returns_400(client: TestClient) -> None:
     payload = _cartoon_payload()
     payload["rows_cartoon"] = []
+    r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
+    assert r.status_code == 400
+
+
+def test_submit_image_resize_returns_job_id(client: TestClient) -> None:
+    r = client.post("/jobs", json=_image_resize_payload(), headers=_auth("tok-bulk1"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["row_count"] == 1
+
+
+def test_submit_image_resize_without_rows_returns_400(client: TestClient) -> None:
+    payload = _image_resize_payload()
+    payload["rows_image_resize"] = []
     r = client.post("/jobs", json=payload, headers=_auth("tok-bulk1"))
     assert r.status_code == 400
 

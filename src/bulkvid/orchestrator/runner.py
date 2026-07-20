@@ -34,6 +34,7 @@ from bulkvid.models.row import (
     CartoonRow,
     FourImagesVO2Row,
     HookCardRow,
+    ImageResizeRow,
     ImageVORow,
     MotionAdsRow,
     RowResult,
@@ -50,6 +51,7 @@ from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
 from bulkvid.orchestrator.row_processor_hook_card import process_hook_card_row
+from bulkvid.orchestrator.row_processor_image_resize import process_image_resize_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_motion_ads import process_motion_ads_row
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
@@ -95,6 +97,7 @@ _TAB_TEXT_ON_IMG = "text_on_img"
 _TAB_AVATAR = "avatar"
 _TAB_MOTION_ADS = "motion_ads"
 _TAB_HOOK_CARD = "hook_card"
+_TAB_IMAGE_RESIZE = "image_resize"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
@@ -128,6 +131,9 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # assembly, all on Rendi. No Seedance (Ken Burns is CPU-cheap ffmpeg), but
     # the extra Rendi round-trips can queue on a shared account — 20 min ample.
     _TAB_HOOK_CARD: 1200.0,
+    # image_resize is one Nano Banana reframe + a Pillow crop/optimize (CPU,
+    # sub-second). Same shape as image_vo's single gen — reuse its 15-min budget.
+    _TAB_IMAGE_RESIZE: 900.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -147,6 +153,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_MOTION_ADS: SETTING_ROW_TIMEOUT_IMAGE_VO,
     # hook_card reuses the image_vo timeout — heavy image gen + Rendi assembly.
     _TAB_HOOK_CARD: SETTING_ROW_TIMEOUT_IMAGE_VO,
+    # image_resize reuses the image_vo timeout — one image gen call.
+    _TAB_IMAGE_RESIZE: SETTING_ROW_TIMEOUT_IMAGE_VO,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -287,6 +295,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_MOTION_ADS
     if isinstance(row, HookCardRow):
         return _TAB_HOOK_CARD
+    if isinstance(row, ImageResizeRow):
+        return _TAB_IMAGE_RESIZE
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -398,6 +408,8 @@ async def _dispatch_to_processor(
         return await process_motion_ads_row(row, clients, job_id=job_id)
     if isinstance(row, HookCardRow):
         return await process_hook_card_row(row, clients, job_id=job_id)
+    if isinstance(row, ImageResizeRow):
+        return await process_image_resize_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):

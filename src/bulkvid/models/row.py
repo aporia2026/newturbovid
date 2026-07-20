@@ -169,6 +169,37 @@ class TextOnImgRow:
 
 
 @dataclass
+class ImageResizeRow:
+    """``image_resize`` tab input row — one IMAGE (not video): the operator's
+    Manual Image reframed to the target aspect ratio by Nano Banana 2, which
+    extends the background/design naturally and re-renders any baked-in text so
+    the result looks native at the new size. The reframed image URL is written
+    back to the ``Ready Image`` column.
+
+    Column-identical to :class:`TextOnImgRow` (Yoav cloned that tab's layout).
+    ``text`` here is the inherited "Text" column (E) and is **ignored** — the
+    text this tab preserves already lives in the image pixels, we do not overlay
+    operator-typed text. ``article_url`` / ``voice_over`` / ``zapcap`` /
+    ``script_pattern`` / ``open_comments`` are likewise retained for Apps Script
+    payload compatibility but ignored by the processor.
+
+    Plan ``_plans/2026-07-20-image-resize-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str                  # ignored — kept for wire compat
+    manual_image_url: str
+    text: str                         # ignored — text is baked into the image
+    voice_over: bool                  # ignored — kept for wire compat
+    zapcap: bool                      # ignored — kept for wire compat
+    aspect_ratio: str                 # target size, e.g. "9:16" or "1080x1920"
+    script_pattern: str               # ignored — kept for wire compat
+    open_comments: str                # ignored — kept for wire compat
+
+
+@dataclass
 class CartoonRow:
     """Cartoon tab input row — animated, multi-shot videos generated from text.
 
