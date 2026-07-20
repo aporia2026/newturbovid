@@ -246,6 +246,12 @@ class QueuedRow:
     row_num: int
     payload: dict[str, Any]
     status: str
+    # Parent job's spreadsheet id, carried from the claim's existing JOIN to
+    # ``jobs`` so the runner can route the row to a per-sheet kie key with zero
+    # extra DB round-trips. Defaults to "" for hand-built rows (tests) and any
+    # claim path that predates it — those route to the default kie pool. Plan
+    # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+    sheet_id: str = ""
 
 
 @dataclass
@@ -617,7 +623,7 @@ class JobQueue:
         """
         with self._tx():
             cur = self._conn.execute(
-                "SELECT rq.id, rq.job_id, rq.row_num, rq.payload "
+                "SELECT rq.id, rq.job_id, rq.row_num, rq.payload, j.sheet_id "
                 "FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
                 "WHERE rq.status = ? AND j.status IN (?, ?) "
                 "ORDER BY rq.id ASC LIMIT 1",
@@ -643,6 +649,7 @@ class JobQueue:
                 row_num=row["row_num"],
                 payload=json.loads(row["payload"]),
                 status=ROW_PROCESSING,
+                sheet_id=row["sheet_id"] or "",
             )
 
     def _record_result_sync(self, queue_id: int, result: RowResult) -> None:

@@ -57,7 +57,12 @@ def build_pipeline_clients(settings: Settings) -> PipelineClients:
     """Construct the bundle. Required adapters fail fast on missing config;
     ZapCap is optional (set to ``None`` when no key configured)."""
     openai = openai_mod.build_client_from_settings(settings)
-    kie = kie_mod.build_client_from_settings(settings)
+    # Per-sheet key routing: the router's ``default`` IS the client every
+    # unmapped sheet uses, so wire ``kie`` to it (no pool built twice) and pass
+    # the router through for the runner to swap per row. Plan
+    # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+    kie_router = kie_mod.build_router_from_settings(settings)
+    kie = kie_router.default
     tts = tts_mod.build_client_from_settings(settings)
     rendi = rendi_mod.build_client_from_settings(settings)
     storage = storage_mod.build_client_from_settings(settings)
@@ -80,6 +85,7 @@ def build_pipeline_clients(settings: Settings) -> PipelineClients:
         article=article,
         zapcap=zapcap,
         atlas=atlas,
+        kie_router=kie_router,
     )
 
 
@@ -179,6 +185,7 @@ async def run() -> None:
         db_path=str(db_path),
         max_concurrent_rows=settings.BULKVID_MAX_CONCURRENT_ROWS,
         kie_keys_configured=len(settings.kie_key_list),
+        kie_mapped_sheets=len(settings.kie_key_map),
         sheet_writer_configured=bool(settings.SHEETS_SERVICE_ACCOUNT_FILE),
         kill_switch=bool(settings.BULKVID_KILL_SWITCH),
     )

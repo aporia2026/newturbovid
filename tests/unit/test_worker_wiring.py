@@ -60,6 +60,27 @@ def test_build_pipeline_clients_full_config_succeeds() -> None:
     assert clients.zapcap is not None
 
 
+def test_build_pipeline_clients_attaches_kie_router() -> None:
+    # The router is always wired; ``kie`` IS the router's default (same
+    # instance) so the default pool is never constructed twice. Plan
+    # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+    clients = build_pipeline_clients(_full_settings())
+    assert clients.kie_router is not None
+    assert clients.kie is clients.kie_router.default
+
+
+def test_build_pipeline_clients_routes_mapped_sheet_to_own_client() -> None:
+    settings = _full_settings(
+        KIE_AI_KEYS="kie_default_AAAAAAAA",
+        KIE_KEY_MAP="bulk-videos-2 = kie_newkey_BBBBBBBB",
+    )
+    clients = build_pipeline_clients(settings)
+    router = clients.kie_router
+    assert router is not None
+    assert router.for_sheet("bulk-videos-2") is not clients.kie   # own client
+    assert router.for_sheet("bulk-videos-1") is clients.kie       # default pool
+
+
 def test_zapcap_is_none_when_key_missing() -> None:
     settings = _full_settings(ZAPCAP_API_KEY="")
     clients = build_pipeline_clients(settings)

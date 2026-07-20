@@ -24,7 +24,7 @@ import asyncio
 import os
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bulkvid.logging import get_logger, set_context
 from bulkvid.models.row import (
@@ -481,6 +481,11 @@ class BatchRunner:
         # (including an empty-queue ``None``, which still proves the connection
         # is alive). Drives ``_maybe_watchdog_exit``. Plan 2026-06-22 §Prong 2.
         self._consecutive_claim_failures: int = 0
+        # Sheets whose per-sheet kie-key routing has already been logged, so the
+        # "routed to a non-default key" breadcrumb fires once per sheet per
+        # process instead of once per row. Plan
+        # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+        self._routed_sheets_logged: set[str] = set()
 
     def request_shutdown(self) -> None:
         _log.info("runner_shutdown_requested")
@@ -783,6 +788,28 @@ class BatchRunner:
             tab, _DEFAULT_ROW_TIMEOUTS_SECONDS[_TAB_CARTOON]
         )
 
+    def _clients_for_sheet(self, sheet_id: str) -> PipelineClients:
+        """Resolve the per-row client bundle, swapping in the sheet's kie key.
+
+        With no router configured (tests / no ``KIE_KEY_MAP``) or an unmapped
+        sheet, the shared bundle is returned unchanged — same object, no copy. A
+        mapped sheet gets a shallow ``dataclasses.replace`` copy with ``kie``
+        pointed at its own client; every other field is shared (all safe). The
+        route is logged ONCE per sheet per process so a large batch doesn't
+        flood the log while the operator can still confirm it in the logs. Plan
+        ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+        """
+        router = self._clients.kie_router
+        if router is None or not sheet_id:
+            return self._clients
+        kie = router.for_sheet(sheet_id)
+        if kie is self._clients.kie:
+            return self._clients                  # sheet uses the default pool
+        if sheet_id not in self._routed_sheets_logged:
+            self._routed_sheets_logged.add(sheet_id)
+            _log.info("kie_router_selected", sheet_id=sheet_id)
+        return replace(self._clients, kie=kie)
+
     async def _handle_row(self, queued: QueuedRow, meta: _RowMeta) -> None:
         set_context(batch_id=queued.job_id, row_num=queued.row_num)
         result: RowResult
@@ -793,8 +820,12 @@ class BatchRunner:
             # could be empty on a hand-crafted test payload).
             tab = _tab_for_row(row)
             timeout_seconds = await self._row_timeout_seconds(tab)
+            # Route the row to its spreadsheet's kie key (default pool when
+            # unmapped / no router). The 14 processors keep calling
+            # ``clients.kie`` — only the bundle they receive changes.
+            clients = self._clients_for_sheet(queued.sheet_id)
             processor_coro = _dispatch_to_processor(
-                row, self._clients, queued.job_id
+                row, clients, queued.job_id
             )
             try:
                 result = await asyncio.wait_for(

@@ -78,6 +78,13 @@ class Settings(BaseSettings):
 
     # ── kie.ai ───────────────────────────────────────────────────────────
     KIE_AI_KEYS: str = ""
+    # Optional per-spreadsheet key routing. Any sheet listed here draws from its
+    # own key(s); every other sheet falls back to the ``KIE_AI_KEYS`` pool. Lets
+    # a duplicated sheet ("Bulk Videos 2") bill a different kie.ai key without a
+    # second backend. Format: one mapping per line (commas also accepted),
+    # ``<sheet_id> = key1|key2``. Parsed by ``kie_key_map`` below. See
+    # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+    KIE_KEY_MAP: str = ""
     KIE_BASE_URL: str = "https://api.kie.ai"
     KIE_CONNECT_TIMEOUT_SECONDS: float = 10.0
     KIE_TIMEOUT_SECONDS: float = 120.0
@@ -232,6 +239,31 @@ class Settings(BaseSettings):
     @property
     def kie_key_list(self) -> list[str]:
         return [k.strip() for k in self.KIE_AI_KEYS.split(",") if k.strip()]
+
+    @property
+    def kie_key_map(self) -> dict[str, list[str]]:
+        """Parse ``KIE_KEY_MAP`` into ``{sheet_id: [key, ...]}``.
+
+        Entries are separated by newlines or commas; each entry is
+        ``<sheet_id> = key1|key2`` (split on the FIRST ``=`` so a stray ``=``
+        inside a key can't corrupt the sheet id). Multiple keys per sheet are
+        ``|``-separated. Blank lines and malformed entries (no ``=``, empty side)
+        are skipped — a garbled entry degrades that sheet to the default pool
+        rather than failing the whole map. A later sheet id wins if it repeats.
+        """
+        mapping: dict[str, list[str]] = {}
+        raw = self.KIE_KEY_MAP.replace(",", "\n")
+        for line in raw.splitlines():
+            entry = line.strip()
+            if not entry or "=" not in entry:
+                continue
+            sheet_id, _, keys_str = entry.partition("=")
+            sheet_id = sheet_id.strip()
+            keys = [k.strip() for k in keys_str.split("|") if k.strip()]
+            if not sheet_id or not keys:
+                continue
+            mapping[sheet_id] = keys
+        return mapping
 
 
 @lru_cache(maxsize=1)

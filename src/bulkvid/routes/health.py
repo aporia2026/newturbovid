@@ -81,6 +81,14 @@ async def deep_health(
                 "configured": len(settings.kie_key_list) > 0,
                 "key_count": len(settings.kie_key_list),
                 "suffixes": [k[-4:] for k in settings.kie_key_list],
+                # Per-spreadsheet key routing (KIE_KEY_MAP). Suffix-masked like
+                # the pool above so an admin can confirm a given sheet maps to
+                # the intended key without exposing it. Empty when unconfigured.
+                # Plan ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+                "sheet_key_map": {
+                    sid: [k[-4:] for k in keys]
+                    for sid, keys in settings.kie_key_map.items()
+                },
             },
             "vertex_ai": {
                 # Recognise BOTH credential modes the TTS client actually uses:

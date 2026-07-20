@@ -12,9 +12,11 @@ Public surface
 --------------
 - ``KiePool``               — round-robin keys with per-key cooldown
 - ``KieClient``             — async submit + poll, key-pinning aware
+- ``KieClientRouter``       — pick a ``KieClient`` per spreadsheet (key routing)
 - ``nano_banana_edit(...)`` — high-level wrapper, returns ``(url, cost_usd)``
 - ``recraft_crisp_upscale(...)`` — high-level wrapper, returns ``(url, cost_usd)``
-- ``build_client_from_settings()`` — wires the client from env
+- ``build_client_from_settings()`` — wires the default client from env
+- ``build_router_from_settings()`` — wires the per-sheet router from env
 
 Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 (Concurrency model,
 "kie.ai key pool"), §11 (Cost model — refresh estimates before each release).
@@ -885,18 +887,88 @@ async def seedance_image_to_video(
 # ── Construction from settings ───────────────────────────────────────────────
 
 
-def build_client_from_settings(settings: Settings | None = None) -> KieClient:
-    """Construct a KieClient with the configured key pool. Raises if no keys."""
-    s = settings or get_settings()
-    if not s.kie_key_list:
-        raise ValueError("KIE_AI_KEYS is empty; cannot build KieClient")
-    pool = KiePool(
-        s.kie_key_list,
-        cooldown_seconds=s.KIE_RATE_LIMIT_COOLDOWN_SECONDS,
-    )
+def _build_client_from_keys(keys: list[str], s: Settings) -> KieClient:
+    """Construct a KieClient from an explicit key list + shared kie settings."""
+    pool = KiePool(keys, cooldown_seconds=s.KIE_RATE_LIMIT_COOLDOWN_SECONDS)
     return KieClient(
         pool=pool,
         base_url=s.KIE_BASE_URL,
         connect_timeout=s.KIE_CONNECT_TIMEOUT_SECONDS,
         read_timeout=s.KIE_TIMEOUT_SECONDS,
     )
+
+
+def build_client_from_settings(settings: Settings | None = None) -> KieClient:
+    """Construct a KieClient with the configured key pool. Raises if no keys."""
+    s = settings or get_settings()
+    if not s.kie_key_list:
+        raise ValueError("KIE_AI_KEYS is empty; cannot build KieClient")
+    return _build_client_from_keys(s.kie_key_list, s)
+
+
+class KieClientRouter:
+    """Pick a :class:`KieClient` by spreadsheet id.
+
+    A sheet listed in ``KIE_KEY_MAP`` gets its own client (own key pool, own
+    per-key cooldown, own httpx session — fully independent of the default
+    pool); every other sheet falls back to ``default`` (the ``KIE_AI_KEYS``
+    pool). This lets one backend bill different kie.ai keys per sheet — e.g. a
+    duplicated "Bulk Videos 2" on a separate key — without a second deployment.
+    Routing is by the job's ``sheet_id``, resolved once per row at the runner
+    seam so the 14 row processors keep calling ``clients.kie`` unchanged. Plan
+    ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
+    """
+
+    def __init__(
+        self, default: KieClient, by_sheet: dict[str, KieClient] | None = None
+    ) -> None:
+        self._default = default
+        self._by_sheet = dict(by_sheet or {})
+
+    @property
+    def default(self) -> KieClient:
+        return self._default
+
+    @property
+    def mapped_sheet_ids(self) -> list[str]:
+        return list(self._by_sheet)
+
+    def for_sheet(self, sheet_id: str | None) -> KieClient:
+        """Return the client for ``sheet_id``, or the default when unmapped.
+
+        A blank/None id (hand-crafted test payload, older claim path) resolves
+        to the default — a missing route degrades to the shared pool, never to
+        "no client".
+        """
+        if not sheet_id:
+            return self._default
+        return self._by_sheet.get(sheet_id, self._default)
+
+
+def build_router_from_settings(
+    settings: Settings | None = None,
+) -> KieClientRouter:
+    """Wire a :class:`KieClientRouter` from env.
+
+    ``default`` is the same client :func:`build_client_from_settings` builds
+    (the ``KIE_AI_KEYS`` pool), so the default pool is never constructed twice.
+    Each ``KIE_KEY_MAP`` entry becomes an independent per-sheet client. Raises if
+    ``KIE_AI_KEYS`` is empty — the default is the mandatory fallback for every
+    unmapped sheet.
+    """
+    s = settings or get_settings()
+    default = build_client_from_settings(s)
+    by_sheet = {
+        sheet_id: _build_client_from_keys(keys, s)
+        for sheet_id, keys in s.kie_key_map.items()
+    }
+    if by_sheet:
+        _log.info(
+            "kie_router_init",
+            default_suffixes=[_key_suffix(k) for k in s.kie_key_list],
+            mapped_sheets={
+                sid: [_key_suffix(k) for k in keys]
+                for sid, keys in s.kie_key_map.items()
+            },
+        )
+    return KieClientRouter(default, by_sheet)
