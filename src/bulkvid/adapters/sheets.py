@@ -41,6 +41,7 @@ from bulkvid.orchestrator.queue import (
     TAB_CARTOON,
     TAB_FOUR_IMAGES,
     TAB_HOOK_CARD,
+    TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
     TAB_SIMPLE,
@@ -208,6 +209,12 @@ class _TextOnImgCols:
 
 
 TEXT_ON_IMG_COLS = _TextOnImgCols()
+
+
+# image_resize (2026-07-20) reuses the text_on_img layout exactly (Yoav cloned
+# that tab): Manual Image (D) reframed to Change Size (H), one Ready Image URL to
+# column K (0-indexed 10). Same column map, so alias rather than duplicate.
+IMAGE_RESIZE_COLS = TEXT_ON_IMG_COLS
 
 
 @dataclass(frozen=True)
@@ -392,6 +399,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_AVATAR: 1,
     TAB_MOTION_ADS: 1,
     TAB_HOOK_CARD: 1,
+    TAB_IMAGE_RESIZE: 1,
 }
 
 
@@ -582,6 +590,8 @@ class SheetsClient:
             col = SIMPLE_X4_COLS.ready_video_start
         elif layout == TAB_TEXT_ON_IMG:
             col = TEXT_ON_IMG_COLS.ready_video_start
+        elif layout == TAB_IMAGE_RESIZE:
+            col = IMAGE_RESIZE_COLS.ready_video_start
         elif layout == TAB_AVATAR:
             col = AVATAR_COLS.ready_video_start
         elif layout == TAB_MOTION_ADS:
@@ -990,6 +1000,8 @@ class SheetsClient:
                 if tab_type == TAB_SIMPLE_X4
                 else TEXT_ON_IMG_COLS.ready_video_start
                 if tab_type == TAB_TEXT_ON_IMG
+                else IMAGE_RESIZE_COLS.ready_video_start
+                if tab_type == TAB_IMAGE_RESIZE
                 else AVATAR_COLS.ready_video_start
                 if tab_type == TAB_AVATAR
                 else MOTION_ADS_COLS.ready_video_start

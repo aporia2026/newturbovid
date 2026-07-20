@@ -31,6 +31,7 @@ from bulkvid.models.row import CartoonRow, FourImagesVO2Row, ImageVORow
 from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_FOUR_IMAGES,
+    TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_YT_CARTOON,
 )
@@ -473,6 +474,37 @@ async def test_yt_cartoon_writes_to_columns_P_and_Q() -> None:
     cells = {u["range"]: u["values"][0][0] for u in updates}
     # yt-cartoon: ready videos start at col P (1-indexed col 16), 0-indexed 15.
     assert cells == {"P2": "u1", "Q2": "u2"}
+
+
+async def test_image_resize_writes_to_column_K() -> None:
+    """Regression for the dead-write bug (2026-07-20): the image_resize tab had
+    no branch in ``batch_write_video_urls``'s positional_fallback chain, so it
+    hit ``else None`` and the write was SKIPPED (logged skip_unknown_tab_type) —
+    the reframed image never landed in Ready Image (col K) even though the job
+    completed and the image was stored. With no matching header in the fake
+    client, the write MUST fall back to the positional column (K = 0-indexed 10)
+    and write the single Ready Image URL."""
+    client, worksheets = _make_fake_client({})
+    sc = SheetsClient(client=client)
+
+    n = await sc.batch_write_video_urls(
+        [
+            _write(
+                sheet_id="sheet-IR",
+                worksheet="image_resize",
+                tab_type=TAB_IMAGE_RESIZE,
+                row_num=2,
+                video_urls=["u1"],   # one reframed image per row
+            )
+        ]
+    )
+    assert n == 1
+
+    ws = worksheets[("sheet-IR", "image_resize")]
+    updates = ws.batch_update.call_args.args[0]
+    cells = {u["range"]: u["values"][0][0] for u in updates}
+    # image_resize: Ready Image at col K (1-indexed col 11), 0-indexed 10.
+    assert cells == {"K2": "u1"}
 
 
 async def test_groups_by_sheet_and_worksheet_one_batch_each() -> None:
