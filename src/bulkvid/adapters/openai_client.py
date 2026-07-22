@@ -1,7 +1,8 @@
 """OpenAI adapter — chat completions + vision, with token-based cost tracking.
 
 Used for:
-  - gpt-5.4-mini  (Yoav directive)  -> script gen, prompt build, classifier
+  - gpt-5.4-mini  (Yoav directive)  -> script gen, prompt build, text and
+                                       vision classifiers
   - gpt-4o                          -> image description (vision input)
 
 Pricing table is module-level and admin-overridable in Phase 5. Cost is
@@ -48,6 +49,12 @@ MODEL_SCRIPT_GEN = "gpt-5.4-mini"
 MODEL_VISION = "gpt-4o"
 MODEL_COLLAGE_PROMPT = "gpt-5.4-mini"
 MODEL_CLASSIFIER = "gpt-5.4-mini"
+# Vision classifier (text_on_img overlay detection, 2026-07-22). Deliberately
+# NOT ``MODEL_VISION``: gpt-4o has dropped off OpenAI's current pricing page,
+# and gpt-5.4-mini is both this repo's workhorse and cheaper on input
+# ($0.75 vs $2.50 per 1M). Verified 2026-07-22 to accept an image part,
+# ``temperature=0.0`` and ``response_format`` together.
+MODEL_TEXT_DETECT = "gpt-5.4-mini"
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -250,8 +257,16 @@ class OpenAIClient:
         model: str = MODEL_VISION,
         detail: str = "high",
         max_tokens: int = 500,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
-        """Single-image vision call. Provide ``image_url`` OR ``image_b64``."""
+        """Single-image vision call. Provide ``image_url`` OR ``image_b64``.
+
+        ``temperature`` / ``response_format`` are plain passthroughs to
+        :meth:`chat` — a vision *classifier* (as opposed to a describer) wants
+        deterministic strict-JSON output, and there is no reason to duplicate
+        the message shaping just to reach those two knobs.
+        """
         if not image_url and not image_b64:
             raise ValueError("vision_describe requires image_url or image_b64")
 
@@ -273,7 +288,13 @@ class OpenAIClient:
             }
         ]
 
-        return await self.chat(model=model, messages=messages, max_tokens=max_tokens)
+        return await self.chat(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=response_format,
+        )
 
 
 def _extract_openai_retry_after(exc: BaseException) -> float | None:

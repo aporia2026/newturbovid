@@ -1,16 +1,21 @@
 """Tests for the text-on-img row processor.
 
 The 2026-06-09 rewrite stripped the video pipeline — this tab now produces
-a still PNG (manual image + center-overlay text). Covers:
+a still PNG (manual image + center-overlay text). The 2026-07-22 change added
+a vision pre-check that passes already-headlined creatives through untouched.
+Covers:
   - Happy path -> STATUS_SUCCESS + exactly 1 image URL written back
   - Blank text -> still SUCCESS, image ships without overlay
   - Bad manual_image_url -> STATUS_IMAGE_DOWNLOAD_FAILED, fast fail
+  - Already-headlined image -> source bytes passed through under an ``asis`` key
+  - A hedged or failed vision verdict still composes (fail open)
   - Article / TTS / Rendi / ZapCap clients are NEVER called
 """
 
 from __future__ import annotations
 
 import io
+import json
 
 import httpx
 import respx
@@ -59,6 +64,44 @@ def _src_png(width: int = 640, height: int = 360, color=(120, 180, 220)) -> byte
     img.save(buf, format="PNG")
     img.close()
     return buf.getvalue()
+
+
+def _src_jpeg(width: int = 640, height: int = 360, color=(200, 140, 90)) -> bytes:
+    img = Image.new("RGB", (width, height), color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    img.close()
+    return buf.getvalue()
+
+
+def _mock_detect(
+    *, has_text: bool = False, confidence: str = "high", reason: str = "r"
+) -> respx.Route:
+    """Stub the overlay-text vision check.
+
+    Registered explicitly in every test that reaches it — an unmocked route
+    would raise inside the detector, which fails open, so the test would still
+    pass while quietly exercising the error path instead of the one it names.
+    """
+    content = json.dumps({
+        "has_overlay_text": has_text, "confidence": confidence, "reason": reason,
+    })
+    return respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(200, json={
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1717_000_000,
+            "model": "gpt-5.4-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 1200, "completion_tokens": 30, "total_tokens": 1230,
+            },
+        }),
+    )
 
 
 def _build_clients(storage: _FakeStorageClient | None = None) -> PipelineClients:
@@ -110,13 +153,16 @@ async def test_happy_path_returns_one_image_url() -> None:
     respx.get("https://example.com/ad.png").mock(
         return_value=httpx.Response(200, content=_src_png()),
     )
+    _mock_detect(has_text=False)
 
     storage = _FakeStorageClient()
     result = await process_text_on_img_row(_row(), _build_clients(storage), job_id="jobX")
 
     assert result.status == STATUS_SUCCESS
+    assert result.metadata["already_had_text"] is False
     assert len(result.video_urls) == 1
     assert result.video_urls[0].startswith("https://storage.test/bulkvid/text_on_img/")
+    assert "/asis/" not in result.video_urls[0]
     assert result.video_urls[0].endswith(".png")
     assert result.metadata["tab"] == "text_on_img"
     assert result.metadata["overlay_chars"] > 0
@@ -135,18 +181,30 @@ async def test_happy_path_returns_one_image_url() -> None:
 
 
 @respx.mock
-async def test_blank_text_ships_image_without_overlay() -> None:
+async def test_blank_text_ships_image_without_overlay_and_without_paying() -> None:
     """Empty text is allowed — the overlay function returns the
-    blurred-bg-fit image without drawing text. Status still SUCCESS."""
+    blurred-bg-fit image without drawing text. Status still SUCCESS.
+
+    The vision check is skipped outright: with nothing to draw there is no
+    doubled text to prevent, so it has no decision to make. A blank-text
+    batch must therefore cost nothing in vision tokens, and must keep its
+    pre-2026-07-22 output (fit to Change Size) rather than passing through."""
     respx.get("https://example.com/ad.png").mock(
         return_value=httpx.Response(200, content=_src_png()),
     )
+    # Deliberately answers YES. If the guard regressed, the row would pass
+    # through untouched and this test would catch it.
+    detect = _mock_detect(has_text=True)
 
-    result = await process_text_on_img_row(_row(text=""), _build_clients(), job_id="j")
+    result = await process_text_on_img_row(_row(text="   "), _build_clients(), job_id="j")
 
     assert result.status == STATUS_SUCCESS
     assert len(result.video_urls) == 1
-    assert result.metadata["overlay_chars"] == 0
+    assert result.metadata["overlay_chars"] == 3
+    assert not detect.called, "blank Text must not trigger a paid vision call"
+    assert "already_had_text" not in result.metadata
+    assert result.metadata["cost_breakdown"]["vision"] == 0.0
+    assert "/asis/" not in result.video_urls[0]
 
 
 async def test_bad_image_url_fails_fast() -> None:
@@ -161,13 +219,12 @@ async def test_bad_image_url_fails_fast() -> None:
 
 
 @respx.mock
-async def test_no_external_pipeline_clients_called() -> None:
-    """The image-only pipeline must NOT hit OpenAI, Rendi, Gemini TTS,
-    ZapCap, or any article-fetch backend. Register mocks at those bases
-    and assert none were called."""
-    openai_route = respx.post(f"{OPENAI_BASE}/chat/completions").mock(
-        return_value=httpx.Response(200, json={}),
-    )
+async def test_only_the_vision_check_calls_out() -> None:
+    """The image-only pipeline hits OpenAI exactly once — the overlay-text
+    vision check. It must NOT touch Rendi, Gemini TTS, ZapCap, or any
+    article-fetch backend. Register mocks at those bases and assert none
+    were called."""
+    openai_route = _mock_detect(has_text=False)
     rendi_route = respx.post(f"{RENDI_BASE}/v1/run-ffmpeg-command").mock(
         return_value=httpx.Response(200, json={"command_id": "x"}),
     )
@@ -187,7 +244,7 @@ async def test_no_external_pipeline_clients_called() -> None:
     result = await process_text_on_img_row(_row(), _build_clients(), job_id="j")
 
     assert result.status == STATUS_SUCCESS
-    assert not openai_route.called, "OpenAI must not be called"
+    assert openai_route.call_count == 1, "exactly one vision check per row"
     assert not rendi_route.called, "Rendi must not be called"
     assert not zapcap_route.called, "ZapCap must not be called"
     assert not tts_route.called, "Gemini TTS must not be called"
@@ -211,19 +268,137 @@ async def test_image_download_network_failure() -> None:
 
 
 @respx.mock
-async def test_cost_breakdown_only_storage() -> None:
-    """The stripped pipeline has exactly one cost source: storage. No
-    article / language / classify / script / tts / rendi / zapcap entries."""
+async def test_cost_breakdown_is_vision_plus_storage() -> None:
+    """The stripped pipeline has exactly two cost sources: the overlay-text
+    vision check and storage. No article / language / script / tts / rendi /
+    zapcap entries."""
     respx.get("https://example.com/ad.png").mock(
         return_value=httpx.Response(200, content=_src_png()),
     )
+    _mock_detect(has_text=False)
 
     result = await process_text_on_img_row(_row(), _build_clients(), job_id="j")
 
     assert result.status == STATUS_SUCCESS
     breakdown = result.metadata["cost_breakdown"]
-    assert set(breakdown.keys()) == {"storage"}
+    assert set(breakdown.keys()) == {"vision", "storage"}
     assert breakdown["storage"] > 0
+    assert breakdown["vision"] > 0
+
+
+# ── Already-headlined creatives pass through ────────────────────────────────
+
+
+@respx.mock
+async def test_already_has_text_passes_source_through_untouched() -> None:
+    """The whole point of the 2026-07-22 change: a confident yes uploads the
+    ORIGINAL bytes — no resize, no re-encode, no overlay — under an ``asis``
+    key, and that URL goes to the Ready Image cell."""
+    source = _src_png()
+    respx.get("https://example.com/ad.png").mock(
+        return_value=httpx.Response(200, content=source),
+    )
+    _mock_detect(has_text=True, reason="White headline laid over the photo.")
+
+    storage = _FakeStorageClient()
+    result = await process_text_on_img_row(_row(), _build_clients(storage), job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["already_had_text"] is True
+    assert result.metadata["detect_confidence"] == "high"
+    assert "headline" in result.metadata["detect_reason"]
+
+    assert len(storage.calls) == 1
+    key, content_type, size = storage.calls[0]
+    assert key.startswith("bulkvid/text_on_img/asis/")
+    assert content_type == "image/png"
+    # Byte-for-byte: composing would have changed the length.
+    assert size == len(source)
+    assert result.video_urls == [f"https://storage.test/{key}"]
+
+    filename = key.rsplit("/", 1)[-1]
+    assert filename.startswith("ES_real-estate_asis_")
+    assert "_r2_" in filename
+
+
+@respx.mock
+async def test_passthrough_keeps_jpeg_content_type() -> None:
+    """Content type is sniffed from the bytes, not the URL. A JPEG source
+    must not be served from our bucket labelled ``image/png`` — the URL in
+    column K feeds an ad upload that checks it."""
+    source = _src_jpeg()
+    respx.get("https://example.com/ad.png").mock(     # .png URL, JPEG bytes
+        return_value=httpx.Response(200, content=source),
+    )
+    _mock_detect(has_text=True)
+
+    storage = _FakeStorageClient()
+    result = await process_text_on_img_row(_row(), _build_clients(storage), job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    key, content_type, size = storage.calls[0]
+    assert content_type == "image/jpeg"
+    assert key.endswith(".jpg")
+    assert size == len(source)
+
+
+@respx.mock
+async def test_passthrough_ignores_change_size() -> None:
+    """"As is" means as is — a 640x360 source asked for 9:16 still ships at
+    its native size rather than gaining blurred bars (chat 2026-07-22)."""
+    source = _src_png(width=640, height=360)
+    respx.get("https://example.com/ad.png").mock(
+        return_value=httpx.Response(200, content=source),
+    )
+    _mock_detect(has_text=True)
+
+    storage = _FakeStorageClient()
+    await process_text_on_img_row(
+        _row(aspect_ratio="9:16"), _build_clients(storage), job_id="j"
+    )
+
+    _key, _ct, size = storage.calls[0]
+    assert size == len(source)
+
+
+@respx.mock
+async def test_hedged_verdict_still_composes() -> None:
+    """A low-confidence yes must fall through to the overlay. Shipping an ad
+    with no headline is silent; doubled text is visible and fixable."""
+    source = _src_png()
+    respx.get("https://example.com/ad.png").mock(
+        return_value=httpx.Response(200, content=source),
+    )
+    _mock_detect(has_text=True, confidence="low")
+
+    storage = _FakeStorageClient()
+    result = await process_text_on_img_row(_row(), _build_clients(storage), job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["already_had_text"] is False
+    key, _ct, size = storage.calls[0]
+    assert "/asis/" not in key
+    assert size != len(source)    # composed, not passed through
+
+
+@respx.mock
+async def test_vision_failure_still_composes() -> None:
+    """OpenAI down must degrade the tab to its pre-2026-07-22 behaviour, not
+    break a 500-row batch."""
+    respx.post(f"{OPENAI_BASE}/chat/completions").mock(
+        return_value=httpx.Response(500, json={"error": {"message": "boom"}}),
+    )
+    respx.get("https://example.com/ad.png").mock(
+        return_value=httpx.Response(200, content=_src_png()),
+    )
+
+    storage = _FakeStorageClient()
+    result = await process_text_on_img_row(_row(), _build_clients(storage), job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["already_had_text"] is False
+    assert result.metadata["cost_breakdown"]["vision"] == 0.0
+    assert "/asis/" not in storage.calls[0][0]
 
 
 # ── Object-key naming ───────────────────────────────────────────────────────

@@ -10,12 +10,22 @@ Pipeline:
 
   1. Validate the manual image URL
   2. Download manual image
-  3. Pillow: blurred-bg fit into target aspect + center-overlay text
-  4. Upload composed PNG to storage
-  5. Return the image URL
+  3. Vision check (only when the Text cell is non-blank): does the image
+     ALREADY carry a headline? If yes, upload the source bytes untouched and
+     return that URL — skip 4 and 5.
+  4. Pillow: blurred-bg fit into target aspect + center-overlay text
+  5. Upload composed PNG to storage
+  6. Return the image URL
 
-Pure CPU + 2 network hops. Runs the Pillow rendering via
-``asyncio.to_thread`` so the event loop stays free.
+Stage 3 exists because on 500-row batches the team pastes creatives that are
+already finished — the headline is burned in — and overlaying again produces
+doubled text (Yoav 2026-07-22). The check is automatic and needs no new sheet
+column. It fails open: anything less than a confident yes composes as usual.
+See ``bulkvid.pipeline.text_detect`` for why the bias runs that way, and
+``_plans/2026-07-22-text-on-img-skip-already-texted-images.md``.
+
+Mostly CPU + 2 network hops (3 with the vision call). Runs the Pillow
+rendering via ``asyncio.to_thread`` so the event loop stays free.
 
 The TextOnImgRow dataclass still carries ``article_url`` / ``voice_over``
 / ``zapcap`` / ``script_pattern`` / ``open_comments`` for wire
@@ -27,12 +37,16 @@ operator can configure them, but they have no effect on the output.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from PIL import Image
 
 from bulkvid.adapters.rendi import normalize_aspect_ratio
 from bulkvid.http_download import download_image
@@ -47,6 +61,7 @@ from bulkvid.models.row import (
 )
 from bulkvid.orchestrator.aspect_resolve import resolve_aspect_ratio
 from bulkvid.orchestrator.clients import PipelineClients
+from bulkvid.pipeline.text_detect import NO_OVERLAY_TEXT, detect_overlay_text
 from bulkvid.pipeline.text_overlay import overlay_text_on_image_bytes
 
 _log = get_logger("row")
@@ -103,17 +118,67 @@ def _image_object_key(row: TextOnImgRow, *, now: datetime | None = None) -> str:
     return f"bulkvid/text_on_img/{fname}"
 
 
+def _asis_object_key(
+    row: TextOnImgRow, *, ext: str = "png", now: datetime | None = None
+) -> str:
+    """Storage key for a Manual Image passed through untouched.
+
+    Same segment layout as :func:`_image_object_key` but marked ``asis`` under
+    an ``text_on_img/asis/`` prefix, so a glance at the Ready Image URL tells
+    you whether the row was composed by us or handed through because it
+    already had a headline. The extension follows the *sniffed* bytes: we
+    re-encode nothing here, so the filename must not claim PNG for a JPEG.
+    """
+    n = now or datetime.now(timezone.utc)
+    country = _country_code(row.country)
+    vertical = _slug_segment(row.vertical, fallback="general")[:40]
+    date_part = n.strftime("%Y-%m-%d")
+    short = uuid.uuid4().hex[:6]
+    fname = f"{country}_{vertical}_asis_{date_part}_r{row.row_num}_{short}.{ext}"
+    return f"bulkvid/text_on_img/asis/{fname}"
+
+
+# Formats we can name and serve honestly on the pass-through path. Anything
+# else (or an unreadable header) falls back to PNG, which every browser and
+# ad platform accepts.
+_SNIFFED_TYPES: dict[str, tuple[str, str]] = {
+    "JPEG": ("jpg", "image/jpeg"),
+    "PNG": ("png", "image/png"),
+    "WEBP": ("webp", "image/webp"),
+    "GIF": ("gif", "image/gif"),
+}
+
+
+def _sniff_image_type(raw: bytes) -> tuple[str, str]:
+    """Return ``(extension, content_type)`` read from the bytes themselves.
+
+    Deliberately not derived from the source URL: operators paste CDN links
+    whose extension routinely lies (``…/photo.php``, ``…?d=…`` with no
+    extension at all), and serving a wrong ``Content-Type`` from our bucket
+    would break the downstream ad upload. Pillow only parses the header here —
+    ``load()`` is never called, so this stays cheap.
+    """
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            fmt = (img.format or "").upper()
+    except Exception:
+        _log.warning("asis_sniff_failed", head=raw[:8].hex())
+        return "png", "image/png"
+    return _SNIFFED_TYPES.get(fmt, ("png", "image/png"))
+
+
 def _is_valid_http_url(url: str) -> bool:
     return isinstance(url, str) and url.strip().startswith(("http://", "https://"))
 
 
 @dataclass
 class _Costs:
+    vision: float = 0.0
     storage: float = 0.0
 
     @property
     def total(self) -> float:
-        return round(self.storage, 6)
+        return round(self.vision + self.storage, 6)
 
 
 async def process_text_on_img_row(
@@ -178,7 +243,58 @@ async def process_text_on_img_row(
                 t0, costs, metadata,
             )
 
-        # ─── Stage 2: compose (blurred-bg fit + text overlay) ───
+        # ─── Stage 2: does the creative already carry a headline? ───
+        # On big batches the team pastes finished creatives with the headline
+        # already burned in; overlaying again doubles the text. The detector
+        # fails open — anything short of a confident yes falls through to the
+        # normal compose path below (see ``pipeline.text_detect``).
+        #
+        # Skipped entirely when the Text cell is blank: with nothing to draw
+        # there is no doubling to prevent, so the check has no decision to
+        # make. This keeps blank-text rows on exactly their pre-2026-07-22
+        # behaviour (fit to Change Size, no overlay) and keeps a batch of them
+        # free.
+        verdict = NO_OVERLAY_TEXT
+        if (row.text or "").strip():
+            verdict = await detect_overlay_text(
+                clients.openai, base64.b64encode(source_image_bytes).decode("ascii")
+            )
+            costs.vision += verdict.cost_usd
+            metadata["already_had_text"] = verdict.has_overlay_text
+            metadata["detect_confidence"] = verdict.confidence
+            metadata["detect_reason"] = verdict.reason
+
+        if verdict.has_overlay_text:
+            # Pass the image through byte-for-byte: no resize, no re-encode,
+            # no overlay. ``Change Size`` is intentionally NOT applied — "as
+            # is" means as is (chat 2026-07-22). We still re-host rather than
+            # echoing the source URL, because Facebook/IG links expire and
+            # column K has to stay a set of URLs we control.
+            ext, content_type = _sniff_image_type(source_image_bytes)
+            _log.info(
+                "text_overlay_skipped_already_has_text",
+                reason=verdict.reason,
+                source_bytes=len(source_image_bytes),
+                content_type=content_type,
+            )
+            try:
+                asis_upload = await clients.storage.upload_bytes(
+                    source_image_bytes,
+                    key=_asis_object_key(row, ext=ext),
+                    content_type=content_type,
+                )
+                costs.storage += asis_upload.cost_usd
+                # Deliberately NOT ``composed_image_bytes`` — nothing was
+                # composed here, and a row record that claims otherwise is
+                # the kind of small lie that costs an hour during a batch
+                # post-mortem.
+                metadata["asis_image_bytes"] = len(source_image_bytes)
+            except Exception as e:
+                return _fail(row, STATUS_STORAGE_FAILED, str(e), t0, costs, metadata)
+
+            return _ok(row, [asis_upload.url], t0, costs, metadata)
+
+        # ─── Stage 3: compose (blurred-bg fit + text overlay) ───
         try:
             # Pillow rendering is CPU-bound — offload so the event loop stays
             # free to advance other rows during the overlay paint.
@@ -196,7 +312,7 @@ async def process_text_on_img_row(
                 t0, costs, metadata,
             )
 
-        # ─── Stage 3: upload composed PNG ───
+        # ─── Stage 4: upload composed PNG ───
         try:
             composed_upload = await clients.storage.upload_bytes(
                 composed_bytes,
