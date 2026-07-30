@@ -15,6 +15,7 @@ const TAB_IMAGE_VO = 'image_vo';
 const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_SIMPLE_MOTION = 'simple_motion';
+const TAB_FAST_FURIOUS = 'fast_furious';
 const TAB_CARTOON = 'cartoon';
 const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
@@ -77,7 +78,7 @@ const SIZE_DROPDOWN_OPTIONS = [
 // operator sees the active model and its sizes at pick time. Keep
 // SEEDANCE_SIZE_OPTIONS in sync with SEEDANCE_ALLOWED_ASPECT_RATIOS in
 // src/bulkvid/adapters/kie.py.
-const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
+const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_FAST_FURIOUS, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
 const ACTIVE_VIDEO_MODEL_LABEL = 'Seedance 1.5 Pro';
 const SEEDANCE_SIZE_OPTIONS = ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'];
 
@@ -151,6 +152,24 @@ const SIMPLE_MOTION_COLS = {
   openComments: 12,
   readyVideo1: 13, readyVideo2: 14,
   lastInputCol: 12,
+};
+
+// fast-and-furious tab (2026-07-30): like simple-motion (two Manual Image columns
+// D/E, shared across videos) PLUS a Number of Videos column (F) and FOUR Change
+// Size columns (I-L, one aspect per output video), feeding Ready Video 1-4 (Q-T).
+// Each row produces up to 4 Gen-Z variations. Read by HEADER NAME first (like
+// simple-motion) — but the four Change Size columns share a header, so they are
+// read POSITIONALLY. These positional values are the fallback. Plan
+// _plans/2026-07-30-fast-and-furious-tab.md.
+const FAST_FURIOUS_COLS = {
+  country: 1, vertical: 2, article: 3,
+  manualImage1: 4, manualImage2: 5,
+  numVideos: 6, voiceOver: 7, zapcap: 8,
+  changeSize1: 9, changeSize2: 10, changeSize3: 11, changeSize4: 12,
+  scriptPattern: 13, ctaEnabled: 14, ctaText: 15,
+  openComments: 16,
+  readyVideo1: 17, readyVideo2: 18, readyVideo3: 19, readyVideo4: 20,
+  lastInputCol: 16,
 };
 
 // yt-cartoon tab (2026-06-17): the cartoon layout PLUS four new columns
@@ -336,6 +355,13 @@ function _detectTabType(sheet) {
   // shape. Must be checked BEFORE plain "simple" since the name contains it.
   if (name.indexOf('x4') !== -1) {
     return _isSimpleX4Migrated(sheet) ? TAB_SIMPLE_X4 : TAB_IMAGE_VO;
+  }
+  // "fast-and-furious" -> simple-motion variant with TikTok/Gen-Z narration and
+  // no silent tail (2026-07-30). The name contains none of the other tab
+  // keywords, so ordering vs them is moot; kept up top with the name detections.
+  if (name.indexOf('fast-and-furious') !== -1 || name.indexOf('fast and furious') !== -1
+      || name.indexOf('fast_and_furious') !== -1 || name.indexOf('fast-furious') !== -1) {
+    return TAB_FAST_FURIOUS;
   }
   // "simple-motion" -> animate super-realistic images (manual D/E or generated).
   // MUST be checked BEFORE the generic "simple" match below, since the name
@@ -581,6 +607,62 @@ function _readSimpleMotionRow(sheet, rowNum) {
     voice_over: _yes(_cell(values, cVoiceOver), true),
     zapcap: _yes(_cell(values, cZapcap), false),
     aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
+function _readFastFuriousRow(sheet, rowNum) {
+  // fast-and-furious: simple-motion inputs PLUS Number of Videos (F) and FOUR
+  // Change Size columns (one aspect per output video), feeding Ready Video 1-4.
+  // Header-name first for everything EXCEPT the four Change Size cells: they share
+  // the "Change Size" header, so they're read POSITIONALLY (FAST_FURIOUS_COLS).
+  // Both Manual Image cells are SHARED by all videos (blank → generated; filled →
+  // animated as-is). Plan _plans/2026-07-30-fast-and-furious-tab.md.
+  const cols = FAST_FURIOUS_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage1 = _colForHeaders(headerMap, ['Manual Image 1', 'Manual Image'], cols.manualImage1);
+  const cManualImage2 = _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2);
+  const cNumVideos    = _colForHeaders(headerMap, ['Number of Videos', 'Number of Video', 'Num Videos'], cols.numVideos);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  const numRaw = parseInt(_cell(values, cNumVideos), 10);
+  const numVideos = isNaN(numRaw) ? 1 : Math.max(1, Math.min(4, numRaw));
+
+  // The four Change Size columns share the "Change Size" header, so read them
+  // positionally. Blank cells stay '' → the backend defaults that video to 9:16.
+  const aspectRatios = [
+    _aspectCell(values, cols.changeSize1),
+    _aspectCell(values, cols.changeSize2),
+    _aspectCell(values, cols.changeSize3),
+    _aspectCell(values, cols.changeSize4),
+  ];
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_1: _cell(values, cManualImage1),
+    manual_image_2: _cell(values, cManualImage2),
+    num_videos: numVideos,
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratios: aspectRatios,
     script_pattern: _cell(values, cScriptPat),
     cta_enabled: _yes(_cell(values, cCtaEnabled), false),
     cta_text: _cell(values, cCtaText).slice(0, 80),
@@ -859,6 +941,15 @@ function _validateSimpleMotion(r) {
 }
 
 
+function _validateFastFurious(r) {
+  // Only the article is required (it drives the voiceovers + any generated
+  // scenes). Manual Image cells are optional (shared across videos); Number of
+  // Videos + Change Size default sensibly.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
 function _validateMotionAds(r) {
   // Only the article is required. Manual Image is optional (blank → the backend
   // generates a realistic image; filled → it animates that image as-is). Apple /
@@ -1015,6 +1106,7 @@ function generateAllUnprocessed() {
     tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
+    : tabType === TAB_FAST_FURIOUS ? FAST_FURIOUS_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
     : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -1045,6 +1137,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   const readRow = tabType === TAB_FOUR_IMAGES ? _readFourImagesRow
     : tabType === TAB_CARTOON ? _readCartoonRow
     : tabType === TAB_SIMPLE_MOTION ? _readSimpleMotionRow
+    : tabType === TAB_FAST_FURIOUS ? _readFastFuriousRow
     : tabType === TAB_YT_CARTOON ? _readYtCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
@@ -1055,6 +1148,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
     : tabType === TAB_SIMPLE_MOTION ? _validateSimpleMotion
+    : tabType === TAB_FAST_FURIOUS ? _validateFastFurious
     : tabType === TAB_YT_CARTOON ? _validateYtCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
@@ -1088,6 +1182,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       tabType === TAB_FOUR_IMAGES ? FOUR_IMAGES_COLS
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
+      : tabType === TAB_FAST_FURIOUS ? FAST_FURIOUS_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
       : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -1133,6 +1228,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   if (tabType === TAB_FOUR_IMAGES) payload.rows_four_images = rows;
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_SIMPLE_MOTION) payload.rows_simple_motion = rows;
+  else if (tabType === TAB_FAST_FURIOUS) payload.rows_fast_furious = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_YT_CARTOON) payload.rows_yt_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
@@ -1481,7 +1577,7 @@ function showActiveModels() {
     '<h1>Active models &amp; sizes</h1>' +
     '<p class="sub">Which model each tab runs, and the sizes it accepts.</p>' +
     '<div class="card video"><div class="top">' +
-    '<span class="tabs">cartoon · yt-cartoon · simple-motion · Motion_Ads</span>' +
+    '<span class="tabs">cartoon · yt-cartoon · simple-motion · fast-and-furious · Motion_Ads</span>' +
     '<span class="model">animated video · <b>' + ACTIVE_VIDEO_MODEL_LABEL + '</b></span>' +
     '</div><div class="chips">' + chips(SEEDANCE_SIZE_OPTIONS) + '</div></div>' +
     '<div class="card image"><div class="top">' +

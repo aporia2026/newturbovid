@@ -282,6 +282,43 @@ class SimpleMotionRow:
 
 
 @dataclass
+class FastFuriousRow:
+    """fast-and-furious tab input row — N TikTok-style realistic videos per row.
+
+    A sibling of :class:`SimpleMotionRow` (same realistic-image, two-shot,
+    manual-image-or-generate pipeline) but with three differences, driven off the
+    ``fast_furious`` tab type:
+
+      * N DIFFERENT creative variations per row. ``num_videos`` (sheet col
+        "Number of Videos", 1-4) picks how many; each is its own Gen-Z script +
+        its own visuals, like the cartoon tab's multi-idea output.
+      * PER-VIDEO aspect ratio. ``aspect_ratios`` holds the four "Change Size"
+        columns; video ``i`` uses ``aspect_ratios[i]`` (blank/missing → "9:16").
+      * A TikTok/Gen-Z narration written to FILL the video (the processor drives
+        each video's length from its voiceover, so there is no silent tail).
+
+    ``manual_image_1`` / ``manual_image_2`` (cols D/E) are SHARED by all N videos
+    as shot 1 / shot 2; a blank cell is auto-generated per video. Outputs land in
+    Ready Video 1..N. Plan ``_plans/2026-07-30-fast-and-furious-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_1: str               # col D — shot 1, shared; blank → generate
+    manual_image_2: str               # col E — shot 2, shared; blank → generate
+    num_videos: int                   # "Number of Videos" (1-4)
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratios: list[str]          # "Change Size 1-4"; video i uses index i
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # mirrors cartoon — yellow pill at bottom
+    cta_text: str = ""                # operator text; empty = per-language default
+
+
+@dataclass
 class MotionAdsRow:
     """Motion_Ads tab input row — a silent motion-ad video + ad copy.
 

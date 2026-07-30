@@ -30,6 +30,7 @@ from bulkvid.models.row import (
     CardChoice,
     CartoonRow,
     AvatarRow,
+    FastFuriousRow,
     FourImagesVO2Row,
     HookCardRow,
     ImageVORow,
@@ -52,6 +53,7 @@ from bulkvid.orchestrator.queue import (
     KILL_OUTCOME_TIMEOUT,
     TAB_AVATAR,
     TAB_CARTOON,
+    TAB_FAST_FURIOUS,
     TAB_FOUR_IMAGES,
     TAB_HOOK_CARD,
     TAB_IMAGE_VO,
@@ -173,6 +175,31 @@ class SimpleMotionRowIn(BaseModel):
     voice_over: bool = True
     zapcap: bool = False
     aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
+class FastFuriousRowIn(BaseModel):
+    """Wire shape for the ``fast-and-furious`` tab — N realistic videos per row.
+
+    Like ``simple-motion`` (two shared manual image columns D/E), PLUS a
+    ``num_videos`` count and up to four per-video aspect ratios (``Change Size
+    1-4``). Video ``i`` is its own Gen-Z variation at ``aspect_ratios[i]`` (blank →
+    9:16). Coerced defensively downstream so a blank/garbage cell never 400s the
+    batch. Plan ``_plans/2026-07-30-fast-and-furious-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_1: str = ""     # col D — shot 1, shared across videos
+    manual_image_2: str = ""     # col E — shot 2, shared across videos
+    num_videos: int = 1          # "Number of Videos" (clamped 1-4 server-side)
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratios: list[str] = Field(default_factory=list, max_length=4)
     script_pattern: str = ""
     cta_enabled: bool = False
     cta_text: str = ""
@@ -330,6 +357,8 @@ class SubmitJobIn(BaseModel):
     rows_cartoon: list[CartoonRowIn] | None = None
     # simple-motion: animate super-realistic images (manual D/E or generated).
     rows_simple_motion: list[SimpleMotionRowIn] | None = None
+    # fast-and-furious: simple-motion variant with TikTok/Gen-Z narration (plan 2026-07-30).
+    rows_fast_furious: list[FastFuriousRowIn] | None = None
     # yt-cartoon: engaging, variable-length cartoon videos (plan 2026-06-17).
     rows_yt_cartoon: list[YtCartoonRowIn] | None = None
     # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
@@ -496,6 +525,34 @@ def _build_simple_motion_row(r: SimpleMotionRowIn) -> SimpleMotionRow:
         voice_over=r.voice_over,
         zapcap=r.zapcap,
         aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
+        open_comments=r.open_comments,
+    )
+
+
+def _build_fast_furious_row(r: FastFuriousRowIn) -> FastFuriousRow:
+    """Coerce a FastFuriousRowIn into a FastFuriousRow.
+
+    Server-side hardening: ``num_videos`` clamped to 1-4; ``aspect_ratios``
+    trimmed and truncated to 4 (blanks kept so the processor defaults them to
+    9:16 per position); ``cta_text`` bounded at 80 chars; manual image URLs
+    trimmed and passed through (the processor downloads + re-uploads them once).
+    """
+    num_videos = max(1, min(4, r.num_videos))
+    aspect_ratios = [(a or "").strip() for a in (r.aspect_ratios or [])][:4]
+    return FastFuriousRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_1=(r.manual_image_1 or "").strip(),
+        manual_image_2=(r.manual_image_2 or "").strip(),
+        num_videos=num_videos,
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratios=aspect_ratios,
         script_pattern=r.script_pattern,
         cta_enabled=r.cta_enabled,
         cta_text=(r.cta_text or "")[:80],
@@ -877,6 +934,12 @@ async def submit_job(
                 400, "rows_simple_motion is required for tab_type=simple_motion"
             )
         rows = [_build_simple_motion_row(r) for r in payload.rows_simple_motion]
+    elif payload.tab_type == TAB_FAST_FURIOUS:
+        if not payload.rows_fast_furious:
+            raise HTTPException(
+                400, "rows_fast_furious is required for tab_type=fast_furious"
+            )
+        rows = [_build_fast_furious_row(r) for r in payload.rows_fast_furious]
     elif payload.tab_type == TAB_YT_CARTOON:
         if not payload.rows_yt_cartoon:
             raise HTTPException(

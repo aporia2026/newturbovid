@@ -33,6 +33,7 @@ from bulkvid.models.row import (
     AvatarRow,
     CardChoice,
     CartoonRow,
+    FastFuriousRow,
     FourImagesVO2Row,
     HookCardRow,
     ImageVORow,
@@ -70,6 +71,7 @@ TAB_IMAGE_VO = "image_vo"
 TAB_FOUR_IMAGES = "four_images_vo2"
 TAB_SIMPLE = "simple"
 TAB_SIMPLE_MOTION = "simple_motion"
+TAB_FAST_FURIOUS = "fast_furious"
 TAB_CARTOON = "cartoon"
 TAB_YT_CARTOON = "yt_cartoon"
 TAB_SIMPLE_X4 = "simple_x4"
@@ -278,7 +280,7 @@ def _deterministic_job_id(user_email: str, idempotency_key: str) -> str:
 
 
 def _row_to_payload(
-    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow,
+    row: ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | FastFuriousRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow,
     tab: str,
 ) -> str:
     data = asdict(row)
@@ -1502,7 +1504,7 @@ class JobQueue:
 
 def payload_to_row(
     payload: dict[str, Any],
-) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow:
+) -> ImageVORow | FourImagesVO2Row | SimpleRow | SimpleMotionRow | FastFuriousRow | CartoonRow | YtCartoonRow | SimpleX4Row | TextOnImgRow | AvatarRow | MotionAdsRow | HookCardRow:
     """Reconstruct the typed row dataclass from a queue payload dict."""
     tab = payload.pop("__tab__", TAB_IMAGE_VO)
     if tab == TAB_FOUR_IMAGES:
@@ -1511,6 +1513,8 @@ def payload_to_row(
         return SimpleRow(**payload)
     if tab == TAB_SIMPLE_MOTION:
         return SimpleMotionRow(**payload)
+    if tab == TAB_FAST_FURIOUS:
+        return FastFuriousRow(**payload)
     if tab == TAB_CARTOON:
         return CartoonRow(**payload)
     if tab == TAB_YT_CARTOON:
