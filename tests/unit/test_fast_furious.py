@@ -42,6 +42,7 @@ from bulkvid.orchestrator.queue import (
 from bulkvid.orchestrator.row_processor_fast_furious import (
     FF_MAX_WORDS,
     FF_TARGET_WORDS,
+    FF_VO_ATEMPO,
     process_fast_furious_row,
 )
 from bulkvid.orchestrator.runner import _dispatch_to_processor, _tab_for_row
@@ -112,6 +113,7 @@ class _FakeTTS:
 class _FakeRendi:
     def __init__(self) -> None:
         self.concat_calls: list[dict] = []
+        self.music_mixes: list[dict] = []
 
     async def concat_clips_with_audio(
         self, clip_urls, audio_url, per_clip_seconds,
@@ -120,8 +122,15 @@ class _FakeRendi:
     ) -> RendiOutput:
         self.concat_calls.append({
             "clips": list(clip_urls), "audio": audio_url,
-            "aspect": aspect_ratio, "total": total_video_seconds,
+            "aspect": aspect_ratio, "total": total_video_seconds, "atempo": atempo,
         })
+        return RendiOutput(
+            url=f"https://r.dev/{output_filename}", cost_usd=0.01,
+            command_id=f"cmd-{output_filename}",
+        )
+
+    async def mix_music(self, video_url, music_url, output_filename="out.mp4", **_) -> RendiOutput:
+        self.music_mixes.append({"video": video_url, "music": music_url})
         return RendiOutput(
             url=f"https://r.dev/{output_filename}", cost_usd=0.01,
             command_id=f"cmd-{output_filename}",
@@ -331,16 +340,18 @@ async def test_uses_gen_z_prompt_and_bigger_budget(monkeypatch, _stub_pipeline) 
 
 
 @respx.mock
-async def test_video_length_follows_voiceover(monkeypatch) -> None:
+async def test_video_length_follows_sped_voiceover(monkeypatch) -> None:
     _register_downloads()
     _patch_kie(monkeypatch)
-    clients = _clients(tts_seconds=8.0)   # > FF_MIN_VIDEO_SECONDS floor
+    clients = _clients(tts_seconds=12.0)   # sped length > FF_MIN_VIDEO_SECONDS floor
 
     await process_fast_furious_row(_row(num_videos=1), clients, job_id="j")
 
-    # The shared builder sizes the video to the VO (+ tail), not a fixed window.
+    # Livelier: the VO plays at FF_VO_ATEMPO, and the video is sized to the SPED
+    # length (+ tail) — no fixed window, no trailing silence.
+    assert clients.rendi.concat_calls[0]["atempo"] == pytest.approx(FF_VO_ATEMPO)
     total = clients.rendi.concat_calls[0]["total"]
-    assert total == pytest.approx(8.0 + VO_TAIL_SECONDS, abs=0.05)
+    assert total == pytest.approx(12.0 / FF_VO_ATEMPO + VO_TAIL_SECONDS, abs=0.05)
 
 
 @respx.mock
@@ -355,6 +366,30 @@ async def test_voice_over_off_is_silent(monkeypatch) -> None:
     assert len(result.video_urls) == 2 and all(result.video_urls)
     assert clients.tts.calls == 0
     assert all(c["audio"] is None for c in clients.rendi.concat_calls)
+    # No VO → no music to duck under (mix_music needs existing audio).
+    assert clients.rendi.music_mixes == []
+
+
+# ── Energetic background music ───────────────────────────────────────────────
+
+
+@respx.mock
+async def test_energetic_music_ducked_once_per_variation(monkeypatch) -> None:
+    _register_downloads()
+    _patch_kie(monkeypatch)
+    clients = _clients()
+
+    result = await process_fast_furious_row(_row(num_videos=3), clients, job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    # One energetic track picked + uploaded once, ducked under EACH variation.
+    assert result.metadata.get("music_track")
+    assert len(clients.rendi.music_mixes) == 3
+    music_urls = {m["music"] for m in clients.rendi.music_mixes}
+    assert len(music_urls) == 1                       # shared across variations
+    assert "fast_furious_music" in next(iter(music_urls))
+    # The final videos are the music-mixed outputs.
+    assert all("videos_music" in u for u in result.video_urls)
 
 
 # ── Shared manual images + verbatim override ─────────────────────────────────

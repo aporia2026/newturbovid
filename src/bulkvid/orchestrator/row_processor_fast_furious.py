@@ -40,6 +40,7 @@ Plan: ``_plans/2026-07-30-fast-and-furious-tab.md``.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -78,6 +79,7 @@ from bulkvid.pipeline.cartoon_prompt import (
     generate_cartoon_plan,
 )
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
+from bulkvid.pipeline.hook_card_music import content_type_for, select_track
 from bulkvid.pipeline.language import detect_language, reconcile_language
 from bulkvid.pipeline.open_comments import OpenCommentsMode, classify_open_comments
 from bulkvid.pipeline.safety import resolve_safety
@@ -101,6 +103,18 @@ FF_MAX_WORDS = 22
 # Length floor for the shared builder. Gen-Z variations are short/punchy, so keep
 # a low floor — the video otherwise follows the voiceover exactly.
 FF_MIN_VIDEO_SECONDS = 6.0
+
+# Play the voiceover faster than natural pace for a lively, TikTok energy (the
+# shared pinned builder defaults to 1.0 = calm; that read too flat). The builder
+# sizes the video to the SPED length, so there's still no trailing silence.
+FF_VO_ATEMPO = 1.25
+
+# Energetic background music, ducked under the voiceover (mix_music = music at
+# 30% under the full VO). Picked once per row from this upbeat subset of the
+# bundled library and shared across the row's variations. Only added when the row
+# has a voiceover (mix_music ducks UNDER existing audio). Reuses the hook_card
+# music pool (``pipeline.hook_card_music``).
+FF_MUSIC_STYLES = ("energetic", "uplifting", "electronic")
 
 # Motion for a shot backed by a pasted (manual) image: a universal gentle push-in
 # — the planner can't see the operator's photo, so a scene-specific motion could
@@ -294,6 +308,31 @@ async def process_fast_furious_row(
         metadata["manual_image_1_resolved"] = shared_manual_urls[0] is not None
         metadata["manual_image_2_resolved"] = shared_manual_urls[1] is not None
 
+        # ─── Stage 3b: pick + upload the energetic background music ONCE ───
+        # One upbeat track for the whole row, ducked under each variation's VO
+        # (mix_music = music @30% under the full VO). Only when there's a VO to
+        # duck under; on failure the row still ships (VO only). Shared upload.
+        music_url: str | None = None
+        if row.voice_over:
+            track = select_track(random.choice(FF_MUSIC_STYLES))
+            if track is not None:
+                try:
+                    mu = await clients.storage.upload_bytes(
+                        track.read_bytes(),
+                        key=f"bulkvid/fast_furious_music/{slug}/{track.name}",
+                        content_type=content_type_for(track),
+                    )
+                    costs.storage += mu.cost_usd
+                    music_url = mu.url
+                    metadata["music_track"] = track.name
+                except Exception as e:
+                    _log.warning(
+                        "fast_furious_music_upload_failed_no_music",
+                        error=str(e)[:200],
+                    )
+            else:
+                _log.warning("fast_furious_no_music_track_available")
+
         # ─── Stage 4: build each variation concurrently ───
         slot_errors: list[str] = []
 
@@ -355,9 +394,10 @@ async def process_fast_furious_row(
                         style=ZapCapStyleOptions(top=30, font_size=36),
                     )
 
-                # The shared builder speaks ``script`` verbatim at natural pace and
-                # sizes the video TO the voiceover (no silent tail), floored at
-                # FF_MIN_VIDEO_SECONDS. Same path the override + generated lines use.
+                # The shared builder speaks ``script`` verbatim, sped up by
+                # ``vo_atempo`` for a lively read, and sizes the video TO the
+                # (sped) voiceover — no silent tail. Same path the override + the
+                # generated lines use.
                 res = await build_pinned_cartoon_video(
                     clients=clients,
                     slug=slot_slug,
@@ -374,14 +414,41 @@ async def process_fast_furious_row(
                     zapcap_enabled=bool(row.zapcap and clients.zapcap is not None),
                     zapcap_render_options=zapcap_opts,
                     min_video_seconds=FF_MIN_VIDEO_SECONDS,
+                    vo_atempo=FF_VO_ATEMPO,
                 )
                 fold_pinned_costs(costs, res)
                 if res.zapcap_failed:
                     zapcap_failed = True
-                if res.final_url:
-                    return res.final_url
-                slot_errors.append(f"video {idx + 1}: {res.error or 'no video'}")
-                return None
+                if not res.final_url:
+                    slot_errors.append(f"video {idx + 1}: {res.error or 'no video'}")
+                    return None
+
+                # Duck energetic music under the finished (VO'd, captioned) video.
+                # Non-fatal — on failure ship the video without music. Done AFTER
+                # ZapCap so captions transcribe the clean VO, not the music mix.
+                final_url = res.final_url
+                if music_url:
+                    try:
+                        mixed = await clients.rendi.mix_music(
+                            final_url, music_url,
+                            output_filename=f"{slot_slug}_music.mp4",
+                        )
+                        costs.rendi += mixed.cost_usd
+                        data = await download_image(mixed.url, timeout=180.0)
+                        up = await clients.storage.upload_bytes(
+                            data,
+                            key=f"bulkvid/videos_music/{slot_slug}.mp4",
+                            content_type="video/mp4",
+                        )
+                        costs.storage += up.cost_usd
+                        await clients.rendi.cleanup_commands([mixed.command_id])
+                        final_url = up.url
+                    except Exception as e:
+                        _log.error(
+                            "fast_furious_music_mix_failed_kept_original",
+                            slot=idx + 1, error=str(e)[:200],
+                        )
+                return final_url
             except Exception as e:
                 slot_errors.append(f"video {idx + 1}: {str(e)[:200]}")
                 _log.error("fast_furious_slot_failed", slot=idx + 1, error=str(e)[:200])

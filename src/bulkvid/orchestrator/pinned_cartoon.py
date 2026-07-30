@@ -161,6 +161,7 @@ async def build_pinned_cartoon_video(
     zapcap_render_options: ZapCapRenderOptions | None = None,
     prebuilt_vo: PrebuiltVoiceover | None = None,
     min_video_seconds: float = MIN_VIDEO_SECONDS,
+    vo_atempo: float = PINNED_ATEMPO,
 ) -> PinnedVideoResult:
     """Build ONE video whose voiceover is the operator's pinned script, verbatim.
 
@@ -176,6 +177,11 @@ async def build_pinned_cartoon_video(
     the video-length floor (default ``MIN_VIDEO_SECONDS``) for BOTH the voiced and
     the silent paths; google-simple-motion passes 11.0. Existing callers pass
     neither, so their behaviour is unchanged.
+
+    ``vo_atempo`` (fast-and-furious) plays the voiceover faster for a livelier
+    read; it is applied in BOTH the fixed-shots video-length sizing (so the video
+    tracks the SPED length, no trailing silence) and the concat mux. Defaults to
+    ``PINNED_ATEMPO`` (1.0 — natural pace), so existing callers are unchanged.
     """
     res = PinnedVideoResult(final_url=None)
     if not shots:
@@ -215,7 +221,13 @@ async def build_pinned_cartoon_video(
                 # Floor at ``min_video_seconds`` (6 by default; 11 for
                 # google-simple-motion); no upper cap (audio wins).
                 num_shots = len(shots)
-                total = max(min_video_seconds, round(raw + VO_TAIL_SECONDS, 3))
+                # ``raw`` is the un-sped VO length; at ``vo_atempo`` the played
+                # length is ``raw / vo_atempo``, so size the video to THAT (no
+                # trailing silence). vo_atempo defaults to 1.0 → identical to before.
+                total = max(
+                    min_video_seconds,
+                    round(raw / vo_atempo + VO_TAIL_SECONDS, 3),
+                )
                 per_clip = _even_clips(total, num_shots)
                 seedance_durations = [_smallest_legal_duration(p) for p in per_clip]
             else:
@@ -353,7 +365,7 @@ async def build_pinned_cartoon_video(
             output_filename="pinned.mp4",
             aspect_ratio=aspect,
             total_video_seconds=total,
-            atempo=PINNED_ATEMPO,
+            atempo=vo_atempo,
         )
         res.cost_rendi += stitched.cost_usd
         cleanup_ids: list[str] = [stitched.command_id]
