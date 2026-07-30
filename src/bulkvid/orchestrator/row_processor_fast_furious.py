@@ -116,6 +116,17 @@ FF_VO_ATEMPO = 1.25
 # music pool (``pipeline.hook_card_music``).
 FF_MUSIC_STYLES = ("energetic", "uplifting", "electronic")
 
+# TikTok-optimized overlay positions (Yoav 2026-07-30). TikTok's own UI covers
+# the bottom ~15% (description/username) and the right edge (action buttons), so
+# push the CTA + captions LOW but keep them clear of that strip. The CTA pill
+# sits lower than the cartoon default (0.19); with a pill it occupies ~79-87% of
+# the height, so the captions ride just above it. Without a pill the captions can
+# sit lower still. Higher ``top`` = lower on screen (% from the top).
+FF_CTA_BOTTOM_MARGIN_FRAC = 0.13    # pill bottom ≈ 87% of height (was 0.19 ≈ 81%)
+FF_CAPTION_TOP_WITH_CTA = 62        # captions above the lowered pill
+FF_CAPTION_TOP_NO_CTA = 70          # captions low; no pill to clear
+FF_CAPTION_FONT_SIZE = 36
+
 # Motion for a shot backed by a pasted (manual) image: a universal gentle push-in
 # — the planner can't see the operator's photo, so a scene-specific motion could
 # mismatch it. Generated shots use the planner's own scene-matched motion.
@@ -373,6 +384,7 @@ async def process_fast_furious_row(
                         overlay_bytes = await asyncio.to_thread(
                             render_cartoon_cta_overlay_bytes,
                             cta_text, canvas_width=w, canvas_height=h,
+                            bottom_margin_frac=FF_CTA_BOTTOM_MARGIN_FRAC,
                         )
                         up = await clients.storage.upload_bytes(
                             overlay_bytes,
@@ -387,12 +399,19 @@ async def process_fast_furious_row(
                             slot=idx + 1, error=str(e)[:200],
                         )
 
-                zapcap_opts: ZapCapRenderOptions | None = None
-                if cta_overlay_url:
-                    zapcap_opts = ZapCapRenderOptions(
-                        subs=ZapCapSubsOptions(),
-                        style=ZapCapStyleOptions(top=30, font_size=36),
-                    )
+                # Captions ride LOW for TikTok — just above the CTA pill when one
+                # is present, lower still when it isn't. (Always set, so the
+                # caption position is TikTok-tuned even without a CTA.)
+                caption_top = (
+                    FF_CAPTION_TOP_WITH_CTA if cta_overlay_url
+                    else FF_CAPTION_TOP_NO_CTA
+                )
+                zapcap_opts = ZapCapRenderOptions(
+                    subs=ZapCapSubsOptions(),
+                    style=ZapCapStyleOptions(
+                        top=caption_top, font_size=FF_CAPTION_FONT_SIZE
+                    ),
+                )
 
                 # The shared builder speaks ``script`` verbatim, sped up by
                 # ``vo_atempo`` for a lively read, and sizes the video TO the

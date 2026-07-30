@@ -392,6 +392,52 @@ async def test_energetic_music_ducked_once_per_variation(monkeypatch) -> None:
     assert all("videos_music" in u for u in result.video_urls)
 
 
+# ── TikTok-low CTA + caption positions ───────────────────────────────────────
+
+
+@respx.mock
+async def test_tiktok_low_cta_and_caption_positions(monkeypatch) -> None:
+    from bulkvid.orchestrator.row_processor_fast_furious import (
+        FF_CAPTION_TOP_WITH_CTA,
+        FF_CTA_BOTTOM_MARGIN_FRAC,
+    )
+
+    _register_downloads()
+    _patch_kie(monkeypatch)
+    clients = _clients()
+
+    cta_margins: list[float] = []
+
+    def _fake_cta(cta_text, *, canvas_width, canvas_height, bottom_margin_frac=None, **_):
+        cta_margins.append(bottom_margin_frac)
+        return b"\x89PNG\x00cta"
+
+    captured_opts: list = []
+
+    async def _fake_build(**kw):
+        captured_opts.append(kw.get("zapcap_render_options"))
+        return SimpleNamespace(
+            final_url="https://storage.test/v.mp4", zapcap_failed=False, error=None
+        )
+
+    monkeypatch.setattr(rpff, "render_cartoon_cta_overlay_bytes", _fake_cta)
+    monkeypatch.setattr(rpff, "build_pinned_cartoon_video", _fake_build)
+    monkeypatch.setattr(rpff, "fold_pinned_costs", lambda costs, res: None)
+
+    row = _row(num_videos=1)
+    row.cta_enabled = True
+    result = await process_fast_furious_row(row, clients, job_id="j")
+
+    assert result.status == STATUS_SUCCESS
+    # CTA pill rendered LOW (TikTok margin), not the cartoon default 0.19.
+    assert cta_margins == [FF_CTA_BOTTOM_MARGIN_FRAC]
+    assert FF_CTA_BOTTOM_MARGIN_FRAC < 0.19
+    # Captions positioned low, just above the pill (higher `top` = lower on screen).
+    assert captured_opts[0] is not None
+    assert captured_opts[0].style.top == FF_CAPTION_TOP_WITH_CTA
+    assert FF_CAPTION_TOP_WITH_CTA > 30      # lower than the old fixed top=30
+
+
 # ── Shared manual images + verbatim override ─────────────────────────────────
 
 
