@@ -32,6 +32,7 @@ from bulkvid.models.row import (
     STATUS_ROW_TIMEOUT,
     AvatarRow,
     CartoonRow,
+    FastFuriousRow,
     FourImagesVO2Row,
     GoogleSimpleMotionRow,
     HookCardRow,
@@ -51,6 +52,7 @@ from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
+from bulkvid.orchestrator.row_processor_fast_furious import process_fast_furious_row
 from bulkvid.orchestrator.row_processor_google_simple_motion import (
     process_google_simple_motion_row,
 )
@@ -66,6 +68,7 @@ from bulkvid.orchestrator.row_processor_yt_cartoon import process_yt_cartoon_row
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_4IMAGES,
     SETTING_ROW_TIMEOUT_CARTOON,
+    SETTING_ROW_TIMEOUT_FAST_FURIOUS,
     SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION,
     SETTING_ROW_TIMEOUT_IMAGE_VO,
     SETTING_ROW_TIMEOUT_SIMPLE,
@@ -98,6 +101,7 @@ _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
 _TAB_YT_CARTOON = "yt_cartoon"
 _TAB_GOOGLE_SIMPLE_MOTION = "google_simple_motion"
+_TAB_FAST_FURIOUS = "fast_furious"
 _TAB_SIMPLE_X4 = "simple_x4"
 _TAB_TEXT_ON_IMG = "text_on_img"
 _TAB_AVATAR = "avatar"
@@ -117,6 +121,9 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # but sharing KIE / Rendi / ZapCap rate limits), each 2 shots with image-gen +
     # Seedance + ZapCap — the heaviest per-row workload, so 30 min.
     _TAB_GOOGLE_SIMPLE_MOTION: 1800.0,
+    # fast-and-furious renders up to 4 Gen-Z variations per row — same heavy
+    # per-row workload as google-simple-motion, so the same 30-min headroom.
+    _TAB_FAST_FURIOUS: 1800.0,
     # yt-cartoon runs cartoon's pipeline but with up to 5 shots (20s bucket),
     # so it gets more headroom than the flat-8s cartoon tab.
     _TAB_YT_CARTOON: 1500.0,    # 25 min
@@ -153,6 +160,7 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_CARTOON: SETTING_ROW_TIMEOUT_CARTOON,
     _TAB_SIMPLE_MOTION: SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
     _TAB_GOOGLE_SIMPLE_MOTION: SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION,
+    _TAB_FAST_FURIOUS: SETTING_ROW_TIMEOUT_FAST_FURIOUS,
     _TAB_YT_CARTOON: SETTING_ROW_TIMEOUT_YT_CARTOON,
     # simple_x4 reuses the image_vo timeout setting — same shape of work.
     _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
@@ -296,6 +304,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_SIMPLE
     if isinstance(row, GoogleSimpleMotionRow):
         return _TAB_GOOGLE_SIMPLE_MOTION
+    if isinstance(row, FastFuriousRow):
+        return _TAB_FAST_FURIOUS
     if isinstance(row, SimpleMotionRow):
         return _TAB_SIMPLE_MOTION
     if isinstance(row, SimpleX4Row):
@@ -411,6 +421,8 @@ async def _dispatch_to_processor(
         return await process_simple_row(row, clients, job_id=job_id)
     if isinstance(row, GoogleSimpleMotionRow):
         return await process_google_simple_motion_row(row, clients, job_id=job_id)
+    if isinstance(row, FastFuriousRow):
+        return await process_fast_furious_row(row, clients, job_id=job_id)
     if isinstance(row, SimpleMotionRow):
         return await process_simple_motion_row(row, clients, job_id=job_id)
     if isinstance(row, SimpleX4Row):

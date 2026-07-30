@@ -352,6 +352,40 @@ class GoogleSimpleMotionRow:
 
 
 @dataclass
+class FastFuriousRow:
+    """fast-and-furious tab input row — N TikTok/Gen-Z variations per row.
+
+    Same columns and N-video / per-slot-aspect layout as
+    :class:`GoogleSimpleMotionRow`, but each of the ``num_videos`` (1-4) videos is
+    its OWN Gen-Z creative variation (its own lively, fast, modern script), not one
+    shared creative rendered at N sizes. Video ``i`` is rendered at
+    ``aspect_ratios[i]`` (Change Size ``i+1``) and written to Ready Video ``i+1``
+    (cols Q-T).
+
+    ``manual_image_1`` / ``manual_image_2`` (cols D/E) are SHARED by every
+    variation as shot 1 / shot 2 (a blank cell generates a realistic scene per
+    variation). ``use this script: <text>`` in Open Comments makes every variation
+    speak that exact operator text verbatim. Plan
+    ``_plans/2026-07-30-fast-and-furious-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_1: str               # col D — shot 1, shared; blank → generate
+    manual_image_2: str               # col E — shot 2, shared; blank → generate
+    num_videos: int                   # col F — how many variations (1-4)
+    voice_over: bool                  # col G
+    zapcap: bool                      # col H
+    aspect_ratios: list[str]          # cols I-L (Change Size 1-4); video i uses [i]
+    script_pattern: str               # col M
+    open_comments: str                # col P — override + scene context
+    cta_enabled: bool = False         # col N — Yes/No pill
+    cta_text: str = ""                # col O — operator text; empty → per-language default
+
+
+@dataclass
 class MotionAdsRow:
     """Motion_Ads tab input row — a silent motion-ad video + ad copy.
 

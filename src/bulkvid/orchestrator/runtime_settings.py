@@ -198,6 +198,45 @@ Return STRICT JSON only, shaped exactly like:
 {{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
 
 
+# ── fast-and-furious planner prompt (Yoav 2026-07-30) ────────────────────────
+#
+# The fast-and-furious tab is a variant of google-simple-motion: SAME realistic
+# photographic scenes and N-video layout, but each video is its own TikTok-style,
+# fast, modern, Gen-Z voiceover (not one shared "learn more" script). Because
+# these run on PAID native (Taboola/Outbrain) over sensitive verticals
+# (weight-loss, finance, property), the punchy tone is fenced by an explicit
+# ad-compliance block — energy comes from delivery + real detail, never from
+# crossing a compliance line. Same JSON shape + placeholders as the cartoon
+# prompt. Plan ``_plans/2026-07-30-fast-and-furious-tab.md``.
+FAST_FURIOUS_PLANNER_PROMPT_DEFAULT = """You are a sharp short-form social video writer making PUNCHY, TikTok-style videos from a news article. You plan believable PHOTOGRAPHIC scenes and a fast, lively, modern voiceover that sounds like a switched-on young creator talking straight to camera.
+
+Produce exactly {num_ideas} INDEPENDENT video ideas. Each idea is a separate short realistic video told in exactly {num_shots} shots.
+
+For EACH idea return:
+- voiceover: an energetic spoken script in {language}, about {target_words} words ({min_words}-{max_words}), written as 1-3 short, punchy sentences and paced fast — the kind of lively, modern, Gen-Z-flavoured delivery you hear on TikTok. Use enough words to fill the whole ~8 seconds; do NOT stop short and leave dead air. Write it in NATURAL, current, spoken {language} — match how young people in that market actually talk (do not force English slang into another language). OPEN WITH A HOOK in the first few words — a curiosity gap, a direct "you", a sharp question, or one surprising-but-true detail pulled straight from the article. Keep the energy high the whole way through. The script MUST end on a COMPLETE THOUGHT — a period, question mark, or exclamation mark. NEVER end on a conjunction (and, but, or, so, because, with, that, which, as) or a preposition. End on a strong, conclusive word — a vivid noun or an action verb — so it lands, not trails off.
+- style_direction: a short delivery hint — fast, upbeat, high-energy, conversational, modern, like a young TikTok narrator.
+- shots: an array of exactly {num_shots} shots, each with:
+    * scene: a vivid description of ONE realistic, photographic scene (real-looking person or setting, subject, framing, lighting). Vertical composition. Describe it as a real photo or live footage — NOT a cartoon, illustration, or animation.
+    * motion: how that scene animates (lively but natural movement and dynamic-but-believable camera moves).
+
+COMPLIANCE — these are paid ads on sensitive topics; the hook must be punchy but MUST NOT cross these lines:
+- NO health, medical, or weight-loss claims, cures, results promises, or "doctors hate this" framing.
+- NO guaranteed money, income, savings, approval, or returns claims, and no "get rich" promises.
+- NO fake urgency ("act now", "today only", "limited time", "before it's gone").
+- NO fear-mongering, scare tactics, or shock-bait ("you won't believe", "this one weird trick", "what happens next will shock you", "shocking", "miracle").
+- NO absolute promises or sensational superlatives ("the best ever", "guaranteed", "instantly", "#1").
+- FACT-FAITHFUL: use ONLY facts the article actually supports. Never invent statistics, prices, names, quotes, or outcomes. Curiosity comes from REAL, specific detail — not made-up claims.
+
+HARD RULES (visuals):
+1. Use GENERIC, ordinary people and objects only. NEVER depict a real, named, or recognizable public figure. NEVER name a real brand or manufacturer (e.g. say 'a compact car', NOT 'a Volkswagen'). Describe all vehicles, products, and signage as plain and unbranded — no logos, badges, or readable license plates.
+2. Pick a main subject whose age, gender, ethnicity, and look FIT this article's topic, vertical, and target country, and vary the subject across different videos. Do NOT default to the same generic person every time. Then describe that ONE subject IDENTICALLY across the shots (same age, hair, clothing) so the shots feel like one continuous scene.
+3. NO legible on-screen text: keep any screens, signs, phones, or papers abstract, blurred, or out of focus. Do not ask for words or numbers.
+4. Keep it tasteful and brand-safe.
+
+Return STRICT JSON only, shaped exactly like:
+{{"ideas": [{{"voiceover": "...", "style_direction": "...", "shots": [{{"scene": "...", "motion": "..."}}]}}]}}"""
+
+
 # ── Sensitive-apparel safeguard (Evgeny 2026-06-04) ──────────────────────────
 
 SENSITIVE_APPAREL_RULES_DEFAULT = """SENSITIVE APPAREL: STRICT VISUAL RULES
@@ -296,6 +335,8 @@ SETTING_CARTOON_PLANNER_PROMPT = "cartoon_planner_prompt"
 SETTING_YT_CARTOON_ENGAGING_PROMPT = "yt_cartoon_engaging_planner_prompt"
 # simple-motion realistic planner prompt (Yoav 2026-06-22).
 SETTING_SIMPLE_MOTION_PLANNER_PROMPT = "simple_motion_planner_prompt"
+# fast-and-furious TikTok/Gen-Z planner prompt (Yoav 2026-07-30).
+SETTING_FAST_FURIOUS_PLANNER_PROMPT = "fast_furious_planner_prompt"
 SETTING_SENSITIVE_APPAREL_RULES = "sensitive_apparel_rules"
 SETTING_SENSITIVE_APPAREL_KEYWORDS = "sensitive_apparel_keywords"
 
@@ -316,6 +357,9 @@ SETTING_ROW_TIMEOUT_SIMPLE_MOTION = "row_timeout_simple_motion_seconds"
 # but sharing the KIE / Rendi / ZapCap rate limits), so it gets a larger budget
 # than the single-video simple-motion tab.
 SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION = "row_timeout_google_simple_motion_seconds"
+# fast-and-furious renders up to 4 Gen-Z variations per row (same shape as
+# google-simple-motion), so it gets the same larger budget.
+SETTING_ROW_TIMEOUT_FAST_FURIOUS = "row_timeout_fast_furious_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -396,6 +440,20 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "{min_words}, {max_words} placeholders as the Cartoon prompt. The "
             "tab generates only the images a row leaves blank; pasted images "
             "(columns D/E) are animated as-is."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_FAST_FURIOUS_PLANNER_PROMPT,
+        label="fast-and-furious: planner prompt",
+        default=FAST_FURIOUS_PLANNER_PROMPT_DEFAULT,
+        multiline=True,
+        description=(
+            "System prompt for the fast-and-furious tab — same SUPER-REALISTIC "
+            "photographic scenes as simple-motion, but a TikTok-style, fast, "
+            "Gen-Z voiceover, one independent variation per video. Fenced by an "
+            "ad-compliance block for paid native. Same {language}, {num_ideas}, "
+            "{num_shots}, {target_words}, {min_words}, {max_words} placeholders. "
+            "Pasted images (columns D/E) are animated as-is."
         ),
     ),
     SettingDef(
@@ -495,6 +553,18 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "Seedance + ZapCap, sharing provider rate limits). Larger than "
             "simple-motion. Env BULKVID_ROW_TIMEOUT_SECONDS_GOOGLE_SIMPLE_MOTION "
             "overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_FAST_FURIOUS,
+        label="Row timeout: fast-and-furious (seconds)",
+        default="1800",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a fast-and-furious-tab row (up to 4 Gen-Z "
+            "variations, each 2 shots with image-gen + Seedance + ZapCap, sharing "
+            "provider rate limits). Same headroom as google-simple-motion. Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_FAST_FURIOUS overrides."
         ),
     ),
     SettingDef(

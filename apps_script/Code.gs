@@ -16,6 +16,7 @@ const TAB_FOUR_IMAGES = 'four_images_vo2';
 const TAB_SIMPLE = 'simple';
 const TAB_SIMPLE_MOTION = 'simple_motion';
 const TAB_GOOGLE_SIMPLE_MOTION = 'google_simple_motion';
+const TAB_FAST_FURIOUS = 'fast_furious';
 const TAB_CARTOON = 'cartoon';
 const TAB_YT_CARTOON = 'yt_cartoon';
 const TAB_SIMPLE_X4 = 'simple_x4';
@@ -79,7 +80,7 @@ const SIZE_DROPDOWN_OPTIONS = [
 // operator sees the active model and its sizes at pick time. Keep
 // SEEDANCE_SIZE_OPTIONS in sync with SEEDANCE_ALLOWED_ASPECT_RATIOS in
 // src/bulkvid/adapters/kie.py.
-const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_GOOGLE_SIMPLE_MOTION, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
+const SEEDANCE_VIDEO_TABS = [TAB_SIMPLE_MOTION, TAB_GOOGLE_SIMPLE_MOTION, TAB_FAST_FURIOUS, TAB_CARTOON, TAB_YT_CARTOON, TAB_MOTION_ADS];
 const ACTIVE_VIDEO_MODEL_LABEL = 'Seedance 1.5 Pro';
 const SEEDANCE_SIZE_OPTIONS = ['9:16', '3:4', '1:1', '4:3', '16:9', '21:9'];
 
@@ -162,6 +163,21 @@ const SIMPLE_MOTION_COLS = {
 // HEADER NAME first (like simple-motion) with these positional values as the
 // fallback. Change Size i sets the aspect of Ready Video i.
 const GOOGLE_SIMPLE_MOTION_COLS = {
+  country: 1, vertical: 2, article: 3,
+  manualImage1: 4, manualImage2: 5,
+  numVideos: 6, voiceOver: 7, zapcap: 8,
+  aspect1: 9, aspect2: 10, aspect3: 11, aspect4: 12,
+  scriptPattern: 13, ctaEnabled: 14, ctaText: 15,
+  openComments: 16,
+  readyVideo1: 17, readyVideo2: 18, readyVideo3: 19, readyVideo4: 20,
+  lastInputCol: 16,
+};
+
+// fast-and-furious tab (2026-07-30): IDENTICAL column layout to
+// google-simple-motion (two Manual Image cols D/E, Number of Videos F, four
+// Change Size cols I-L feeding Ready Video 1-4 Q-T). Each video is its own Gen-Z
+// variation. Read by HEADER NAME first with these positional values as fallback.
+const FAST_FURIOUS_COLS = {
   country: 1, vertical: 2, article: 3,
   manualImage1: 4, manualImage2: 5,
   numVideos: 6, voiceOver: 7, zapcap: 8,
@@ -384,6 +400,13 @@ function _detectTabType(sheet) {
   if (name.indexOf('google-simple-motion') !== -1
       || name.indexOf('google simple motion') !== -1) {
     return TAB_GOOGLE_SIMPLE_MOTION;
+  }
+  // "fast-and-furious" -> N Gen-Z variations per row (2026-07-30). The name has
+  // no "simple"/"cartoon", so order vs those is moot; kept with the other name
+  // detections for clarity.
+  if (name.indexOf('fast-and-furious') !== -1 || name.indexOf('fast and furious') !== -1
+      || name.indexOf('fast_and_furious') !== -1 || name.indexOf('fast-furious') !== -1) {
+    return TAB_FAST_FURIOUS;
   }
   // "simple-motion" -> animate super-realistic images (manual D/E or generated).
   // MUST be checked BEFORE the generic "simple" match below, since the name
@@ -645,6 +668,60 @@ function _readGoogleSimpleMotionRow(sheet, rowNum) {
   // Number of Videos → num_videos (1-4); the four Change Size cells →
   // aspect_ratios[0..3], slot i rendered at Change Size i (blank → 9:16 server-side).
   const cols = GOOGLE_SIMPLE_MOTION_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage1 = _colForHeaders(headerMap, ['Manual Image 1', 'Manual Image'], cols.manualImage1);
+  const cManualImage2 = _colForHeaders(headerMap, ['Manual Image 2'], cols.manualImage2);
+  const cNumVideos    = _colForHeaders(headerMap, ['Number of Videos', 'Number Of Videos', 'Num of Videos'], cols.numVideos);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cAspect1      = _colForHeaders(headerMap, ['Change Size 1', 'Change Size'], cols.aspect1);
+  const cAspect2      = _colForHeaders(headerMap, ['Change Size 2'], cols.aspect2);
+  const cAspect3      = _colForHeaders(headerMap, ['Change Size 3'], cols.aspect3);
+  const cAspect4      = _colForHeaders(headerMap, ['Change Size 4'], cols.aspect4);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  const numVideos = Math.max(1, Math.min(4, parseInt(_cell(values, cNumVideos), 10) || 1));
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_1: _cell(values, cManualImage1),
+    manual_image_2: _cell(values, cManualImage2),
+    num_videos: numVideos,
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratios: [
+      _aspectCell(values, cAspect1),
+      _aspectCell(values, cAspect2),
+      _aspectCell(values, cAspect3),
+      _aspectCell(values, cAspect4),
+    ],
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
+function _readFastFuriousRow(sheet, rowNum) {
+  // fast-and-furious: IDENTICAL column layout to google-simple-motion — two
+  // Manual Image cols (D/E), Number of Videos (F), Voice Over / ZapCap, FOUR
+  // Change Size cols (I-L), Script Pattern, CTA + CTA Text, Open Comments.
+  // Resolved by HEADER NAME first with FAST_FURIOUS_COLS as the positional
+  // fallback. Each video is its own Gen-Z variation; slot i uses Change Size i.
+  const cols = FAST_FURIOUS_COLS;
   const headerMap = _buildHeaderColMap(sheet);
   const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
   const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
@@ -995,6 +1072,15 @@ function _validateGoogleSimpleMotion(r) {
 }
 
 
+function _validateFastFurious(r) {
+  // Only the article is required (it drives the Gen-Z scripts + any generated
+  // scenes). Manual images are optional (blank → generated); Number of Videos /
+  // Change Size default sensibly server-side.
+  if (!r.article_url) return 'article URL missing';
+  return null;
+}
+
+
 function _validateMotionAds(r) {
   // Only the article is required. Manual Image is optional (blank → the backend
   // generates a realistic image; filled → it animates that image as-is). Apple /
@@ -1164,6 +1250,7 @@ function generateAllUnprocessed() {
     : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
     : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
     : tabType === TAB_GOOGLE_SIMPLE_MOTION ? GOOGLE_SIMPLE_MOTION_COLS
+    : tabType === TAB_FAST_FURIOUS ? FAST_FURIOUS_COLS
     : tabType === TAB_CARTOON ? CARTOON_COLS
     : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
     : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -1196,6 +1283,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_CARTOON ? _readCartoonRow
     : tabType === TAB_SIMPLE_MOTION ? _readSimpleMotionRow
     : tabType === TAB_GOOGLE_SIMPLE_MOTION ? _readGoogleSimpleMotionRow
+    : tabType === TAB_FAST_FURIOUS ? _readFastFuriousRow
     : tabType === TAB_YT_CARTOON ? _readYtCartoonRow
     : tabType === TAB_SIMPLE_X4 ? _readSimpleX4Row
     : tabType === TAB_TEXT_ON_IMG ? _readTextOnImgRow
@@ -1208,6 +1296,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_CARTOON ? _validateCartoon
     : tabType === TAB_SIMPLE_MOTION ? _validateSimpleMotion
     : tabType === TAB_GOOGLE_SIMPLE_MOTION ? _validateGoogleSimpleMotion
+    : tabType === TAB_FAST_FURIOUS ? _validateFastFurious
     : tabType === TAB_YT_CARTOON ? _validateYtCartoon
     : tabType === TAB_SIMPLE_X4 ? _validateSimpleX4
     : tabType === TAB_TEXT_ON_IMG ? _validateTextOnImg
@@ -1243,6 +1332,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       : tabType === TAB_SIMPLE_X4 ? SIMPLE_X4_COLS
       : tabType === TAB_SIMPLE_MOTION ? SIMPLE_MOTION_COLS
       : tabType === TAB_GOOGLE_SIMPLE_MOTION ? GOOGLE_SIMPLE_MOTION_COLS
+      : tabType === TAB_FAST_FURIOUS ? FAST_FURIOUS_COLS
       : tabType === TAB_CARTOON ? CARTOON_COLS
       : tabType === TAB_YT_CARTOON ? YT_CARTOON_COLS
       : tabType === TAB_TEXT_ON_IMG ? TEXT_ON_IMG_COLS
@@ -1290,6 +1380,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_SIMPLE) payload.rows_simple = rows;
   else if (tabType === TAB_SIMPLE_MOTION) payload.rows_simple_motion = rows;
   else if (tabType === TAB_GOOGLE_SIMPLE_MOTION) payload.rows_google_simple_motion = rows;
+  else if (tabType === TAB_FAST_FURIOUS) payload.rows_fast_furious = rows;
   else if (tabType === TAB_CARTOON) payload.rows_cartoon = rows;
   else if (tabType === TAB_YT_CARTOON) payload.rows_yt_cartoon = rows;
   else if (tabType === TAB_SIMPLE_X4) payload.rows_simple_x4 = rows;
@@ -1639,7 +1730,7 @@ function showActiveModels() {
     '<h1>Active models &amp; sizes</h1>' +
     '<p class="sub">Which model each tab runs, and the sizes it accepts.</p>' +
     '<div class="card video"><div class="top">' +
-    '<span class="tabs">cartoon · yt-cartoon · simple-motion · Motion_Ads</span>' +
+    '<span class="tabs">cartoon · yt-cartoon · simple-motion · google-simple-motion · fast-and-furious · Motion_Ads</span>' +
     '<span class="model">animated video · <b>' + ACTIVE_VIDEO_MODEL_LABEL + '</b></span>' +
     '</div><div class="chips">' + chips(SEEDANCE_SIZE_OPTIONS) + '</div></div>' +
     '<div class="card image"><div class="top">' +
@@ -2251,7 +2342,8 @@ function _submitJobWithRetry_(payload) {
 function _rowCountForPayload_(payload) {
   return (payload.rows_image_vo || payload.rows_four_images
     || payload.rows_simple || payload.rows_simple_motion
-    || payload.rows_google_simple_motion || payload.rows_cartoon
+    || payload.rows_google_simple_motion || payload.rows_fast_furious
+    || payload.rows_cartoon
     || payload.rows_yt_cartoon || payload.rows_simple_x4 || payload.rows_text_on_img
     || payload.rows_avatar || payload.rows_motion_ads
     || payload.rows_hook_card || payload.rows_image_resize || []).length;

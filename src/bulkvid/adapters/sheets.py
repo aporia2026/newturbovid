@@ -39,6 +39,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_CARTOON,
+    TAB_FAST_FURIOUS,
     TAB_FOUR_IMAGES,
     TAB_GOOGLE_SIMPLE_MOTION,
     TAB_HOOK_CARD,
@@ -313,6 +314,39 @@ GOOGLE_SIMPLE_MOTION_COLS = _GoogleSimpleMotionCols()
 
 
 @dataclass(frozen=True)
+class _FastFuriousCols:
+    """Layout for the ``fast-and-furious`` tab (2026-07-30).
+
+    Identical column layout to ``google-simple-motion`` (two Manual Image columns
+    D/E, Number of Videos F, four Change Size columns I-L feeding Ready Video 1-4
+    Q-T). Only the writer's ``ready_video_start`` (col Q) is consulted here; the
+    read is by header name in Apps Script. Plan
+    ``_plans/2026-07-30-fast-and-furious-tab.md``.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image_1: int = 3   # D
+    manual_image_2: int = 4   # E
+    num_videos: int = 5       # F
+    voice_over: int = 6       # G
+    zapcap: int = 7           # H
+    aspect_1: int = 8         # I  (Change Size 1)
+    aspect_2: int = 9         # J  (Change Size 2)
+    aspect_3: int = 10        # K  (Change Size 3)
+    aspect_4: int = 11        # L  (Change Size 4)
+    script_pattern: int = 12  # M
+    cta_enabled: int = 13     # N
+    cta_text: int = 14        # O
+    open_comments: int = 15   # P
+    ready_video_start: int = 16   # Q = 0-indexed col 16
+
+
+FAST_FURIOUS_COLS = _FastFuriousCols()
+
+
+@dataclass(frozen=True)
 class _YtCartoonCols:
     """Layout for the ``yt-cartoon`` tab (2026-06-17).
 
@@ -429,6 +463,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_SIMPLE: 1,
     TAB_SIMPLE_MOTION: 1,
     TAB_GOOGLE_SIMPLE_MOTION: 1,
+    TAB_FAST_FURIOUS: 1,
     TAB_CARTOON: 1,
     TAB_YT_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
@@ -619,6 +654,8 @@ class SheetsClient:
             col = SIMPLE_MOTION_COLS.ready_video_start
         elif layout == TAB_GOOGLE_SIMPLE_MOTION:
             col = GOOGLE_SIMPLE_MOTION_COLS.ready_video_start
+        elif layout == TAB_FAST_FURIOUS:
+            col = FAST_FURIOUS_COLS.ready_video_start
         elif layout == TAB_CARTOON:
             col = CARTOON_COLS.ready_video_start
         elif layout == TAB_YT_CARTOON:
@@ -1031,6 +1068,8 @@ class SheetsClient:
                 if tab_type == TAB_SIMPLE_MOTION
                 else GOOGLE_SIMPLE_MOTION_COLS.ready_video_start
                 if tab_type == TAB_GOOGLE_SIMPLE_MOTION
+                else FAST_FURIOUS_COLS.ready_video_start
+                if tab_type == TAB_FAST_FURIOUS
                 else CARTOON_COLS.ready_video_start
                 if tab_type == TAB_CARTOON
                 else YT_CARTOON_COLS.ready_video_start

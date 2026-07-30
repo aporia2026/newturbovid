@@ -30,6 +30,7 @@ from bulkvid.models.row import (
     CardChoice,
     CartoonRow,
     AvatarRow,
+    FastFuriousRow,
     FourImagesVO2Row,
     GoogleSimpleMotionRow,
     HookCardRow,
@@ -54,6 +55,7 @@ from bulkvid.orchestrator.queue import (
     KILL_OUTCOME_TIMEOUT,
     TAB_AVATAR,
     TAB_CARTOON,
+    TAB_FAST_FURIOUS,
     TAB_FOUR_IMAGES,
     TAB_HOOK_CARD,
     TAB_IMAGE_RESIZE,
@@ -198,6 +200,32 @@ class GoogleSimpleMotionRowIn(BaseModel):
     article_url: str
     manual_image_1: str = ""     # col D — slot 1 base; blank → generate
     manual_image_2: str = ""     # col E — slot 2 base; blank → generate
+    num_videos: int = 1          # col F — 1..4
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratios: list[str] = Field(default_factory=list)   # cols I-L (Change Size 1-4)
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
+class FastFuriousRowIn(BaseModel):
+    """Wire shape for the ``fast-and-furious`` tab.
+
+    Same shape as ``GoogleSimpleMotionRowIn`` (two Manual Image columns, Number of
+    Videos, four Change Size columns as ``aspect_ratios``, CTA, Open Comments) —
+    the tabs share their input contract; the narration (N independent Gen-Z
+    variations) differs downstream. Coerced defensively server-side so a
+    lazy/garbage cell never 400s the batch. Plan
+    ``_plans/2026-07-30-fast-and-furious-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_1: str = ""     # col D — shot 1, shared across variations
+    manual_image_2: str = ""     # col E — shot 2, shared across variations
     num_videos: int = 1          # col F — 1..4
     voice_over: bool = True
     zapcap: bool = False
@@ -382,6 +410,8 @@ class SubmitJobIn(BaseModel):
     rows_simple_motion: list[SimpleMotionRowIn] | None = None
     # google-simple-motion: N size-variant fixed-script motion ads (plan 2026-07-20).
     rows_google_simple_motion: list[GoogleSimpleMotionRowIn] | None = None
+    # fast-and-furious: N Gen-Z variations per row (plan 2026-07-30).
+    rows_fast_furious: list[FastFuriousRowIn] | None = None
     # yt-cartoon: engaging, variable-length cartoon videos (plan 2026-06-17).
     rows_yt_cartoon: list[YtCartoonRowIn] | None = None
     # Simple x4: per-video card template + CTA picks (plan 2026-06-08).
@@ -595,6 +625,35 @@ def _build_google_simple_motion_row(
     aspects = [(a or "").strip() for a in (r.aspect_ratios or [])][:4]
     aspects += [""] * (4 - len(aspects))
     return GoogleSimpleMotionRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_1=(r.manual_image_1 or "").strip(),
+        manual_image_2=(r.manual_image_2 or "").strip(),
+        num_videos=n,
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratios=aspects,
+        script_pattern=r.script_pattern,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
+        open_comments=r.open_comments,
+    )
+
+
+def _build_fast_furious_row(r: FastFuriousRowIn) -> FastFuriousRow:
+    """Coerce a FastFuriousRowIn into a FastFuriousRow.
+
+    Same server-side hardening as ``_build_google_simple_motion_row``:
+    ``num_videos`` clamped to 1-4; ``aspect_ratios`` padded to length 4 (blank
+    entries flow through as "" so the processor defaults them to 9:16); manual
+    image URLs trimmed and passed through; ``cta_text`` bounded at 80 chars.
+    """
+    n = max(1, min(4, int(r.num_videos or 1)))
+    aspects = [(a or "").strip() for a in (r.aspect_ratios or [])][:4]
+    aspects += [""] * (4 - len(aspects))
+    return FastFuriousRow(
         row_num=r.row_num,
         country=r.country,
         vertical=r.vertical,
@@ -997,6 +1056,12 @@ async def submit_job(
             _build_google_simple_motion_row(r)
             for r in payload.rows_google_simple_motion
         ]
+    elif payload.tab_type == TAB_FAST_FURIOUS:
+        if not payload.rows_fast_furious:
+            raise HTTPException(
+                400, "rows_fast_furious is required for tab_type=fast_furious"
+            )
+        rows = [_build_fast_furious_row(r) for r in payload.rows_fast_furious]
     elif payload.tab_type == TAB_YT_CARTOON:
         if not payload.rows_yt_cartoon:
             raise HTTPException(
