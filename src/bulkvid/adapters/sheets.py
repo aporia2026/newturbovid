@@ -39,6 +39,7 @@ from bulkvid.models.row import (
 from bulkvid.orchestrator.queue import (
     TAB_AVATAR,
     TAB_CARTOON,
+    TAB_FAST_FURIOUS,
     TAB_FOUR_IMAGES,
     TAB_HOOK_CARD,
     TAB_IMAGE_VO,
@@ -270,6 +271,40 @@ SIMPLE_MOTION_COLS = _SimpleMotionCols()
 
 
 @dataclass(frozen=True)
+class _FastFuriousCols:
+    """Layout for the ``fast-and-furious`` tab (2026-07-30).
+
+    Like simple-motion (two Manual Image columns D/E) PLUS a Number of Videos
+    column (F) and FOUR Change Size columns (I-L, one per output video), feeding
+    Ready Video 1-4 (Q-T). A row produces up to 4 videos. Only ``ready_video_start``
+    is used by the write-back (resolved by header name, this positional value is
+    the fallback + the gate that lets the write run). Plan
+    ``_plans/2026-07-30-fast-and-furious-tab.md``.
+    """
+
+    country: int = 0            # A
+    vertical: int = 1           # B
+    article: int = 2            # C
+    manual_image_1: int = 3     # D  (shot 1, shared — blank → generate)
+    manual_image_2: int = 4     # E  (shot 2, shared — blank → generate)
+    num_videos: int = 5         # F  "Number of Videos" (1-4)
+    voice_over: int = 6         # G
+    zapcap: int = 7             # H
+    change_size_1: int = 8      # I  aspect for video 1
+    change_size_2: int = 9      # J  aspect for video 2
+    change_size_3: int = 10     # K  aspect for video 3
+    change_size_4: int = 11     # L  aspect for video 4
+    script_pattern: int = 12    # M
+    cta_enabled: int = 13       # N  (Yes/No dropdown)
+    cta_text: int = 14          # O
+    open_comments: int = 15     # P
+    ready_video_start: int = 16     # Q = 0-indexed col 16 (Ready Video 1..4)
+
+
+FAST_FURIOUS_COLS = _FastFuriousCols()
+
+
+@dataclass(frozen=True)
 class _YtCartoonCols:
     """Layout for the ``yt-cartoon`` tab (2026-06-17).
 
@@ -385,6 +420,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_FOUR_IMAGES: 1,
     TAB_SIMPLE: 1,
     TAB_SIMPLE_MOTION: 1,
+    TAB_FAST_FURIOUS: 1,
     TAB_CARTOON: 1,
     TAB_YT_CARTOON: 1,
     TAB_SIMPLE_X4: 2,
@@ -572,6 +608,8 @@ class SheetsClient:
             col = IMAGE_VO_COLS.ready_video_start
         elif layout == TAB_SIMPLE_MOTION:
             col = SIMPLE_MOTION_COLS.ready_video_start
+        elif layout == TAB_FAST_FURIOUS:
+            col = FAST_FURIOUS_COLS.ready_video_start
         elif layout == TAB_CARTOON:
             col = CARTOON_COLS.ready_video_start
         elif layout == TAB_YT_CARTOON:
@@ -980,6 +1018,8 @@ class SheetsClient:
                 if tab_type in (TAB_IMAGE_VO, TAB_SIMPLE)
                 else SIMPLE_MOTION_COLS.ready_video_start
                 if tab_type == TAB_SIMPLE_MOTION
+                else FAST_FURIOUS_COLS.ready_video_start
+                if tab_type == TAB_FAST_FURIOUS
                 else CARTOON_COLS.ready_video_start
                 if tab_type == TAB_CARTOON
                 else YT_CARTOON_COLS.ready_video_start

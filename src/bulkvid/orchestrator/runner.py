@@ -32,6 +32,7 @@ from bulkvid.models.row import (
     STATUS_ROW_TIMEOUT,
     AvatarRow,
     CartoonRow,
+    FastFuriousRow,
     FourImagesVO2Row,
     HookCardRow,
     ImageVORow,
@@ -49,6 +50,7 @@ from bulkvid.orchestrator.queue import JobQueue, QueuedRow, payload_to_row
 from bulkvid.orchestrator.row_processor_4images import process_4images_vo2_row
 from bulkvid.orchestrator.row_processor_avatar import process_avatar_row
 from bulkvid.orchestrator.row_processor_cartoon import process_cartoon_row
+from bulkvid.orchestrator.row_processor_fast_furious import process_fast_furious_row
 from bulkvid.orchestrator.row_processor_hook_card import process_hook_card_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_motion_ads import process_motion_ads_row
@@ -60,6 +62,7 @@ from bulkvid.orchestrator.row_processor_yt_cartoon import process_yt_cartoon_row
 from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_4IMAGES,
     SETTING_ROW_TIMEOUT_CARTOON,
+    SETTING_ROW_TIMEOUT_FAST_FURIOUS,
     SETTING_ROW_TIMEOUT_IMAGE_VO,
     SETTING_ROW_TIMEOUT_SIMPLE,
     SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
@@ -86,6 +89,7 @@ _log = get_logger("runner")
 
 _TAB_SIMPLE = "simple"
 _TAB_SIMPLE_MOTION = "simple_motion"
+_TAB_FAST_FURIOUS = "fast_furious"
 _TAB_IMAGE_VO = "image_vo"
 _TAB_4IMAGES = "4images"
 _TAB_CARTOON = "cartoon"
@@ -104,6 +108,11 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # simple-motion runs cartoon's pipeline with ONE idea (1 video, ≤2 generated
     # images and/or manual-image re-uploads). Same 20-min ceiling is ample.
     _TAB_SIMPLE_MOTION: 1200.0,
+    # fast-and-furious produces up to 4 realistic videos per row (each = its own
+    # image-gen + 2 Seedance clips + TTS/caption), which queue on the shared KIE /
+    # Rendi keys — give it the largest headroom so key contention doesn't time out
+    # a row with some variations already rendered.
+    _TAB_FAST_FURIOUS: 2400.0,   # 40 min
     # yt-cartoon runs cartoon's pipeline but with up to 5 shots (20s bucket),
     # so it gets more headroom than the flat-8s cartoon tab.
     _TAB_YT_CARTOON: 1500.0,    # 25 min
@@ -136,6 +145,7 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_4IMAGES: SETTING_ROW_TIMEOUT_4IMAGES,
     _TAB_CARTOON: SETTING_ROW_TIMEOUT_CARTOON,
     _TAB_SIMPLE_MOTION: SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
+    _TAB_FAST_FURIOUS: SETTING_ROW_TIMEOUT_FAST_FURIOUS,
     _TAB_YT_CARTOON: SETTING_ROW_TIMEOUT_YT_CARTOON,
     # simple_x4 reuses the image_vo timeout setting — same shape of work.
     _TAB_SIMPLE_X4: SETTING_ROW_TIMEOUT_IMAGE_VO,
@@ -277,6 +287,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_SIMPLE
     if isinstance(row, SimpleMotionRow):
         return _TAB_SIMPLE_MOTION
+    if isinstance(row, FastFuriousRow):
+        return _TAB_FAST_FURIOUS
     if isinstance(row, SimpleX4Row):
         return _TAB_SIMPLE_X4
     if isinstance(row, TextOnImgRow):
@@ -388,6 +400,8 @@ async def _dispatch_to_processor(
         return await process_simple_row(row, clients, job_id=job_id)
     if isinstance(row, SimpleMotionRow):
         return await process_simple_motion_row(row, clients, job_id=job_id)
+    if isinstance(row, FastFuriousRow):
+        return await process_fast_furious_row(row, clients, job_id=job_id)
     if isinstance(row, SimpleX4Row):
         return await process_simple_x4_row(row, clients, job_id=job_id)
     if isinstance(row, TextOnImgRow):
