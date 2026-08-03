@@ -1089,3 +1089,209 @@ async def test_watchdog_counter_resets_on_successful_claim(
 
     assert runner._consecutive_claim_failures == 0
     assert exits == []    # never reached the (huge) threshold
+
+
+# ── Stale-read tripwire (Plan 2026-08-03) ───────────────────────────────────
+#
+# A long-lived libsql remote connection can serve a stale read — pending=0 for a
+# non-empty queue — with NO error, invisible to every error/hang-based
+# self-healer, so a job sits queued until a manual restart. On sustained idle the
+# runner recycles the connection and re-counts; a post-recycle pending>0 is a
+# caught stale read. These tests drive ``_maybe_refresh_stale_connection``
+# directly (like the watchdog tests) with a spied queue.
+
+
+def _stale_read_runner(queue: JobQueue) -> BatchRunner:
+    return BatchRunner(queue, _make_dummy_clients(), max_concurrent=2)
+
+
+async def test_stale_read_tripwire_detects_and_reconnects(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sustained idle + a fresh-connection count that reveals pending rows ⇒
+    reconnect fires once and ``worker_stale_read_detected`` is logged."""
+    import time
+    from unittest.mock import MagicMock
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 0.5)
+
+    reconnects: dict[str, object] = {"n": 0, "reasons": []}
+
+    async def _spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] = int(reconnects["n"]) + 1
+        reconnects["reasons"].append(reason)    # type: ignore[attr-defined]
+
+    async def _fresh_count() -> tuple[int, int]:
+        return (5, 0)    # the fresh connection sees rows the stale one hid
+
+    monkeypatch.setattr(queue, "reconnect", _spy_reconnect)
+    monkeypatch.setattr(queue, "count_active_queue", _fresh_count)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic() - 1000.0    # long idle
+
+    await runner._maybe_refresh_stale_connection()
+
+    assert reconnects["n"] == 1
+    assert reconnects["reasons"] == ["stale_read_tripwire"]
+    detected = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "worker_stale_read_detected"
+    ]
+    assert detected, "expected a worker_stale_read_detected warning"
+    assert detected[0].kwargs["pending"] == 5
+    # The idle clock was reset so the next poll doesn't immediately re-recycle.
+    assert runner._last_stale_read_refresh > time.monotonic() - 1.0
+
+
+async def test_stale_read_tripwire_not_due_skips(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent refresh (clock not yet past the threshold) ⇒ no reconnect."""
+    import time
+
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 60.0)
+
+    reconnects = {"n": 0}
+
+    async def _spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+
+    monkeypatch.setattr(queue, "reconnect", _spy_reconnect)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic()    # just refreshed
+
+    await runner._maybe_refresh_stale_connection()
+
+    assert reconnects["n"] == 0
+
+
+async def test_stale_read_tripwire_skips_when_in_flight(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even past the threshold, a busy worker (rows in flight) must NOT recycle —
+    it is provably reading fresh, and recycling under a pipeline is needless
+    risk."""
+    import time
+
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 0.5)
+
+    reconnects = {"n": 0}
+
+    async def _spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+
+    monkeypatch.setattr(queue, "reconnect", _spy_reconnect)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic() - 1000.0
+
+    async def _block() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_block())
+    runner._in_flight[task] = runner_mod._RowMeta(
+        start_monotonic=time.monotonic(),
+        queued_id=1, job_id="j", row_num=1, tab="image_vo",
+    )
+    try:
+        await runner._maybe_refresh_stale_connection()
+        assert reconnects["n"] == 0
+    finally:
+        task.cancel()
+        try:
+            await task
+        except BaseException:    # noqa: BLE001 — best-effort cleanup
+            pass
+
+
+async def test_stale_read_tripwire_clean_refresh_no_detection(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routine recycle whose fresh count is still empty recycles the
+    connection but logs NO stale-read detection (nothing was hidden)."""
+    import time
+    from unittest.mock import MagicMock
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 0.5)
+
+    reconnects = {"n": 0}
+
+    async def _spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+
+    async def _empty_count() -> tuple[int, int]:
+        return (0, 0)
+
+    monkeypatch.setattr(queue, "reconnect", _spy_reconnect)
+    monkeypatch.setattr(queue, "count_active_queue", _empty_count)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic() - 1000.0
+
+    await runner._maybe_refresh_stale_connection()
+
+    assert reconnects["n"] == 1    # still recycled (we can't know without a fresh read)
+    detected = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "worker_stale_read_detected"
+    ]
+    assert not detected, "must not claim a stale read when the queue is truly empty"
+
+
+async def test_stale_read_tripwire_disabled(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_STALE_READ_REFRESH_SECONDS <= 0`` disables the tripwire entirely."""
+    import time
+
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 0.0)
+
+    reconnects = {"n": 0}
+
+    async def _spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] += 1
+
+    monkeypatch.setattr(queue, "reconnect", _spy_reconnect)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic() - 1000.0
+
+    await runner._maybe_refresh_stale_connection()
+
+    assert reconnects["n"] == 0
+
+
+async def test_stale_read_tripwire_survives_reconnect_failure(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconnect that raises (Turso unreachable) is logged and swallowed — the
+    tripwire must never sink the run loop."""
+    import time
+    from unittest.mock import MagicMock
+
+    fake_log = MagicMock()
+    monkeypatch.setattr(runner_mod, "_log", fake_log)
+    monkeypatch.setattr(runner_mod, "_STALE_READ_REFRESH_SECONDS", 0.5)
+
+    async def _boom_reconnect(*, reason: str) -> None:
+        raise RuntimeError("turso unreachable")
+
+    monkeypatch.setattr(queue, "reconnect", _boom_reconnect)
+
+    runner = _stale_read_runner(queue)
+    runner._last_stale_read_refresh = time.monotonic() - 1000.0
+
+    # Must not raise.
+    await runner._maybe_refresh_stale_connection()
+
+    failed = [
+        c for c in fake_log.warning.call_args_list
+        if c.args and c.args[0] == "worker_stale_read_refresh_failed"
+    ]
+    assert failed, "expected a worker_stale_read_refresh_failed warning"

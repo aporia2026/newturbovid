@@ -314,3 +314,42 @@ def test_record_result_reconnects_after_stream_eviction(
     rows = asyncio.run(queue.list_rows(claimed.job_id))
     assert len(rows) == 1
     assert rows[0]["status"] == "done"
+
+
+# ── Stale-read self-heal: public reconnect() ─────────────────────────────────
+
+
+def test_reconnect_swaps_connection_and_stays_usable(
+    queue: JobQueue, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``queue.reconnect()`` recycles the underlying connection via
+    ``_reconnect_sync`` and the queue keeps working afterward.
+
+    This is the primitive behind the worker's stale-read tripwire: a long-lived
+    libsql remote connection can serve a stale read (0 pending rows for a
+    non-empty queue) with no error, and recycling the connection is the only
+    client-exposed way to guarantee the next read is fresh (Context7:
+    remote mode has no ``sync()``). Plan
+    ``_plans/2026-08-03-worker-stale-read-selfheal.md``.
+    """
+    reconnects: dict[str, object] = {"n": 0, "reasons": []}
+    real_reconnect = queue._reconnect_sync
+
+    def spy_reconnect(*, reason: str) -> None:
+        reconnects["n"] = int(reconnects["n"]) + 1
+        reconnects["reasons"].append(reason)    # type: ignore[attr-defined]
+        real_reconnect(reason=reason)
+
+    monkeypatch.setattr(queue, "_reconnect_sync", spy_reconnect)
+
+    old_conn = queue._conn
+    asyncio.run(queue.reconnect(reason="stale_read_tripwire"))
+
+    assert reconnects["n"] == 1
+    assert reconnects["reasons"] == ["stale_read_tripwire"]
+    assert queue._conn is not old_conn          # a genuinely fresh handle
+
+    # The recycled connection is fully functional: enqueue + read back.
+    jid = asyncio.run(_enqueue(queue, [_row(2)], "after-reconnect"))
+    rows = asyncio.run(queue.list_rows(jid))
+    assert [r["row_num"] for r in rows] == [2]
