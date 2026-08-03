@@ -246,6 +246,31 @@ _WATCHDOG_HARD_MAX_CONSECUTIVE_CLAIM_FAILURES = int(
 )
 
 
+# ── Stale-read tripwire (Plan 2026-08-03) ───────────────────────────────────
+#
+# A long-lived libsql *remote* connection can keep serving a stale read
+# snapshot — returning ``pending=0`` for a queue that actually has rows — with
+# NO error. That defeats every existing self-healer: ``_run_db`` reconnects only
+# on an exception, the DB-pool wedge watchdog only on a hung thread
+# (``db_wedged`` stays 0), and the liveness watchdog only on consecutive claim
+# *failures* (a stale read "succeeds" with ``None``). So the worker looks
+# perfectly healthy — idle heartbeats, live DB — while a job sits ``queued``
+# forever, and only a manual HF restart (a fresh connection) clears it. This was
+# the 2026-08-02 incident: web saw "109 queued", the worker saw ``pending=0``.
+#
+# The cure is the only one the client allows (Context7: remote mode has no
+# ``sync()`` / fresh-read primitive): after a stretch of sustained idle, recycle
+# the connection and re-count. A post-recycle ``pending > 0`` is a caught stale
+# read — logged loudly so the wedge is finally observable — and the next claim
+# on the fresh connection drains the backlog. Recycle is cheap (one HTTPS
+# handshake) and idle-only, so no in-flight work is ever at risk. Default 60s
+# matches the sidebar's "not claiming for 1m" banner; ``<= 0`` disables it.
+# Plan ``_plans/2026-08-03-worker-stale-read-selfheal.md``.
+_STALE_READ_REFRESH_SECONDS = float(
+    os.environ.get("BULKVID_WORKER_STALE_READ_REFRESH_SECONDS") or 60.0
+)
+
+
 # Heartbeat cadence: number of consecutive empty polls before the runner
 # emits a heartbeat. With the default ``poll_idle_seconds=1.0`` this is
 # one heartbeat every ~30s — frequent enough to spot a stalled runner,
@@ -498,6 +523,11 @@ class BatchRunner:
         # process instead of once per row. Plan
         # ``_plans/2026-07-20-per-sheet-kie-key-routing.md``.
         self._routed_sheets_logged: set[str] = set()
+        # Monotonic clock for the stale-read tripwire: recycle the DB connection
+        # after this long in *sustained* idle (reset on any real work), so a
+        # silently-stale libsql read heals itself instead of waiting for a
+        # manual restart. Plan ``_plans/2026-08-03-worker-stale-read-selfheal.md``.
+        self._last_stale_read_refresh: float = time.monotonic()
 
     def request_shutdown(self) -> None:
         _log.info("runner_shutdown_requested")
@@ -511,6 +541,7 @@ class BatchRunner:
             max_concurrent=self._sem._value,           # type: ignore[attr-defined]
             poll_idle_seconds=self._poll_idle,
             recovered_orphans=recovered,
+            stale_read_refresh_seconds=_STALE_READ_REFRESH_SECONDS,
         )
         # Start the pending-records drainer alongside the main loop. It
         # runs until shutdown is set AND the queue is empty (with a
@@ -583,6 +614,11 @@ class BatchRunner:
                                 error_type=type(e).__name__,
                             )
                         _polls_since_heartbeat = 0
+                    # Stale-read tripwire: after sustained idle, recycle the DB
+                    # connection so a silently-stale libsql read (queue looks
+                    # empty but isn't) heals itself. Self-contained + swallows
+                    # its own errors, so it can never sink the loop.
+                    await self._maybe_refresh_stale_connection()
                     # Empty queue. Wait briefly, or exit if shutdown fired.
                     try:
                         await asyncio.wait_for(
@@ -593,6 +629,9 @@ class BatchRunner:
                     continue
                 _polls_since_heartbeat = 0    # reset on real work — busy runner
                 # emits its heartbeat via the stuck-row check on idle ticks anyway.
+                # Real work also restarts the stale-read idle clock: a worker
+                # that just claimed a row is provably reading fresh.
+                self._last_stale_read_refresh = time.monotonic()
 
                 await self._sem.acquire()       # block if at max_concurrent
                 meta = self._build_row_meta(queued)
@@ -714,6 +753,70 @@ class BatchRunner:
             ),
         )
         os._exit(_WATCHDOG_EXIT_CODE)
+
+    async def _maybe_refresh_stale_connection(self) -> None:
+        """Idle-path cure for a stale-read wedge: recycle the DB connection and
+        re-count so a silently-stale worker heals itself instead of waiting for
+        a manual restart.
+
+        A libsql *remote* connection can keep returning ``pending=0`` for a
+        queue that actually has rows, with no error — invisible to every
+        error/hang-based self-healer (see ``JobQueue.reconnect``). We defeat it
+        the only way the client allows: force a fresh connection, then re-count.
+        A post-recycle ``pending > 0`` means we just caught a stale read; the
+        next claim (on the fresh connection) drains it.
+
+        Gated to fire only during **sustained true idle** — nothing in flight (a
+        busy worker is provably reading fresh via its ``record_result`` writes)
+        and at most once per ``_STALE_READ_REFRESH_SECONDS``. Disabled when that
+        value is ``<= 0``. Errors are swallowed (logged) so the tripwire can
+        never sink the run loop. Plan
+        ``_plans/2026-08-03-worker-stale-read-selfheal.md``."""
+        if _STALE_READ_REFRESH_SECONDS <= 0:
+            return
+        # A busy worker is demonstrably reading fresh (its record_result writes
+        # keep the stream live), and recycling under an in-flight pipeline is
+        # needless risk — only act when the worker believes it is fully idle,
+        # which is exactly the wedge's signature.
+        if self.in_flight_count != 0:
+            return
+        now = time.monotonic()
+        idle_for = now - self._last_stale_read_refresh
+        if idle_for < _STALE_READ_REFRESH_SECONDS:
+            return
+        # Reset the clock up front so a persistently-failing recycle can't hammer
+        # the DB every poll — it retries once per interval, not once per second.
+        self._last_stale_read_refresh = now
+        try:
+            await self._queue.reconnect(reason="stale_read_tripwire")
+            pending, processing = await self._queue.count_active_queue()
+        except Exception as e:    # noqa: BLE001 — tripwire must never kill the loop
+            _log.warning(
+                "worker_stale_read_refresh_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
+            return
+        if pending > 0:
+            # The smoking gun: a fresh connection sees rows the old one hid. This
+            # is the line that finally makes the wedge visible in prod (and
+            # proves the fix caught it). The next claim drains the backlog.
+            _log.warning(
+                "worker_stale_read_detected",
+                pending=pending,
+                processing=processing,
+                idle_seconds=round(idle_for, 1),
+                threshold_s=_STALE_READ_REFRESH_SECONDS,
+                note=(
+                    "recycled a stale libsql connection that was hiding queued "
+                    "rows; the next claim will drain them"
+                ),
+            )
+        else:
+            _log.debug(
+                "worker_idle_connection_refreshed",
+                idle_seconds=round(idle_for, 1),
+            )
 
     async def _emit_heartbeat(self, *, idle: bool) -> None:
         """Log a heartbeat. Always enumerates stuck in-flight rows.

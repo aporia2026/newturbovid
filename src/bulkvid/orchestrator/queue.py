@@ -1512,6 +1512,36 @@ class JobQueue:
             _log.warning("orphaned_rows_recovered", count=n)
         return n
 
+    async def reconnect(self, *, reason: str) -> None:
+        """Force a fresh DB connection off the hot path — the worker's cure for
+        a stale-read wedge.
+
+        A long-lived libsql *remote* connection has been observed serving a
+        stale read snapshot: it returns 0 pending rows for a queue that actually
+        has work, with NO error (see the ``db.py`` history note at
+        ``connect`` L501-L507). That makes the wedge invisible to ``_run_db``
+        (which reconnects only on an exception), the DB-pool wedge watchdog
+        (only a hung thread trips it), and the runner's liveness watchdog (a
+        stale read "succeeds" with ``None``), so the job sits ``queued`` until a
+        manual HF restart. Verified via Context7 (``/tursodatabase/libsql-python``):
+        remote mode exposes no ``sync()`` / fresh-read primitive and
+        ``interrupt()`` is unimplemented, so recycling the connection is the
+        only client-exposed way to guarantee the next read sees the latest
+        committed state.
+
+        Takes ``self._lock`` (exactly like ``_run_db``) so a recycle can never
+        race a concurrent op on the shared connection, and time-boxes the
+        reconnect on the dedicated DB pool. Raises on failure (Turso
+        unreachable) — the caller logs and carries on; ``_reconnect_sync``
+        swaps ``self._conn`` only AFTER a successful open, so a failed reconnect
+        leaves the existing connection intact. Plan
+        ``_plans/2026-08-03-worker-stale-read-selfheal.md``."""
+        async with self._lock:
+            await asyncio.wait_for(
+                _db.run_db_call(self._reconnect_sync, reason=reason),
+                timeout=_DB_CALL_TIMEOUT_SECONDS,
+            )
+
 
 def payload_to_row(
     payload: dict[str, Any],
