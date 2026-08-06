@@ -312,6 +312,40 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
     return SimpleX4Row(cards=cards, **data)
 
 
+def count_active_queue(conn: Any) -> tuple[int, int]:
+    """``(pending, processing)`` row counts for still-active jobs, on ANY
+    connection.
+
+    The single source of truth for the active-queue depth query. Two callers:
+
+      * ``JobQueue._count_active_queue_sync`` — the runner heartbeat, on the
+        worker's long-lived connection.
+      * the stuck-queue restart watchdog — on its OWN fresh short-lived
+        connection, so it reads ground truth independent of a possibly-stale
+        worker connection (``stuck_queue_watchdog.py``).
+
+    Kept connection-agnostic (takes ``conn``, touches no ``self``) precisely so
+    the watchdog can reuse it without constructing a ``JobQueue`` (which would
+    open a second long-lived connection — the very thing the watchdog avoids).
+    Cheap: two COUNTs on the indexed status column. Index access (``[0]``) works
+    for both ``sqlite3.Row`` and the libsql ``_DictRow`` shim."""
+    pending_cur = conn.execute(
+        "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+        "WHERE rq.status = ? AND j.status IN (?, ?)",
+        (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
+    )
+    processing_cur = conn.execute(
+        "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
+        "WHERE rq.status = ? AND j.status IN (?, ?)",
+        (ROW_PROCESSING, JOB_QUEUED, JOB_RUNNING),
+    )
+    p = pending_cur.fetchone()
+    q = processing_cur.fetchone()
+    pending = int(p[0]) if p is not None else 0
+    processing = int(q[0]) if q is not None else 0
+    return pending, processing
+
+
 class JobQueue:
     """SQLite job queue. Synchronous methods; async wrappers via ``asyncio.to_thread``."""
 
@@ -1189,26 +1223,13 @@ class JobQueue:
     def _count_active_queue_sync(self) -> tuple[int, int]:
         """``(pending, processing)`` rows whose parent job is still active.
 
-        Cheap: two COUNTs on the indexed status column. Used by the runner
-        heartbeat so a "rows stranded in PENDING" wedge is distinguishable from
-        a genuinely empty queue — both otherwise log identically as
-        ``idle=True in_flight=0``. Plan
-        ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2."""
-        pending_cur = self._conn.execute(
-            "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
-            "WHERE rq.status = ? AND j.status IN (?, ?)",
-            (ROW_PENDING, JOB_QUEUED, JOB_RUNNING),
-        )
-        processing_cur = self._conn.execute(
-            "SELECT COUNT(*) FROM row_queue rq JOIN jobs j ON j.job_id = rq.job_id "
-            "WHERE rq.status = ? AND j.status IN (?, ?)",
-            (ROW_PROCESSING, JOB_QUEUED, JOB_RUNNING),
-        )
-        p = pending_cur.fetchone()
-        q = processing_cur.fetchone()
-        pending = int(p[0]) if p is not None else 0
-        processing = int(q[0]) if q is not None else 0
-        return pending, processing
+        Thin caller of the module-level ``count_active_queue`` — the SSOT for the
+        active-queue depth query, shared with the stuck-queue watchdog (which runs
+        the same query on its OWN fresh connection). Used by the runner heartbeat
+        so a "rows stranded in PENDING" wedge is distinguishable from a genuinely
+        empty queue — both otherwise log identically as ``idle=True in_flight=0``.
+        Plan ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2."""
+        return count_active_queue(self._conn)
 
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""

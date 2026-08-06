@@ -42,6 +42,7 @@ from bulkvid.orchestrator.queue import (
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
     JobQueue,
+    count_active_queue,
     payload_to_row,
 )
 
@@ -152,6 +153,26 @@ async def test_count_active_queue_tracks_pending_and_processing(
 
     await queue.claim_next_row()    # one row -> PROCESSING, job -> RUNNING
     assert await queue.count_active_queue() == (2, 1)
+
+
+async def test_module_count_active_queue_matches_method(queue: JobQueue) -> None:
+    """SSOT: the module-level ``count_active_queue(conn)`` — the query the
+    stuck-queue watchdog runs on its OWN fresh connection — returns exactly what
+    ``JobQueue.count_active_queue()`` returns on the same data. The refactor that
+    extracted the query must stay behavior-preserving. Plan
+    ``_plans/2026-08-06-worker-stuck-queue-restart-watchdog.md``."""
+    await queue.enqueue(
+        user_email="yoav@aporia.com",
+        sheet_id="sheet-A",
+        worksheet="Image-VO",
+        tab_type=TAB_IMAGE_VO,
+        rows=[_img_row(2), _img_row(3), _img_row(4)],
+    )
+    await queue.claim_next_row()    # (2 pending, 1 processing)
+    # Same connection the queue uses — proves the extracted function is the SSOT
+    # the method delegates to, not a second implementation that could drift.
+    assert count_active_queue(queue._conn) == await queue.count_active_queue()
+    assert count_active_queue(queue._conn) == (2, 1)
 
 
 # ── claim_next_row + job transition ─────────────────────────────────────────

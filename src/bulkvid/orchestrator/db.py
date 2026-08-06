@@ -449,6 +449,7 @@ def connect(
     sync_interval_seconds: float = 1.0,
     check_same_thread: bool = False,
     timeout: float = 30.0,
+    quiet: bool = False,
 ) -> Any:
     """Open a DB-API 2.0 connection.
 
@@ -461,12 +462,17 @@ def connect(
 
     The local replica file lives at ``db_path`` either way, so test code
     that inspects the file (e.g. checking row counts) keeps working.
+
+    ``quiet`` suppresses the one-line ``db_backend`` INFO log — for callers that
+    open a fresh connection on a tight cadence (the stuck-queue watchdog probes
+    every ~30s) and would otherwise flood the very logs used to diagnose a wedge.
     """
     path_str = str(db_path)
     Path(path_str).parent.mkdir(parents=True, exist_ok=True)
 
     if not sync_url:
-        _log.info("db_backend", backend=BACKEND_SQLITE, path=path_str)
+        if not quiet:
+            _log.info("db_backend", backend=BACKEND_SQLITE, path=path_str)
         return sqlite3.connect(
             path_str,
             check_same_thread=check_same_thread,
@@ -487,12 +493,13 @@ def connect(
     # sqlite3 mode by leaving BULKVID_DB_URL empty.
     import libsql  # type: ignore[import-not-found]
 
-    _log.info(
-        "db_backend",
-        backend=BACKEND_LIBSQL_REMOTE,
-        path=path_str,
-        sync_url=_redact_host(sync_url),
-    )
+    if not quiet:
+        _log.info(
+            "db_backend",
+            backend=BACKEND_LIBSQL_REMOTE,
+            path=path_str,
+            sync_url=_redact_host(sync_url),
+        )
     # Remote mode: every statement is an HTTPS round-trip to Turso. No
     # local file is touched — ``path_str`` is accepted for API symmetry
     # with the sqlite3 path (callers like JobQueue compute the path for

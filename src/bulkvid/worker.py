@@ -46,6 +46,7 @@ from bulkvid.orchestrator.sheet_writer import (
     FlushCallback,
     PendingWrite,
 )
+from bulkvid.orchestrator.stuck_queue_watchdog import start_stuck_queue_watchdog
 
 _log = get_logger("worker")
 
@@ -195,6 +196,19 @@ async def run() -> None:
     # gap the claim-failure watchdog can't — a wedge while rows are in flight.
     # Plan ``_plans/2026-07-07-db-wedge-permanent-fix.md`` §Phase 1.
     start_db_wedge_watchdog("worker")
+
+    # Automate the manual "restart the Space": an independent daemon thread that
+    # proves — via its OWN fresh connection — that real rows are queued while
+    # nothing is in flight, and restarts a wedged worker when the stale-read
+    # tripwire's in-process reconnect fails to drain it. Covers the outcome
+    # (queue not draining) that the four cause-specific self-healers all miss.
+    # Plan ``_plans/2026-08-06-worker-stuck-queue-restart-watchdog.md``.
+    start_stuck_queue_watchdog(
+        db_path=db_path,
+        sync_url=settings.BULKVID_DB_URL,
+        auth_token=settings.BULKVID_DB_AUTH_TOKEN,
+        sync_interval_seconds=settings.BULKVID_DB_SYNC_INTERVAL_SECONDS,
+    )
 
     # ── Wire shutdown signals ───────────────────────────────────────────
     def _handle_signal(*_: Any) -> None:
