@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from bulkvid.orchestrator import db as _db
+from bulkvid.orchestrator import hrana as _hrana
 
 
 def test_connect_with_empty_sync_url_returns_sqlite_connection(tmp_path: Path) -> None:
@@ -403,3 +404,174 @@ def test_libsqlconn_tx_pattern_with_rollback_drops_rollback_on_the_floor() -> No
     assert len(fake.executed) == 1
     assert fake.rolled_back == 0
     assert fake.committed == 0
+
+
+# ── Hrana HTTP transport selection (Plan 2026-08-12) ────────────────────────
+
+
+class _FakeHranaClient:
+    """Stands in for a real ``HranaClient``. Records statements so the shim's
+    BEGIN/COMMIT translation can be asserted by what it did NOT send."""
+
+    def __init__(self, *, fail_probe: bool = False) -> None:
+        self.statements: list[tuple[str, object]] = []
+        self.scripts: list[str] = []
+        self.closed = False
+        self._fail_probe = fail_probe
+        self.result = _hrana.StatementResult(
+            cols=(), rows=[], affected_row_count=0, last_insert_rowid=None
+        )
+
+    def execute(self, sql: str, params: object = ()) -> _hrana.StatementResult:
+        if self._fail_probe:
+            raise _hrana.HranaTransportError("probe boom")
+        self.statements.append((sql, params))
+        return self.result
+
+    def execute_script(self, sql: str) -> None:
+        self.scripts.append(sql)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _rowset(cols, rows, affected=0, rowid=None) -> _hrana.StatementResult:
+    return _hrana.StatementResult(
+        cols=tuple(cols), rows=[tuple(r) for r in rows],
+        affected_row_count=affected, last_insert_rowid=rowid,
+    )
+
+
+def test_db_transport_defaults_to_libsql(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BULKVID_DB_TRANSPORT", raising=False)
+    assert _db.db_transport() == _db.TRANSPORT_LIBSQL
+
+
+def test_db_transport_reads_hrana_and_ignores_garbage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", " HRANA ")
+    assert _db.db_transport() == _db.TRANSPORT_HRANA
+    # An unrecognised value must never fail a deploy; it falls back.
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "postgres")
+    assert _db.db_transport() == _db.TRANSPORT_LIBSQL
+
+
+def test_hrana_conn_returns_dict_rows(tmp_path: Path) -> None:
+    """Rows must be indistinguishable from the libsql path: name AND index
+    access, because queue.py uses both."""
+    client = _FakeHranaClient()
+    client.result = _rowset(("job_id", "status"), [("job-1", "queued")])
+    conn = _db._HranaConn(client)
+
+    row = conn.execute("SELECT job_id, status FROM jobs").fetchone()
+    assert row is not None
+    assert row["job_id"] == "job-1"      # by name
+    assert row[1] == "queued"            # by index
+    assert row.keys() == ["job_id", "status"]
+
+
+def test_hrana_conn_translates_transaction_statements_to_noops() -> None:
+    """Autocommit means BEGIN/COMMIT/ROLLBACK must never reach the wire. On a
+    stateless transport a forwarded BEGIN would be actively misleading: it
+    cannot hold anything open across requests."""
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+
+    for sql in ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK", "begin", "End"):
+        cur = conn.execute(sql)
+        assert cur.fetchone() is None
+    assert client.statements == []       # nothing was sent
+
+    conn.execute("SELECT 1")
+    assert [s for s, _ in client.statements] == ["SELECT 1"]
+
+
+def test_hrana_conn_exposes_rowcount_and_lastrowid() -> None:
+    client = _FakeHranaClient()
+    client.result = _rowset((), [], affected=4, rowid=99)
+    conn = _db._HranaConn(client)
+    cur = conn.execute("UPDATE row_queue SET status = ?", ("pending",))
+    assert cur.rowcount == 4
+    assert cur.lastrowid == 99
+
+
+def test_hrana_cursor_fetch_semantics() -> None:
+    client = _FakeHranaClient()
+    client.result = _rowset(("n",), [(1,), (2,), (3,)])
+    conn = _db._HranaConn(client)
+
+    cur = conn.execute("SELECT n FROM t")
+    assert cur.fetchone()["n"] == 1
+    assert [r["n"] for r in cur.fetchmany(1)] == [2]
+    assert [r["n"] for r in cur.fetchall()] == [3]
+    assert cur.fetchone() is None        # exhausted
+    # Iteration walks a fresh cursor from the start.
+    assert [r["n"] for r in conn.execute("SELECT n FROM t")] == [1, 2, 3]
+
+
+def test_hrana_conn_executescript_uses_sequence() -> None:
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    conn.executescript("CREATE TABLE a(x); CREATE TABLE b(y);")
+    assert client.scripts == ["CREATE TABLE a(x); CREATE TABLE b(y);"]
+
+
+def test_hrana_conn_executemany_unrolls_to_one_call_per_row() -> None:
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    conn.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+    assert [p for _, p in client.statements] == [(1,), (2,)]
+
+
+def test_hrana_conn_accepts_row_factory_assignment() -> None:
+    """queue.py assigns ``conn.row_factory = sqlite3.Row`` unconditionally; the
+    shim must tolerate it rather than raise."""
+    conn = _db._HranaConn(_FakeHranaClient())
+    conn.row_factory = sqlite3.Row
+    assert conn.execute("SELECT 1") is not None
+
+
+def test_hrana_conn_close_closes_the_client() -> None:
+    client = _FakeHranaClient()
+    _db._HranaConn(client).close()
+    assert client.closed is True
+
+
+def test_connect_uses_hrana_when_selected_and_probe_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _FakeHranaClient()
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    monkeypatch.setattr(_hrana, "HranaClient", lambda *a, **k: client)
+    conn = _db.connect(
+        tmp_path / "x.db", sync_url="libsql://x.turso.io", auth_token="tok"
+    )
+    assert isinstance(conn, _db._HranaConn)
+    # The probe is a real round-trip, so a broken transport is caught at open.
+    assert client.statements == [("SELECT 1", ())]
+
+
+def test_connect_falls_back_to_libsql_when_probe_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The safety property that makes the env flag safe to flip on a live
+    Space: a broken HTTP transport degrades to the client that already works
+    instead of crash-looping both processes under supervisord."""
+    import sys
+    import types
+
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    monkeypatch.setattr(
+        _hrana, "HranaClient", lambda *a, **k: _FakeHranaClient(fail_probe=True)
+    )
+    # Stand in for the optional libsql package (absent on most dev machines).
+    fake_libsql = types.ModuleType("libsql")
+    fake_libsql.connect = lambda *a, **k: sqlite3.connect(":memory:")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "libsql", fake_libsql)
+
+    conn = _db.connect(
+        tmp_path / "x.db", sync_url="libsql://x.turso.io", auth_token="tok"
+    )
+    assert isinstance(conn, _db._LibsqlConn)
+    assert not isinstance(conn, _db._HranaConn)

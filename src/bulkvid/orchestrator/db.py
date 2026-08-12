@@ -54,10 +54,12 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from bulkvid.logging import get_logger
+from bulkvid.orchestrator import hrana as _hrana
 
 _log = get_logger("db")
 
@@ -215,6 +217,11 @@ async def run_db_call[**P, R](
 # at a glance ("did this worker actually pick up the Turso URL?").
 BACKEND_SQLITE = "sqlite_local"
 BACKEND_LIBSQL_REMOTE = "libsql_remote"
+# Stateless SQL-over-HTTP against the same Turso database. Same data, same
+# schema, same autocommit semantics as ``libsql_remote`` — it differs only in
+# having enforceable per-request deadlines and no long-lived session to serve a
+# stale snapshot. Plan ``_plans/2026-08-12-hrana-http-transport.md``.
+BACKEND_HRANA_HTTP = "hrana_http"
 # Kept for backwards-compat with any external grep / docs / older plan
 # references. The 14:13 deploy on 2026-06-04 proved embedded-replica mode
 # is unsafe when two processes (web + worker) share a single container's
@@ -438,7 +445,183 @@ class _LibsqlConn:
         return getattr(self._conn, name)
 
 
+class _HranaCursor:
+    """DB-API cursor over an already-materialised ``StatementResult``.
+
+    The HTTP protocol has no streaming cursor: one round-trip returns the whole
+    result set. So this is a cursor over a list, which keeps ``fetchone`` /
+    ``fetchall`` / iteration working exactly as callers expect while doing no
+    further I/O. Rows are handed back as ``_DictRow`` — the same type the libsql
+    path returns — so no call site can tell the transports apart.
+    """
+
+    def __init__(self, result: _hrana.StatementResult) -> None:
+        self._result = result
+        self._pos = 0
+
+    @property
+    def description(self) -> list[tuple[Any, ...]] | None:
+        """Only the column-name slot is populated; that is all
+        ``_DictRow``-based callers ever read."""
+        if not self._result.cols:
+            return None
+        return [(name, None, None, None, None, None, None)
+                for name in self._result.cols]
+
+    @property
+    def rowcount(self) -> int:
+        return self._result.affected_row_count
+
+    @property
+    def lastrowid(self) -> int | None:
+        return self._result.last_insert_rowid
+
+    def fetchone(self) -> _DictRow | None:
+        if self._pos >= len(self._result.rows):
+            return None
+        row = self._result.rows[self._pos]
+        self._pos += 1
+        return _DictRow(row, self._result.cols)
+
+    def fetchall(self) -> list[_DictRow]:
+        rows = self._result.rows[self._pos:]
+        self._pos = len(self._result.rows)
+        return [_DictRow(r, self._result.cols) for r in rows]
+
+    def fetchmany(self, size: int | None = None) -> list[_DictRow]:
+        n = len(self._result.rows) - self._pos if size is None else max(size, 0)
+        rows = self._result.rows[self._pos:self._pos + n]
+        self._pos += len(rows)
+        return [_DictRow(r, self._result.cols) for r in rows]
+
+    def __iter__(self) -> Any:
+        while True:
+            row = self.fetchone()
+            if row is None:
+                return
+            yield row
+
+    def close(self) -> None:
+        return None
+
+
+class _HranaConn:
+    """Connection wrapper presenting the same DB-API surface as ``_LibsqlConn``,
+    backed by stateless SQL-over-HTTP instead of the sync libsql client.
+
+    Behavioural parity is the whole design goal: identical ``_DictRow`` rows,
+    identical BEGIN/COMMIT/ROLLBACK no-op translation, identical autocommit
+    semantics. The ONLY difference a caller can observe is the good one — a
+    stalled statement now raises on a deadline instead of blocking its thread
+    forever. Plan ``_plans/2026-08-12-hrana-http-transport.md``.
+    """
+
+    def __init__(self, client: _hrana.HranaClient) -> None:
+        self._client = client
+        # Stored but ignored, exactly as in ``_LibsqlConn``: every cursor we
+        # return already provides name-and-index access, and callers assign
+        # ``conn.row_factory = sqlite3.Row`` unconditionally.
+        self.row_factory: Any = None
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        # Same translation as the libsql path: in autocommit every statement is
+        # its own transaction, so transaction-control statements are dropped on
+        # the floor rather than sent. Forwarding them would be worse here than
+        # for libsql — a stateless request cannot hold a transaction open at
+        # all, so a real BEGIN would silently do nothing anyway.
+        if _is_begin_stmt(sql) or _is_commit_stmt(sql) or _is_rollback_stmt(sql):
+            return _NoopCursor()
+        return _HranaCursor(self._client.execute(sql, params))
+
+    def executemany(self, sql: str, params_seq: Any) -> Any:
+        # One request per parameter set. Matches the libsql shim, which also
+        # unrolls executemany after remote-mode batching was observed to
+        # silently no-op our row_queue inserts (see ``_LibsqlConn``).
+        last: Any = None
+        for params in params_seq:
+            last = self._client.execute(sql, params)
+        return _NoopCursor() if last is None else _HranaCursor(last)
+
+    def executescript(self, sql: str) -> Any:
+        self._client.execute_script(sql)
+        return _NoopCursor()
+
+    def cursor(self) -> Any:
+        # Intentionally unsupported: no call site in this codebase uses a
+        # standalone cursor, and returning an empty one would fail silently.
+        raise NotImplementedError(
+            "the Hrana transport has no standalone cursor; use conn.execute()"
+        )
+
+    def commit(self) -> Any:
+        return None    # autocommit — every statement already committed
+
+    def rollback(self) -> Any:
+        return None    # nothing is ever left open to roll back
+
+    def close(self) -> Any:
+        return self._client.close()
+
+    def sync(self) -> Any:
+        return None    # embedded-replica concept; meaningless over HTTP
+
+
 # ── Public ─────────────────────────────────────────────────────────────────
+
+
+TRANSPORT_LIBSQL = "libsql"
+TRANSPORT_HRANA = "hrana"
+
+
+def db_transport() -> str:
+    """Which remote transport this process should use.
+
+    Defaults to the long-serving ``libsql`` client. Set
+    ``BULKVID_DB_TRANSPORT=hrana`` to select the HTTP transport with real
+    per-request deadlines; any unrecognised value falls back to the default
+    rather than failing a deploy. Surfaced in ``/health/deep`` so the active
+    choice is verifiable without reading env vars off the box."""
+    raw = (os.environ.get("BULKVID_DB_TRANSPORT") or "").strip().lower()
+    return raw if raw in (TRANSPORT_LIBSQL, TRANSPORT_HRANA) else TRANSPORT_LIBSQL
+
+
+def _connect_hrana_checked(
+    sync_url: str, auth_token: str, *, quiet: bool
+) -> Any | None:
+    """Open a Hrana connection and prove it works, or return ``None``.
+
+    The probe is what makes ``BULKVID_DB_TRANSPORT=hrana`` safe to flip on a
+    live Space. Without it, any incompatibility (a rejected statement shape, an
+    auth quirk, a proxy in front of the endpoint) would crash-loop BOTH
+    processes under supervisord and take the service down until someone unset
+    the variable by hand. With it, the worst case degrades to "we logged an
+    error and kept using the transport that already works" — strictly no worse
+    than today. One extra round-trip per connection open, which happens at boot
+    and on reconnect, not per query."""
+    try:
+        client = _hrana.HranaClient(sync_url, auth_token)
+    except Exception as e:    # noqa: BLE001 — never let transport choice crash boot
+        _log.error("hrana_client_init_failed", error=str(e)[:200])
+        return None
+    try:
+        client.execute("SELECT 1")
+    except Exception as e:    # noqa: BLE001 — fall back rather than crash-loop
+        _log.error(
+            "hrana_probe_failed",
+            error=str(e)[:200],
+            error_type=type(e).__name__,
+            note="falling back to the libsql client for this connection",
+        )
+        with suppress(Exception):
+            client.close()
+        return None
+    if not quiet:
+        _log.info(
+            "db_backend",
+            backend=BACKEND_HRANA_HTTP,
+            sync_url=_redact_host(sync_url),
+        )
+    return _HranaConn(client)
 
 
 def connect(
@@ -485,6 +668,14 @@ def connect(
             "BULKVID_DB_URL is set but BULKVID_DB_AUTH_TOKEN is empty — "
             "libsql embedded replica requires both."
         )
+
+    # Opt-in HTTP transport with real per-request deadlines. Probed before use;
+    # a failed probe logs loudly and falls through to the libsql client below,
+    # so flipping this env var can never take the service down.
+    if db_transport() == TRANSPORT_HRANA:
+        conn = _connect_hrana_checked(sync_url, auth_token, quiet=quiet)
+        if conn is not None:
+            return conn
 
     # Lazy import: the libsql package builds from Rust source on platforms
     # without a pre-built wheel (e.g. Python 3.14 on Windows), and we

@@ -65,7 +65,20 @@ async def deep_health(
     db_backend = (
         _db.BACKEND_LIBSQL_REMOTE if settings.BULKVID_DB_URL else _db.BACKEND_SQLITE
     )
-    db_info: dict[str, Any] = {"backend": db_backend}
+    # ``transport`` is the CONFIGURED choice; ``live_backend`` is what the
+    # connection actually ended up being. They differ when the Hrana probe
+    # failed and ``connect`` fell back to libsql — the one case where reading
+    # the env var alone would mislead you. Plan
+    # ``_plans/2026-08-12-hrana-http-transport.md``.
+    db_info: dict[str, Any] = {
+        "backend": db_backend,
+        "transport": _db.db_transport(),
+        "live_backend": (
+            _db.BACKEND_HRANA_HTTP
+            if isinstance(queue._conn, _db._HranaConn)
+            else db_backend
+        ),
+    }
     try:
         db_info["ping_ms"] = round(_db.ping(queue._conn), 2)
     except Exception as e:    # noqa: BLE001 — surface to the admin page
