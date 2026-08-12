@@ -364,6 +364,31 @@ def _is_rollback_stmt(sql: str) -> bool:
     return head in ("ROLLBACK", "ROLLBACK TRANSACTION")
 
 
+def _is_pragma_stmt(sql: str) -> bool:
+    """``PRAGMA ...`` in any casing."""
+    return sql.strip().upper().startswith("PRAGMA")
+
+
+def _is_pragma_only_script(sql: str) -> bool:
+    """True when EVERY statement in ``sql`` is a ``PRAGMA``.
+
+    Used to drop the ``PRAGMA journal_mode=WAL`` that ``queue.py`` and
+    ``settings_store.py`` issue at every connection open. Turso's HTTP endpoint
+    rejects it outright (``HTTP 400: SQL not allowed statement``), and rightly
+    so: journal mode is a server-side storage concern that a remote client has
+    no authority over. The libsql client accepted and ignored it, which is why
+    this only surfaced on the HTTP transport (2026-08-12 incident).
+
+    Splitting on ``;`` is safe HERE because the result is only ever a boolean:
+    a real schema script hits ``CREATE TABLE`` on its first chunk and returns
+    False, so the script is forwarded untouched to the ``sequence`` request that
+    handles multi-statement SQL properly. A mis-split can therefore only cause
+    us to send a script we would have sent anyway."""
+    statements = [s.strip() for s in sql.split(";")]
+    meaningful = [s for s in statements if s]
+    return bool(meaningful) and all(_is_pragma_stmt(s) for s in meaningful)
+
+
 class _LibsqlConn:
     """Connection wrapper that returns ``_LibsqlCursor`` from every
     ``execute``/``executemany``/``cursor`` call so callers see dict-like
@@ -531,6 +556,11 @@ class _HranaConn:
         # all, so a real BEGIN would silently do nothing anyway.
         if _is_begin_stmt(sql) or _is_commit_stmt(sql) or _is_rollback_stmt(sql):
             return _NoopCursor()
+        # A remote server owns its own storage configuration, and Turso's HTTP
+        # endpoint rejects PRAGMA outright rather than ignoring it. Dropping it
+        # here matches what the libsql client effectively did.
+        if _is_pragma_stmt(sql):
+            return _NoopCursor()
         return _HranaCursor(self._client.execute(sql, params))
 
     def executemany(self, sql: str, params_seq: Any) -> Any:
@@ -543,6 +573,14 @@ class _HranaConn:
         return _NoopCursor() if last is None else _HranaCursor(last)
 
     def executescript(self, sql: str) -> Any:
+        # ``conn.executescript("PRAGMA journal_mode=WAL;")`` runs at every
+        # connection open. Turso answers HTTP 400 for it, which crash-looped
+        # both processes on 2026-08-12 until the transport was rolled back.
+        # A pragma-only script has nothing a remote server can act on, so it is
+        # dropped; anything containing real DDL is forwarded untouched.
+        if _is_pragma_only_script(sql):
+            _log.debug("hrana_pragma_skipped", sql=sql.strip()[:80])
+            return _NoopCursor()
         self._client.execute_script(sql)
         return _NoopCursor()
 
@@ -585,26 +623,47 @@ def db_transport() -> str:
     return raw if raw in (TRANSPORT_LIBSQL, TRANSPORT_HRANA) else TRANSPORT_LIBSQL
 
 
+# Scratch table used by the connect probe to prove that DDL-over-``sequence``
+# works before we commit to the transport. Created and dropped in a single
+# round-trip, so it leaves nothing behind.
+_PROBE_DDL = (
+    "CREATE TABLE IF NOT EXISTS _bulkvid_transport_probe (x INTEGER);"
+    "DROP TABLE _bulkvid_transport_probe;"
+)
+
+
 def _connect_hrana_checked(
     sync_url: str, auth_token: str, *, quiet: bool
 ) -> Any | None:
     """Open a Hrana connection and prove it works, or return ``None``.
 
     The probe is what makes ``BULKVID_DB_TRANSPORT=hrana`` safe to flip on a
-    live Space. Without it, any incompatibility (a rejected statement shape, an
-    auth quirk, a proxy in front of the endpoint) would crash-loop BOTH
-    processes under supervisord and take the service down until someone unset
-    the variable by hand. With it, the worst case degrades to "we logged an
-    error and kept using the transport that already works" — strictly no worse
-    than today. One extra round-trip per connection open, which happens at boot
-    and on reconnect, not per query."""
+    live Space: without it, any incompatibility crash-loops BOTH supervisord
+    processes and takes the service down until someone unsets the variable by
+    hand.
+
+    It probes THROUGH the ``_HranaConn`` shim, running the same shapes of call
+    that ``JobQueue._open_connection`` makes moments later — a pragma script,
+    a DDL script, and a query — rather than a bare ``SELECT 1``.
+
+    That distinction is the whole lesson of the 2026-08-12 rollback. The first
+    version of this probe ran only ``SELECT 1``; it passed, so the fallback
+    never armed, and boot then died on the very next statement
+    (``PRAGMA journal_mode=WAL``, which Turso answers with HTTP 400). A probe
+    that does not exercise what the caller actually does is not a probe. Cost is
+    two round-trips per connection open (boot and reconnect), not per query."""
     try:
         client = _hrana.HranaClient(sync_url, auth_token)
     except Exception as e:    # noqa: BLE001 — never let transport choice crash boot
         _log.error("hrana_client_init_failed", error=str(e)[:200])
         return None
+    conn = _HranaConn(client)
     try:
-        client.execute("SELECT 1")
+        # Exactly the sequence _open_connection runs: pragma script, then
+        # schema DDL, then queries.
+        conn.executescript("PRAGMA journal_mode=WAL;")
+        conn.executescript(_PROBE_DDL)
+        conn.execute("SELECT 1").fetchone()
     except Exception as e:    # noqa: BLE001 — fall back rather than crash-loop
         _log.error(
             "hrana_probe_failed",
@@ -613,7 +672,7 @@ def _connect_hrana_checked(
             note="falling back to the libsql client for this connection",
         )
         with suppress(Exception):
-            client.close()
+            conn.close()
         return None
     if not quiet:
         _log.info(
@@ -621,7 +680,7 @@ def _connect_hrana_checked(
             backend=BACKEND_HRANA_HTTP,
             sync_url=_redact_host(sync_url),
         )
-    return _HranaConn(client)
+    return conn
 
 
 def connect(

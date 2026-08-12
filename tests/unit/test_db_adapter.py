@@ -575,3 +575,123 @@ def test_connect_falls_back_to_libsql_when_probe_fails(
     )
     assert isinstance(conn, _db._LibsqlConn)
     assert not isinstance(conn, _db._HranaConn)
+
+
+# ── PRAGMA handling + deep probe (2026-08-12 rollback regression) ───────────
+
+
+def test_pragma_script_is_dropped_not_sent() -> None:
+    """REGRESSION (2026-08-12): ``PRAGMA journal_mode=WAL;`` runs at every
+    connection open and Turso answers HTTP 400 "SQL not allowed statement",
+    which crash-looped both processes. A remote server owns its own journal
+    mode, so the statement has nothing to act on and must never reach the wire.
+    """
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    conn.executescript("PRAGMA journal_mode=WAL;")
+    assert client.scripts == []
+    assert client.statements == []
+
+
+def test_standalone_pragma_execute_is_a_noop() -> None:
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    assert conn.execute("PRAGMA foreign_keys=ON").fetchone() is None
+    assert client.statements == []
+
+
+def test_schema_script_containing_ddl_is_still_forwarded_intact() -> None:
+    """The pragma filter must not swallow real schema work. A script is only
+    dropped when EVERY statement in it is a pragma."""
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    schema = "CREATE TABLE jobs (job_id TEXT);\nCREATE INDEX i ON jobs(job_id);"
+    conn.executescript(schema)
+    assert client.scripts == [schema]
+
+
+def test_mixed_pragma_and_ddl_script_is_forwarded_intact() -> None:
+    """Belt and braces: a script that merely STARTS with a pragma still carries
+    DDL, so it must go through untouched rather than be dropped."""
+    client = _FakeHranaClient()
+    conn = _db._HranaConn(client)
+    mixed = "PRAGMA journal_mode=WAL; CREATE TABLE t (x INTEGER);"
+    conn.executescript(mixed)
+    assert client.scripts == [mixed]
+
+
+def test_connect_probe_exercises_ddl_and_query_not_just_select_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The original probe ran only ``SELECT 1``, passed, and let boot die on the
+    next statement. The probe must run the same SHAPES the caller runs."""
+    client = _FakeHranaClient()
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    monkeypatch.setattr(_hrana, "HranaClient", lambda *a, **k: client)
+
+    conn = _db.connect(
+        tmp_path / "x.db", sync_url="libsql://x.turso.io", auth_token="tok"
+    )
+    assert isinstance(conn, _db._HranaConn)
+    # DDL-over-sequence was proven before committing to the transport...
+    assert any("CREATE TABLE IF NOT EXISTS" in s for s in client.scripts)
+    assert any("DROP TABLE" in s for s in client.scripts)
+    # ...and the query path too. The pragma script never reaches the wire.
+    assert [s for s, _ in client.statements] == ["SELECT 1"]
+    assert not any("PRAGMA" in s for s in client.scripts)
+
+
+def test_connect_falls_back_when_ddl_probe_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case that took production down: a statement the server refuses. With
+    the deeper probe this now degrades to a fallback instead of a crash-loop."""
+    import sys
+    import types
+
+    class _RejectsDdl(_FakeHranaClient):
+        def execute_script(self, sql: str) -> None:
+            raise _hrana.HranaTransportError(
+                'HTTP 400: {"error":"SQL not allowed statement"}'
+            )
+
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    monkeypatch.setattr(_hrana, "HranaClient", lambda *a, **k: _RejectsDdl())
+    fake_libsql = types.ModuleType("libsql")
+    fake_libsql.connect = lambda *a, **k: sqlite3.connect(":memory:")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "libsql", fake_libsql)
+
+    conn = _db.connect(
+        tmp_path / "x.db", sync_url="libsql://x.turso.io", auth_token="tok"
+    )
+    assert isinstance(conn, _db._LibsqlConn)
+
+
+def test_turso_like_server_rejecting_pragma_no_longer_breaks_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-08-12 production failure, reproduced end to end.
+
+    Real Turso answers HTTP 400 to ``PRAGMA journal_mode=WAL``. Against a client
+    that behaves that way, connect() must still select the HTTP transport (not
+    fall back), and the pragma call that ``JobQueue._open_connection`` makes
+    immediately afterwards must succeed rather than crash-loop the process."""
+    class _TursoLike(_FakeHranaClient):
+        def execute_script(self, sql: str) -> None:
+            if "PRAGMA" in sql.upper():
+                raise _hrana.HranaTransportError(
+                    'HTTP 400: {"error":"SQL not allowed statement: '
+                    'PRAGMA journal_mode=WAL;"}'
+                )
+            super().execute_script(sql)
+
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    monkeypatch.setattr(_hrana, "HranaClient", lambda *a, **k: _TursoLike())
+
+    conn = _db.connect(
+        tmp_path / "x.db", sync_url="libsql://x.turso.io", auth_token="tok"
+    )
+    assert isinstance(conn, _db._HranaConn)      # transport selected, no fallback
+    conn.executescript("PRAGMA journal_mode=WAL;")   # the call that killed prod
+    conn.executescript("CREATE TABLE IF NOT EXISTS jobs (job_id TEXT);")
+    assert conn.execute("SELECT 1") is not None
