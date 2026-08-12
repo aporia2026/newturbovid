@@ -195,3 +195,18 @@ def test_deep_health_degrades_when_heartbeat_read_fails(
     worker = r.json()["worker"]
     assert "turso unreachable" in worker["heartbeat_error"]
     assert "turso unreachable" in worker["recent_wedges_error"]
+
+
+def test_deep_health_reports_db_transport_and_live_backend(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``transport`` is the configured choice, ``live_backend`` is what the
+    connection actually became. They diverge exactly when the Hrana probe failed
+    and connect() fell back, which is the one case where reading the env var
+    alone would mislead an operator mid-incident."""
+    monkeypatch.setenv("BULKVID_DB_TRANSPORT", "hrana")
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    db = r.json()["db"]
+    assert db["transport"] == "hrana"          # what we asked for
+    assert db["live_backend"] == "sqlite_local"  # what we actually got
