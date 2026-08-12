@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from bulkvid.auth import AuthError, ForbiddenError, Identity
-from bulkvid.orchestrator.queue import JobQueue
+from bulkvid.orchestrator.queue import JobQueue, record_wedge_forensics
 from bulkvid.routes import health as health_routes
 from bulkvid.routes import jobs as jobs_routes
 
@@ -134,3 +134,64 @@ def test_deep_health_does_not_leak_api_keys(client: TestClient) -> None:
     openai = vendors["openai"]
     # Only "configured" + "suffix" are present, never a raw key.
     assert set(openai.keys()) == {"configured", "suffix"}
+
+
+# ── Worker liveness + wedge history (Plan 2026-08-12) ───────────────────────
+
+
+def test_deep_health_reports_no_heartbeat_before_worker_beats(
+    client: TestClient,
+) -> None:
+    """A freshly booted DB has no beat. That is reported as ``None`` rather than
+    a fake age, so nobody mistakes "never beaten" for "beaten just now"."""
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    assert r.json()["worker"]["heartbeat"] is None
+
+
+async def test_deep_health_reports_heartbeat_age(
+    app: FastAPI, client: TestClient
+) -> None:
+    await app.state.queue.write_heartbeat(in_flight=3)
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    beat = r.json()["worker"]["heartbeat"]
+    assert beat["in_flight"] == 3
+    assert 0 <= beat["age_seconds"] < 60
+    assert beat["pid"] > 0
+
+
+async def test_deep_health_lists_recent_wedges_with_truncated_stacks(
+    app: FastAPI, client: TestClient
+) -> None:
+    """The page previews the autopsy; the full dump stays in the DB so a huge
+    stack can never bloat the health response."""
+    record_wedge_forensics(
+        app.state.queue._conn, process="worker",
+        reason="worker_heartbeat_stale", pending=109, processing=6,
+        heartbeat_age_s=312.5, stacks="X" * 5000,
+    )
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    wedges = r.json()["worker"]["recent_wedges"]
+    assert len(wedges) == 1
+    assert wedges[0]["reason"] == "worker_heartbeat_stale"
+    assert (wedges[0]["pending"], wedges[0]["processing"]) == (109, 6)
+    assert len(wedges[0]["stacks_preview"]) == 2000
+
+
+def test_deep_health_degrades_when_heartbeat_read_fails(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DB blip must degrade the page, not 500 it — this endpoint is what an
+    operator opens WHILE things are broken."""
+    async def _boom(*_a, **_k):
+        raise RuntimeError("turso unreachable")
+
+    monkeypatch.setattr(app.state.queue, "read_heartbeat", _boom)
+    monkeypatch.setattr(app.state.queue, "list_wedge_forensics", _boom)
+    r = client.get("/health/deep", headers=_auth("tok-admin"))
+    assert r.status_code == 200
+    worker = r.json()["worker"]
+    assert "turso unreachable" in worker["heartbeat_error"]
+    assert "turso unreachable" in worker["recent_wedges_error"]

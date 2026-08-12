@@ -15,6 +15,7 @@ Plan §8 (Observability), §9 (admin panel kill-switch indicator).
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -70,11 +71,50 @@ async def deep_health(
     except Exception as e:    # noqa: BLE001 — surface to the admin page
         db_info["ping_error"] = str(e)[:200]
 
+    # Worker liveness + wedge history. Answers the two questions an operator
+    # actually has during an incident — "is the worker alive right now?" and
+    # "what did the last auto-restart catch it doing?" — without SSH and without
+    # the HF log tab, which retains nothing from before the restart. Each side
+    # catches its own errors so a DB blip degrades the page instead of 500ing it.
+    # Plan ``_plans/2026-08-12-worker-liveness-net-heartbeat-forensics.md``.
+    worker_info: dict[str, Any] = {}
+    try:
+        beat = await queue.read_heartbeat()
+        if beat is None:
+            worker_info["heartbeat"] = None
+        else:
+            worker_info["heartbeat"] = {
+                "age_seconds": round(time.time() - beat.epoch, 1),
+                "pid": beat.pid,
+                "in_flight": beat.in_flight,
+                "updated_at": beat.updated_at,
+            }
+    except Exception as e:    # noqa: BLE001 — surface to the admin page
+        worker_info["heartbeat_error"] = str(e)[:200]
+    try:
+        worker_info["recent_wedges"] = [
+            {
+                "ts": f.ts,
+                "process": f.process,
+                "reason": f.reason,
+                "pending": f.pending,
+                "processing": f.processing,
+                "heartbeat_age_s": f.heartbeat_age_s,
+                # Preview only — the full dump can run tens of KB. The whole row
+                # is readable straight from the DB when a post-mortem needs it.
+                "stacks_preview": f.stacks[:2000],
+            }
+            for f in await queue.list_wedge_forensics(limit=3)
+        ]
+    except Exception as e:    # noqa: BLE001 — surface to the admin page
+        worker_info["recent_wedges_error"] = str(e)[:200]
+
     return {
         "service": "bulkvid",
         "env": settings.BULKVID_ENV,
         "kill_switch": bool(settings.BULKVID_KILL_SWITCH),
         "db": db_info,
+        "worker": worker_info,
         "vendors": {
             "openai": _present(settings.OPENAI_API_KEY),
             "kie_ai": {

@@ -14,11 +14,18 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
+
 import pytest
 
 from bulkvid.config import Settings
 from bulkvid.orchestrator.sheet_writer import PendingWrite
-from bulkvid.worker import build_flush_callback, build_pipeline_clients
+from bulkvid.worker import (
+    build_flush_callback,
+    build_pipeline_clients,
+    heartbeat_loop,
+)
 
 
 def _full_settings(**overrides) -> Settings:
@@ -168,3 +175,58 @@ async def test_flush_callback_is_noop_when_sheets_credentials_missing() -> None:
         row_num=2, video_urls=["u"], status="SUCCESS", error=None,
     )
     await callback([write])      # no exception means we're good
+
+
+# ── heartbeat_loop (Plan 2026-08-12) ────────────────────────────────────────
+
+
+class _FakeQueue:
+    """Records beats; optionally fails the first N to prove the loop survives."""
+
+    def __init__(self, fail_first: int = 0) -> None:
+        self.beats: list[int] = []
+        self._fail_first = fail_first
+
+    async def write_heartbeat(self, *, in_flight: int) -> None:
+        if len(self.beats) < self._fail_first:
+            self.beats.append(-1)
+            raise RuntimeError("turso flap")
+        self.beats.append(in_flight)
+
+
+class _FakeRunner:
+    def __init__(self, in_flight: int = 0) -> None:
+        self.in_flight_count = in_flight
+
+
+async def _run_beats(queue, runner, *, ticks: int) -> None:
+    """Drive ``heartbeat_loop`` for exactly ``ticks`` beats, then cancel it.
+
+    The loop is infinite by design, so we let a patched sleep count the
+    iterations and cancel from inside once we have seen enough."""
+    task = asyncio.create_task(
+        heartbeat_loop(queue, runner, interval_seconds=0)
+    )
+    while len(queue.beats) < ticks:
+        await asyncio.sleep(0)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_heartbeat_loop_beats_immediately_with_in_flight_count() -> None:
+    """Beats FIRST, then sleeps — the row must be fresh within a moment of boot,
+    not one interval later, or the watchdog's uptime gate misjudges a new
+    worker."""
+    queue = _FakeQueue()
+    await _run_beats(queue, _FakeRunner(in_flight=4), ticks=1)
+    assert queue.beats[0] == 4
+
+
+async def test_heartbeat_loop_survives_write_failures() -> None:
+    """A failed beat IS the wedge signal — it must be logged and swallowed, never
+    crash the worker (which would turn a diagnostic into an outage)."""
+    queue = _FakeQueue(fail_first=2)
+    await _run_beats(queue, _FakeRunner(in_flight=1), ticks=4)
+    assert queue.beats[:2] == [-1, -1]     # two failures
+    assert queue.beats[2:] == [1, 1]       # then it recovers and keeps beating
