@@ -91,6 +91,13 @@ TAB_IMAGE_RESIZE = "image_resize"
 # are pruned opportunistically on every enqueue.
 IDEMPOTENCY_TTL_SECONDS = 86_400
 
+# Wedge-forensics retention. A wedge restart writes ONE row; even a pathological
+# restart loop adds a handful per hour, so 30 days keeps every post-mortem window
+# alive while the table stays tiny. Pruned opportunistically on insert (same
+# shape as the kill-audit prune below). Plan
+# ``_plans/2026-08-12-worker-liveness-net-heartbeat-forensics.md``.
+WEDGE_FORENSICS_TTL_SECONDS = 30 * 86_400
+
 # Kill-attempt audit outcomes. Every kill POST that reaches the backend is
 # recorded durably (table ``kill_audit``) with one of these, so a "kill didn't
 # work" report can be answered from data — the 2026-07-05 incident left zero
@@ -190,11 +197,32 @@ CREATE TABLE IF NOT EXISTS kill_audit (
     detail       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS worker_heartbeat (
+    id           INTEGER PRIMARY KEY,
+    epoch        REAL    NOT NULL,
+    pid          INTEGER NOT NULL,
+    in_flight    INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wedge_forensics (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               TEXT NOT NULL,
+    created_ts       REAL NOT NULL,
+    process          TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    pending          INTEGER NOT NULL DEFAULT 0,
+    processing       INTEGER NOT NULL DEFAULT 0,
+    heartbeat_age_s  REAL,
+    stacks           TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_row_queue_status      ON row_queue(status);
 CREATE INDEX IF NOT EXISTS idx_row_queue_job         ON row_queue(job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status           ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_idempotency_keys_ts   ON idempotency_keys(created_ts);
 CREATE INDEX IF NOT EXISTS idx_kill_audit_ts         ON kill_audit(created_ts);
+CREATE INDEX IF NOT EXISTS idx_wedge_forensics_ts    ON wedge_forensics(created_ts);
 """
 
 
@@ -265,6 +293,37 @@ class KillAttempt:
     user_email: str
     outcome: str
     detail: str | None
+
+
+@dataclass
+class WorkerHeartbeat:
+    """Last liveness beat the worker managed to land in the DB.
+
+    ``epoch`` is wall-clock ``time.time()`` (NOT monotonic) precisely because it
+    is compared ACROSS processes — the stuck-queue watchdog thread and the web
+    app's health route both read it. Monotonic clocks are per-process and would
+    be meaningless here."""
+
+    epoch: float
+    pid: int
+    in_flight: int
+    updated_at: str
+
+
+@dataclass
+class WedgeForensics:
+    """One pre-restart autopsy: why a watchdog fired and what every thread was
+    doing at that instant. Written to the DB (which survives the restart)
+    because the container logs that would otherwise hold it do not."""
+
+    id: int
+    ts: str
+    process: str
+    reason: str
+    pending: int
+    processing: int
+    heartbeat_age_s: float | None
+    stacks: str
 
 
 def _now_iso() -> str:
@@ -344,6 +403,133 @@ def count_active_queue(conn: Any) -> tuple[int, int]:
     pending = int(p[0]) if p is not None else 0
     processing = int(q[0]) if q is not None else 0
     return pending, processing
+
+
+def write_worker_heartbeat(
+    conn: Any, *, epoch: float, pid: int, in_flight: int
+) -> None:
+    """Upsert the worker's single liveness row, on ANY connection.
+
+    The single source of truth for the heartbeat write. One fixed row (``id=1``)
+    via ``INSERT OR REPLACE`` — the beat is a level, not a log, so there is
+    nothing to accumulate and nothing to prune.
+
+    This landing in the DB is the proof-of-life the universal restart net keys
+    on: it can only happen if the worker's event loop is still scheduling AND
+    its DB path still works, which is exactly the pair of conditions every
+    previous wedge broke. Plan
+    ``_plans/2026-08-12-worker-liveness-net-heartbeat-forensics.md``."""
+    conn.execute(
+        "INSERT OR REPLACE INTO worker_heartbeat "
+        "(id, epoch, pid, in_flight, updated_at) VALUES (1,?,?,?,?)",
+        (epoch, pid, in_flight, _now_iso()),
+    )
+
+
+def read_worker_heartbeat(conn: Any) -> WorkerHeartbeat | None:
+    """The worker's last beat, or ``None`` when it has never beaten.
+
+    Connection-agnostic (like ``count_active_queue``) so the stuck-queue
+    watchdog can read it on its OWN fresh connection — reading ground truth
+    through the possibly-wedged worker connection would defeat the purpose.
+    ``None`` means "cannot confirm liveness either way", which every caller
+    treats as do-not-restart."""
+    cur = conn.execute(
+        "SELECT epoch, pid, in_flight, updated_at FROM worker_heartbeat "
+        "WHERE id = 1"
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return WorkerHeartbeat(
+        epoch=float(row[0]),
+        pid=int(row[1]),
+        in_flight=int(row[2]),
+        updated_at=str(row[3]),
+    )
+
+
+def sweep_expired_processing_rows(conn: Any, *, cutoff_iso: str) -> int:
+    """Release PROCESSING rows of still-active jobs whose ``started_at`` predates
+    ``cutoff_iso`` back to PENDING. Returns how many were released.
+
+    The runtime twin of ``_recover_orphaned_rows_sync`` (which only ever runs at
+    boot). A row can be stranded in PROCESSING with nothing working on it —
+    most concretely when ``record_result`` exhausts its retry budget and logs
+    ``runner_pending_record_giveup`` — and until now only a process restart
+    cleared it. Worse, such a strand keeps ``processing > 0`` forever, which
+    silently DISARMS the idle-only stuck-queue watchdog. Sweeping on a timer
+    heals the row and re-arms the guard without restarting anything.
+
+    Bounded by ``started_at`` so a legitimately long row (a 30-min render) is
+    never touched: callers pass a cutoff well past the longest row budget.
+    Restricted to active jobs so killed/completed jobs are never resurrected.
+    ISO-8601 UTC strings from ``_now_iso`` compare correctly with ``<`` because
+    they are fixed-width and same-offset."""
+    cur = conn.execute(
+        "UPDATE row_queue SET status = ?, started_at = NULL "
+        "WHERE status = ? AND started_at IS NOT NULL AND started_at < ? "
+        "AND job_id IN (SELECT job_id FROM jobs WHERE status IN (?, ?))",
+        (ROW_PENDING, ROW_PROCESSING, cutoff_iso, JOB_QUEUED, JOB_RUNNING),
+    )
+    return int(cur.rowcount or 0)
+
+
+def record_wedge_forensics(
+    conn: Any,
+    *,
+    process: str,
+    reason: str,
+    pending: int,
+    processing: int,
+    heartbeat_age_s: float | None,
+    stacks: str,
+) -> None:
+    """Persist one pre-restart autopsy, then prune past the TTL.
+
+    Called from a watchdog microseconds before ``os._exit``, on a fresh
+    connection, because the restart destroys every other copy of this evidence:
+    HF Spaces only retains container logs since the last start, so the six
+    incidents to date each erased their own cause. A row here survives.
+
+    Prunes AFTER the insert (same shape as the kill-audit prune) so a slow prune
+    can never cost us the recording we came for."""
+    conn.execute(
+        "INSERT INTO wedge_forensics "
+        "(ts, created_ts, process, reason, pending, processing, "
+        "heartbeat_age_s, stacks) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            _now_iso(), time.time(), process, reason, pending, processing,
+            heartbeat_age_s, stacks,
+        ),
+    )
+    with suppress(Exception):    # a failed prune must never mask the record
+        conn.execute(
+            "DELETE FROM wedge_forensics WHERE created_ts < ?",
+            (time.time() - WEDGE_FORENSICS_TTL_SECONDS,),
+        )
+
+
+def list_wedge_forensics(conn: Any, *, limit: int = 10) -> list[WedgeForensics]:
+    """Newest-first wedge autopsies for the admin health page."""
+    cur = conn.execute(
+        "SELECT id, ts, process, reason, pending, processing, heartbeat_age_s, "
+        "stacks FROM wedge_forensics ORDER BY created_ts DESC LIMIT ?",
+        (limit,),
+    )
+    return [
+        WedgeForensics(
+            id=int(r[0]),
+            ts=str(r[1]),
+            process=str(r[2]),
+            reason=str(r[3]),
+            pending=int(r[4]),
+            processing=int(r[5]),
+            heartbeat_age_s=(None if r[6] is None else float(r[6])),
+            stacks=str(r[7]),
+        )
+        for r in cur.fetchall()
+    ]
 
 
 class JobQueue:
@@ -1231,6 +1417,21 @@ class JobQueue:
         Plan ``_plans/2026-07-06-stuck-runs-worker-wedge.md`` §Fix 2."""
         return count_active_queue(self._conn)
 
+    def _write_heartbeat_sync(self, *, in_flight: int) -> None:
+        """Thin caller of the module-level ``write_worker_heartbeat`` — the SSOT
+        for the beat, shared with any future writer."""
+        write_worker_heartbeat(
+            self._conn, epoch=time.time(), pid=os.getpid(), in_flight=in_flight
+        )
+
+    def _read_heartbeat_sync(self) -> WorkerHeartbeat | None:
+        """Thin caller of the module-level ``read_worker_heartbeat``."""
+        return read_worker_heartbeat(self._conn)
+
+    def _list_wedge_forensics_sync(self, *, limit: int) -> list[WedgeForensics]:
+        """Thin caller of the module-level ``list_wedge_forensics``."""
+        return list_wedge_forensics(self._conn, limit=limit)
+
     def _recover_orphaned_rows_sync(self) -> int:
         """On worker startup, return PROCESSING rows back to PENDING."""
         with self._tx():
@@ -1514,6 +1715,28 @@ class JobQueue:
         ``_run_db``. Used by the runner heartbeat."""
         return await self._run_db(
             self._count_active_queue_sync, op="count_active_queue"
+        )
+
+    async def write_heartbeat(self, *, in_flight: int) -> None:
+        """Land one liveness beat. Self-heals via ``_run_db`` like every other
+        call, so a single Turso flap costs at most one beat rather than tripping
+        the restart net; a beat that fails past the retries raises, and the
+        caller (the worker's heartbeat task) logs and carries on — a persistently
+        failing beat IS the wedge signal, so it must never crash the worker."""
+        await self._run_db(
+            self._write_heartbeat_sync, in_flight=in_flight, op="write_heartbeat"
+        )
+
+    async def read_heartbeat(self) -> WorkerHeartbeat | None:
+        """The worker's last landed beat, or ``None`` if it has never beaten.
+        Backs ``/health/deep`` so an operator can see worker liveness (and its
+        age) from the browser."""
+        return await self._run_db(self._read_heartbeat_sync, op="read_heartbeat")
+
+    async def list_wedge_forensics(self, *, limit: int = 10) -> list[WedgeForensics]:
+        """Newest-first wedge autopsies, for ``/health/deep``."""
+        return await self._run_db(
+            self._list_wedge_forensics_sync, limit=limit, op="list_wedge_forensics"
         )
 
     async def recover_orphaned_rows(self) -> int:

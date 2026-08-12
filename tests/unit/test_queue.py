@@ -15,7 +15,9 @@ Use a tmp_path DB per test; no shared state. Covers:
 
 from __future__ import annotations
 
+import os
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -41,9 +43,13 @@ from bulkvid.orchestrator.queue import (
     TAB_FOUR_IMAGES,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
+    WEDGE_FORENSICS_TTL_SECONDS,
     JobQueue,
     count_active_queue,
     payload_to_row,
+    read_worker_heartbeat,
+    record_wedge_forensics,
+    sweep_expired_processing_rows,
 )
 
 
@@ -790,3 +796,140 @@ async def test_kill_audit_prunes_rows_past_ttl(queue: JobQueue) -> None:
     )
     attempts = await queue.list_kill_attempts()
     assert [a.id for a in attempts] == [fresh_id]
+
+
+# ── Worker heartbeat (Plan 2026-08-12) ──────────────────────────────────────
+
+
+async def test_heartbeat_roundtrip_and_upsert(queue: JobQueue) -> None:
+    """The beat is a LEVEL, not a log: each write replaces the single row, so
+    the table can never grow and the reader always sees the latest beat."""
+    assert await queue.read_heartbeat() is None
+
+    await queue.write_heartbeat(in_flight=2)
+    first = await queue.read_heartbeat()
+    assert first is not None
+    assert first.in_flight == 2
+    assert first.pid == os.getpid()
+    assert first.epoch <= time.time()
+
+    await queue.write_heartbeat(in_flight=5)
+    second = await queue.read_heartbeat()
+    assert second is not None
+    assert second.in_flight == 5
+    assert second.epoch >= first.epoch
+    # Still exactly one row — an upsert, not an append.
+    rows = queue._conn.execute("SELECT COUNT(*) FROM worker_heartbeat").fetchone()
+    assert rows[0] == 1
+
+
+async def test_module_read_worker_heartbeat_matches_method(queue: JobQueue) -> None:
+    """The watchdog reads the beat on its OWN connection via the module-level
+    function; it must agree with the method the health route uses."""
+    await queue.write_heartbeat(in_flight=3)
+    direct = read_worker_heartbeat(queue._conn)
+    via_method = await queue.read_heartbeat()
+    assert direct is not None and via_method is not None
+    assert (direct.epoch, direct.pid, direct.in_flight) == (
+        via_method.epoch, via_method.pid, via_method.in_flight
+    )
+
+
+# ── Lease sweep (Plan 2026-08-12) ───────────────────────────────────────────
+
+
+async def test_sweep_releases_only_rows_past_the_cutoff(queue: JobQueue) -> None:
+    """A row stranded in PROCESSING past the cutoff goes back to PENDING; a row
+    that is legitimately still working (a 30-min render) is untouched."""
+    await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2), _img_row(3)],
+    )
+    stranded = await queue.claim_next_row()
+    fresh = await queue.claim_next_row()
+    assert stranded is not None and fresh is not None
+    assert await queue.count_active_queue() == (0, 2)
+
+    # Age ONLY the first row well past the cutoff.
+    queue._conn.execute(
+        "UPDATE row_queue SET started_at = ? WHERE id = ?",
+        ("2020-01-01T00:00:00+00:00", stranded.id),
+    )
+    cutoff = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat(
+        timespec="seconds"
+    )
+    released = sweep_expired_processing_rows(queue._conn, cutoff_iso=cutoff)
+    assert released == 1
+    assert await queue.count_active_queue() == (1, 1)
+
+    # The released row is claimable again, and it is the stranded one.
+    reclaimed = await queue.claim_next_row()
+    assert reclaimed is not None
+    assert reclaimed.row_num == stranded.row_num
+
+
+async def test_sweep_ignores_rows_of_inactive_jobs(queue: JobQueue) -> None:
+    """A killed job's rows must never be resurrected by the janitor."""
+    job_id = await queue.enqueue(
+        user_email="u@aporia.com", sheet_id="s", worksheet="w",
+        tab_type=TAB_IMAGE_VO, rows=[_img_row(2)],
+    )
+    claimed = await queue.claim_next_row()
+    assert claimed is not None
+    queue._conn.execute(
+        "UPDATE row_queue SET status = ?, started_at = ? WHERE id = ?",
+        ("processing", "2020-01-01T00:00:00+00:00", claimed.id),
+    )
+    await queue.kill_job(job_id)
+
+    cutoff = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat(
+        timespec="seconds"
+    )
+    assert sweep_expired_processing_rows(queue._conn, cutoff_iso=cutoff) == 0
+
+
+async def test_sweep_is_a_noop_when_nothing_is_stranded(queue: JobQueue) -> None:
+    cutoff = (datetime.now(UTC) - timedelta(seconds=3600)).isoformat(
+        timespec="seconds"
+    )
+    assert sweep_expired_processing_rows(queue._conn, cutoff_iso=cutoff) == 0
+
+
+# ── Wedge forensics (Plan 2026-08-12) ───────────────────────────────────────
+
+
+async def test_wedge_forensics_roundtrip_newest_first(queue: JobQueue) -> None:
+    record_wedge_forensics(
+        queue._conn, process="worker", reason="stuck_queue_idle", pending=5,
+        processing=0, heartbeat_age_s=None, stacks="first dump",
+    )
+    record_wedge_forensics(
+        queue._conn, process="worker", reason="worker_heartbeat_stale",
+        pending=109, processing=6, heartbeat_age_s=312.5, stacks="second dump",
+    )
+    rows = await queue.list_wedge_forensics()
+    assert [r.reason for r in rows] == [
+        "worker_heartbeat_stale", "stuck_queue_idle",
+    ]
+    assert (rows[0].pending, rows[0].processing) == (109, 6)
+    assert rows[0].heartbeat_age_s == 312.5
+    assert rows[0].stacks == "second dump"
+    # A restart with no heartbeat context stores NULL rather than a fake zero.
+    assert rows[1].heartbeat_age_s is None
+
+
+async def test_wedge_forensics_prunes_rows_past_ttl(queue: JobQueue) -> None:
+    record_wedge_forensics(
+        queue._conn, process="worker", reason="old", pending=1, processing=0,
+        heartbeat_age_s=None, stacks="stale dump",
+    )
+    queue._conn.execute(
+        "UPDATE wedge_forensics SET created_ts = ? WHERE reason = ?",
+        (time.time() - WEDGE_FORENSICS_TTL_SECONDS - 60, "old"),
+    )
+    record_wedge_forensics(
+        queue._conn, process="worker", reason="new", pending=2, processing=0,
+        heartbeat_age_s=None, stacks="fresh dump",
+    )
+    rows = await queue.list_wedge_forensics()
+    assert [r.reason for r in rows] == ["new"]

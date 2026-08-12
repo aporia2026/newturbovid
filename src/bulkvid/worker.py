@@ -15,7 +15,9 @@ Plan: ``_plans/2026-06-02-aporia-bulk-video-tool.md`` §5 ("Process split").
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,24 @@ from bulkvid.orchestrator.sheet_writer import (
 from bulkvid.orchestrator.stuck_queue_watchdog import start_stuck_queue_watchdog
 
 _log = get_logger("worker")
+
+
+# ── Liveness heartbeat (Plan 2026-08-12) ────────────────────────────────────
+#
+# The worker lands a beat in the DB on this cadence. The beat is the ONLY signal
+# that proves both halves of "this worker is alive": the event loop is still
+# scheduling tasks (so the coroutine below runs at all) AND the worker's DB path
+# still works (so the write lands). Every wedge to date broke at least one of
+# those, which is why the independent stuck-queue watchdog restarts on a stale
+# beat regardless of what the queue counts say — the shape-specific guards that
+# gate on ``processing == 0`` all missed the 2026-08-12 mid-batch freeze.
+#
+# 30s gives the watchdog's 240s staleness threshold 8 chances to see a beat, so
+# a transient flap (which ``_run_db`` heals in seconds) can never false-fire a
+# restart. Env-tunable for a per-deploy tune without a code change.
+_HEARTBEAT_INTERVAL_SECONDS = float(
+    os.environ.get("BULKVID_WORKER_HEARTBEAT_INTERVAL_SECONDS") or 30.0
+)
 
 
 # ── Construction helpers ────────────────────────────────────────────────────
@@ -122,6 +142,35 @@ def build_flush_callback(settings: Settings) -> FlushCallback:
         ),
     )
     return sheets_client.batch_write_video_urls
+
+
+async def heartbeat_loop(
+    queue: JobQueue,
+    runner: BatchRunner,
+    *,
+    interval_seconds: float = _HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """Land a liveness beat every ``interval_seconds``, forever.
+
+    Beats FIRST, then sleeps, so the row is fresh within a moment of boot rather
+    than one interval later — the stuck-queue watchdog's uptime gate depends on
+    that not lagging.
+
+    A failed beat is logged and swallowed on purpose. The beat is a *signal*,
+    not a duty: if it cannot land, the watchdog seeing it go stale is precisely
+    the outcome we want, whereas crashing the worker here would turn a
+    diagnostic into an outage. Cancelled at shutdown by ``run``.
+    """
+    while True:
+        try:
+            await queue.write_heartbeat(in_flight=runner.in_flight_count)
+        except Exception as e:    # noqa: BLE001 — a missed beat IS the signal
+            _log.warning(
+                "worker_heartbeat_write_failed",
+                error=str(e)[:200],
+                error_type=type(e).__name__,
+            )
+        await asyncio.sleep(interval_seconds)
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────
@@ -225,9 +274,21 @@ async def run() -> None:
             # Ctrl-C the process and let the KeyboardInterrupt propagate.
             pass
 
+    # Proof-of-life for the watchdog above. Started before the main gather so a
+    # worker that wedges during its very first drain still has a fresh beat on
+    # record to go stale from. Plan
+    # ``_plans/2026-08-12-worker-liveness-net-heartbeat-forensics.md``.
+    heartbeat = asyncio.create_task(heartbeat_loop(queue, runner))
+    _log.info(
+        "worker_heartbeat_start", interval_seconds=_HEARTBEAT_INTERVAL_SECONDS
+    )
+
     try:
         await asyncio.gather(runner.run(), writer.run())
     finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
         queue.close()
         settings_store.close()
         _log.info("worker_stop")
