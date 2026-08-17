@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from bulkvid.pipeline.market import effective_country
+
 # Status codes — one per failure mode the orchestrator can return.
 STATUS_SUCCESS = "SUCCESS"
 STATUS_ARTICLE_FETCH_FAILED = "ARTICLE_FETCH_FAILED"
@@ -30,8 +32,41 @@ STATUS_ROW_TIMEOUT = "ROW_TIMEOUT"
 STATUS_KILLED_BY_USER = "KILLED_BY_USER"
 
 
+# ── Target-market normalization ──────────────────────────────────────────────
+
+
+class _MarketRow:
+    """Fills a blank ``country`` from the article URL's ``locale=`` region.
+
+    A row pasted as ``...?q=seized%20cars%20ireland&locale=en_IE`` with the
+    Country column left empty is still an Irish row, but nothing downstream
+    could see that: ``locale=`` was read for its language half only, so the
+    region never reached ``accent_directive`` (which does know ``ie -> Irish``)
+    or the script's market context. The row shipped in a default voice written
+    for nowhere in particular.
+
+    Normalizing here rather than in the route builders is deliberate: every
+    construction path goes through the dataclass ``__init__`` — the
+    ``_build_*_row`` builders, ``_row_from_payload`` on worker replay, and the
+    local worker — so a tab added later cannot forget it. An explicit Country
+    column always wins; this only ever fills a blank, and is never written back
+    to the sheet.
+
+    Field-less on purpose: a mixin that declared fields would shift positional
+    argument order in every existing ``Row(...)`` call site.
+
+    Plan: ``_plans/2026-08-17-locale-market-accent.md``.
+    """
+
+    article_url: str
+    country: str
+
+    def __post_init__(self) -> None:
+        self.country = effective_country(self.article_url, self.country)
+
+
 @dataclass
-class ImageVORow:
+class ImageVORow(_MarketRow):
     """Image-VO tab input row (plan §15 Appendix A)."""
 
     row_num: int
@@ -61,7 +96,7 @@ class CardChoice:
 
 
 @dataclass
-class SimpleX4Row:
+class SimpleX4Row(_MarketRow):
     """Simple x4 tab input row — 4 videos generated from one Manual Image
     via the image_vo pipeline, each with its own optional card overlay.
 
@@ -85,7 +120,7 @@ class SimpleX4Row:
 
 
 @dataclass
-class SimpleRow:
+class SimpleRow(_MarketRow):
     """Simple tab input row — one video from the user's existing Manual Image.
 
     Same input columns as Image-VO, but NO image generation: the supplied
@@ -106,7 +141,7 @@ class SimpleRow:
 
 
 @dataclass
-class AvatarRow:
+class AvatarRow(_MarketRow):
     """``video with avatar`` tab input row — static background image
     (Manual Image used as-is, or a single kie text-to-image) with a
     TikTok Symphony avatar composited at the bottom-left for the full
@@ -141,7 +176,7 @@ class AvatarRow:
 
 
 @dataclass
-class TextOnImgRow:
+class TextOnImgRow(_MarketRow):
     """``paste text on img`` tab input row — one IMAGE (not video) from the
     user's Manual Image with the operator-typed ``text`` overlaid in the
     center (heavy white, thick black outline). The composed PNG is written
@@ -169,7 +204,7 @@ class TextOnImgRow:
 
 
 @dataclass
-class ImageResizeRow:
+class ImageResizeRow(_MarketRow):
     """``image_resize`` tab input row — one IMAGE (not video): the operator's
     Manual Image reframed to the target aspect ratio by Nano Banana 2, which
     extends the background/design naturally and re-renders any baked-in text so
@@ -200,7 +235,7 @@ class ImageResizeRow:
 
 
 @dataclass
-class CartoonRow:
+class CartoonRow(_MarketRow):
     """Cartoon tab input row — animated, multi-shot videos generated from text.
 
     Same input columns as Image-VO (the "Manual Image" column is present in the
@@ -232,7 +267,7 @@ class CartoonRow:
 
 
 @dataclass
-class YtCartoonRow:
+class YtCartoonRow(_MarketRow):
     """yt-cartoon tab input row — engaging, variable-length cartoon videos.
 
     A variable-geometry sibling of :class:`CartoonRow` (the flat-8s ``cartoon``
@@ -277,7 +312,7 @@ class YtCartoonRow:
 
 
 @dataclass
-class SimpleMotionRow:
+class SimpleMotionRow(_MarketRow):
     """simple-motion tab input row — animate super-realistic images.
 
     A sibling of :class:`CartoonRow` (same article-driven planner / TTS-sizing /
@@ -313,7 +348,7 @@ class SimpleMotionRow:
 
 
 @dataclass
-class GoogleSimpleMotionRow:
+class GoogleSimpleMotionRow(_MarketRow):
     """google-simple-motion tab input row — N size-variant fixed-script motion ads.
 
     A sibling of :class:`SimpleMotionRow`. Instead of an article-driven voiceover,
@@ -352,7 +387,7 @@ class GoogleSimpleMotionRow:
 
 
 @dataclass
-class FastFuriousRow:
+class FastFuriousRow(_MarketRow):
     """fast-and-furious tab input row — N TikTok/Gen-Z variations per row.
 
     Same columns and N-video / per-slot-aspect layout as
@@ -386,7 +421,7 @@ class FastFuriousRow:
 
 
 @dataclass
-class MotionAdsRow:
+class MotionAdsRow(_MarketRow):
     """Motion_Ads tab input row — a silent motion-ad video + ad copy.
 
     Produces ONE 12-second SILENT video (no voiceover, no CTA, no captions, no
@@ -415,7 +450,7 @@ class MotionAdsRow:
 
 
 @dataclass
-class HookCardRow:
+class HookCardRow(_MarketRow):
     """Hook_Card tab input row — a 9:16 slideshow with a fixed lower-third hook
     box + background music (no voiceover).
 
@@ -453,7 +488,7 @@ class HookCardRow:
 
 
 @dataclass
-class FourImagesVO2Row:
+class FourImagesVO2Row(_MarketRow):
     """4Images-VO2 tab input row (plan §15 Appendix A)."""
 
     row_num: int

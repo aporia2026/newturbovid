@@ -63,8 +63,25 @@ def test_parse_locale_empty_url() -> None:
 # ── expected_language (Country first, then URL locale) ───────────────────────
 
 
-def test_expected_country_wins() -> None:
-    assert expected_language(_MX_URL, "MX") == ("es", "country")
+def test_expected_agreeing_country_and_locale_credit_the_locale() -> None:
+    """Country MX and ``locale=es_MX`` agree, so both give Spanish. The locale
+    is credited: it states the language outright, where the country map only
+    infers one. (Was ``("es", "country")`` before the 2026-08-17 locale-region
+    work — same verdict, more specific signal.)"""
+    assert expected_language(_MX_URL, "MX") == ("es", "locale")
+
+
+def test_expected_country_wins_when_it_names_a_different_market() -> None:
+    """A stale/copied-in US URL on a deliberately-set MX row: the operator's
+    Country column is the campaign choice and overrides the URL."""
+    assert expected_language("https://x.com/a?locale=en_US", "MX") == ("es", "country")
+
+
+def test_expected_locale_language_survives_a_derived_country() -> None:
+    """``en_FI`` is an English campaign aimed at Finland. The country map would
+    call FI Finnish, which must not override the locale's own language half —
+    otherwise filling a blank Country column from the region flips the VO."""
+    assert expected_language("https://x.com/a?locale=en_FI", "FI") == ("en", "locale")
 
 
 def test_expected_country_case_insensitive() -> None:
