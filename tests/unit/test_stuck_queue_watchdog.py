@@ -11,7 +11,7 @@ Covers the pieces that automate the manual "restart the Space":
   * ``_watch`` does NOT exit before the threshold, when rows are in flight with a
     live heartbeat, when the queue is empty, when the probe fails, when a stuck
     blip recovers, when no heartbeat row exists, or before the uptime gate.
-  * The lease sweep runs on its own cadence and never sinks the loop.
+  * The self-repair pass runs on its own cadence and never sinks the loop.
   * Every exit path captures forensics first.
   * ``start_stuck_queue_watchdog`` is idempotent, honours the env kill switch,
     and no-ops without a ``sync_url`` (local sqlite backend).
@@ -30,6 +30,7 @@ import pytest
 
 from bulkvid.orchestrator import stuck_queue_watchdog as swd
 from bulkvid.orchestrator.queue import WorkerHeartbeat
+from bulkvid.orchestrator.repair import RepairReport
 
 # Wall-clock origin for the fake clocks. ``time.time`` and ``time.monotonic``
 # advance together so a heartbeat epoch can be expressed as "now minus N".
@@ -72,7 +73,7 @@ def _drive(
     interval=30.0,
     max_ticks=40,
     heartbeat_stale=1e9,
-    sweep_interval=1e9,
+    repair_interval=1e9,
 ):
     """Patch the watchdog's clocks + probe and return (state, exit_mock).
 
@@ -83,9 +84,9 @@ def _drive(
     ``sleep`` advances both fake clocks by ``interval`` per tick and stops the
     loop after ``max_ticks`` so a logic bug fails loudly instead of hanging.
 
-    ``heartbeat_stale`` and ``sweep_interval`` default to effectively-infinite so
+    ``heartbeat_stale`` and ``repair_interval`` default to effectively-infinite so
     each test opts in to exactly the condition it is exercising."""
-    state = {"t": _T0, "n": 0, "sweeps": 0}
+    state = {"t": _T0, "n": 0, "repairs": 0}
 
     def _fake_sleep(_seconds: float) -> None:
         state["n"] += 1
@@ -93,19 +94,22 @@ def _drive(
         if state["n"] > max_ticks:
             raise _Stop
 
-    def _fake_sweep(*_a, **_k) -> int:
-        state["sweeps"] += 1
-        return 0
+    def _fake_repair(*_a, **_k) -> RepairReport:
+        state["repairs"] += 1
+        return RepairReport(
+            source="auto", actor="test", scope="", actions=[], lines=[],
+            elapsed_ms=0,
+        )
 
     monkeypatch.setattr(swd, "_STUCK_SECONDS", threshold)
     monkeypatch.setattr(swd, "_HEARTBEAT_STALE_SECONDS", heartbeat_stale)
-    monkeypatch.setattr(swd, "_SWEEP_INTERVAL_SECONDS", sweep_interval)
+    monkeypatch.setattr(swd, "_REPAIR_INTERVAL_SECONDS", repair_interval)
     monkeypatch.setattr(swd, "_CHECK_INTERVAL_SECONDS", interval)
     monkeypatch.setattr(swd.time, "sleep", _fake_sleep)
     monkeypatch.setattr(swd.time, "monotonic", lambda: state["t"])
     monkeypatch.setattr(swd.time, "time", lambda: state["t"])
     monkeypatch.setattr(swd, "_probe_time_boxed", lambda *a, **k: probe(state["t"]))
-    monkeypatch.setattr(swd, "_sweep_time_boxed", _fake_sweep)
+    monkeypatch.setattr(swd, "_repair_time_boxed", _fake_repair)
     # Forensics hits the DB and stderr; every _watch test wants the exit
     # decision, not the autopsy plumbing (which has its own tests below).
     monkeypatch.setattr(swd, "_write_forensics", lambda *a, **k: None)
@@ -334,34 +338,36 @@ def test_watch_resets_streak_on_probe_error(monkeypatch):
     exit_mock.assert_not_called()
 
 
-# ── _watch: lease sweep ──────────────────────────────────────────────────────
+# ── _watch: self-repair pass ─────────────────────────────────────────────────
 
 
-def test_watch_sweeps_on_its_own_cadence(monkeypatch):
-    # Sweep every 60s with 30s polls => one sweep every other tick, independent
-    # of any restart decision. 6 ticks (180s) => 3 sweeps.
+def test_watch_repairs_on_its_own_cadence(monkeypatch):
+    # Repair every 60s with 30s polls => one pass every other tick, independent
+    # of any restart decision. 6 ticks (180s) => 3 passes.
     state, exit_mock = _drive(
         monkeypatch, probe=lambda now: _probe(0, 0, now=now),
-        threshold=1e9, sweep_interval=60.0, interval=30.0, max_ticks=6,
+        threshold=1e9, repair_interval=60.0, interval=30.0, max_ticks=6,
     )
     with pytest.raises(_Stop):
         swd._watch("p", "url", "tok", 1.0)
-    assert state["sweeps"] == 3
+    assert state["repairs"] == 3
     exit_mock.assert_not_called()
 
 
-def test_watch_survives_sweep_failure(monkeypatch):
-    # The janitor is best-effort: a failing sweep must not sink the loop or
-    # block the restart conditions that follow it.
+def test_watch_survives_repair_failure(monkeypatch):
+    # The janitor is best-effort: a failing repair pass must not sink the loop or
+    # block the restart conditions that follow it. This matters more than it
+    # looks — the loop is also the only thing that can restart a wedged worker,
+    # so a repair bug must never cost us the restart net.
     state, exit_mock = _drive(
         monkeypatch, probe=lambda now: _probe(5, 0, now=now),
-        threshold=100.0, sweep_interval=30.0, interval=30.0,
+        threshold=100.0, repair_interval=30.0, interval=30.0,
     )
 
-    def _boom_sweep(*_a, **_k):
-        raise RuntimeError("sweep failed")
+    def _boom_repair(*_a, **_k):
+        raise RuntimeError("repair failed")
 
-    monkeypatch.setattr(swd, "_sweep_time_boxed", _boom_sweep)
+    monkeypatch.setattr(swd, "_repair_time_boxed", _boom_repair)
     swd._watch("p", "url", "tok", 1.0)
     exit_mock.assert_called_once()    # condition 2 still fired
     assert state["n"] == 5

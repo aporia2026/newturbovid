@@ -105,6 +105,34 @@
     .summary-line { font-size: 12px; color: var(--c-muted); margin: 2px 0 8px 0; }
     .reconnect { color: var(--c-amber); }
 
+    /* Self-repair panel (plan 2026-08-17). The operator sees ONE plain
+       sentence; the per-action detail hides behind a Details expander so the
+       primary result stays readable by someone who does not know what
+       "finalize" means. Hidden until a repair actually runs. */
+    .fix-panel {
+      display: none;
+      margin: 8px 0 0 0; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid var(--c-green-soft); background: var(--c-green-soft);
+      font-size: 12px; line-height: 1.45;
+    }
+    .fix-panel.quiet { border-color: var(--c-border-soft); background: var(--c-bg-alt); }
+    .fix-panel.bad   { border-color: var(--c-red-soft);    background: var(--c-red-soft); }
+    .fix-panel pre {
+      margin: 6px 0 0 0; padding: 6px; background: var(--c-bg);
+      border: 1px solid var(--c-border-soft); border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; white-space: pre-wrap; word-break: break-word;
+      max-height: 200px; overflow: auto;
+    }
+    .heal-run {
+      border-top: 1px solid var(--c-border-soft); padding: 6px 0;
+      font-size: 11px;
+    }
+    .heal-run:first-child { border-top: 0; }
+    .heal-when { color: var(--c-subtle); }
+    .heal-auto { color: var(--c-green); font-weight: 600; }
+    .heal-manual { color: var(--c-blue); font-weight: 600; }
+
     /* Queue-status banner (chat 2026-06-09). Row-level snapshot of
        in-flight vs queued vs ETA so the bulk team can see "20 / 20 in
        flight · 480 queued · ETA ~50 min" at a glance instead of asking
@@ -311,9 +339,31 @@
     <div id="archive"><div class="empty">Loading…</div></div>
   </details>
 
-  <div style="margin-top: 12px;">
+  <!-- Recovery controls, ordered by how much they disturb: check, then fix
+       state, then restart the machine. A lazy user should be able to work down
+       the list without reading anything. -->
+  <div style="margin-top: 12px; display:flex; gap:6px; flex-wrap:wrap;">
     <button onclick="refresh()">Refresh now</button>
+    <button id="fix-btn" onclick="fixStuckJobs()">Fix stuck jobs</button>
     <button class="danger" onclick="clearQueue()">Stop all jobs</button>
+  </div>
+  <div class="fix-panel" id="fix-panel"></div>
+
+  <details id="heal-wrap" ontoggle="onHealToggle()">
+    <summary>Self-heal log</summary>
+    <div class="small">
+      Problems the backend found and fixed on its own, newest first. Worth a
+      look after a few days away.
+    </div>
+    <div id="heal-log"><div class="empty">Loading…</div></div>
+  </details>
+
+  <div style="margin-top: 12px; display:flex; gap:6px; flex-wrap:wrap;">
+    <button class="ghost" onclick="restartWorkerClick()">Restart the worker</button>
+  </div>
+  <div class="small">
+    Last resort: restarts the machine that makes the videos. Queued rows resume
+    on their own. Takes about a minute.
   </div>
 
   <script>
@@ -882,12 +932,134 @@
         .killAllJobs();
     }
 
+    // ── Self-repair + worker restart (plan 2026-08-17) ──────────────────────
+
+    function _fixPanel(cls, html) {
+      var el = document.getElementById('fix-panel');
+      if (!el) return;
+      el.className = 'fix-panel' + (cls ? ' ' + cls : '');
+      el.innerHTML = html;
+      el.style.display = 'block';
+    }
+
+    /* Runs the backend's repair pass now instead of waiting for the automatic
+       one. Deliberately NOT behind a confirm dialog: every action is idempotent
+       and none can destroy work, so the cost of a stray click is zero and a
+       prompt would only teach the operator to hesitate. */
+    function fixStuckJobs() {
+      var btn = document.getElementById('fix-btn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+      _fixPanel('quiet', 'Checking for stuck jobs…');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (btn) { btn.disabled = false; btn.textContent = 'Fix stuck jobs'; }
+          if (!(r && r.ok)) {
+            _fixPanel('bad',
+              '<strong>Could not run the fix.</strong><br>' +
+              _escape(String((r && r.error) || 'unknown error')));
+            return;
+          }
+          var detail = (r.log || []).join('\n');
+          _fixPanel(r.changed ? '' : 'quiet',
+            '<strong>' + _escape(String(r.summary || '')) + '</strong>' +
+            (detail
+              ? '<details><summary>Details</summary><pre>' +
+                _escape(detail) + '</pre></details>'
+              : ''));
+          refresh();
+        })
+        .withFailureHandler(function (e) {
+          if (btn) { btn.disabled = false; btn.textContent = 'Fix stuck jobs'; }
+          _fixPanel('bad',
+            '<strong>Could not run the fix.</strong><br>' +
+            _escape(String((e && e.message) || e)));
+        })
+        .repairJobs();
+    }
+
+    /* Loaded on demand, not on the poll cycle — it is a look-back view, and
+       polling it every few seconds would spend a request per cycle on data that
+       changes a few times a day. */
+    function onHealToggle() {
+      var wrap = document.getElementById('heal-wrap');
+      if (!wrap || !wrap.open) return;
+      google.script.run
+        .withSuccessHandler(function (r) {
+          var el = document.getElementById('heal-log');
+          if (!el) return;
+          if (!(r && r.ok)) {
+            el.innerHTML = '<div class="empty">Could not load the log: ' +
+              _escape(String((r && r.error) || 'unknown')) + '</div>';
+            return;
+          }
+          var runs = r.runs || [];
+          if (!runs.length) {
+            el.innerHTML = '<div class="empty">Nothing has needed fixing.</div>';
+            return;
+          }
+          el.innerHTML = runs.map(_healRow).join('');
+        })
+        .withFailureHandler(function () {
+          var el = document.getElementById('heal-log');
+          if (el) el.innerHTML = '<div class="empty">Could not load the log.</div>';
+        })
+        .getRepairLog();
+    }
+
+    function _healRow(run) {
+      var when = String(run.ts || '').replace('T', ' ').substring(0, 16);
+      var isAuto = run.source === 'auto';
+      return '' +
+        '<div class="heal-run">' +
+          '<span class="' + (isAuto ? 'heal-auto' : 'heal-manual') + '">' +
+            (isAuto ? 'Fixed automatically' : 'Fixed by you') + '</span>' +
+          ' <span class="heal-when">' + _escape(when) + '</span>' +
+          '<details><summary>' + (run.changed || 0) + ' item(s)</summary>' +
+            '<pre>' + _escape(String(run.log || '')) + '</pre></details>' +
+        '</div>';
+    }
+
+    /* The one control that DOES get a confirm: it interrupts work in flight and
+       costs a minute of downtime, so an accidental click is expensive. */
+    function restartWorkerClick() {
+      if (!confirm(
+        'Restart the machine that makes the videos?\n\n' +
+        'Rows in progress are picked up again automatically, so nothing is ' +
+        'lost. It takes about a minute to come back.\n\n' +
+        'Try "Fix stuck jobs" first if you have not.'
+      )) return;
+      _fixPanel('quiet', 'Sending the restart…');
+      google.script.run
+        .withSuccessHandler(function (r) {
+          if (!(r && r.ok)) {
+            _fixPanel(r && r.cooldown ? 'quiet' : 'bad',
+              '<strong>' +
+              (r && r.cooldown ? 'Already restarting.' : 'Could not restart.') +
+              '</strong><br>' +
+              _escape(String((r && r.error) || 'unknown error')));
+            return;
+          }
+          _fixPanel('',
+            '<strong>Restart sent.</strong><br>Give it about a minute, then ' +
+            'hit Refresh. Queued rows resume on their own.');
+        })
+        .withFailureHandler(function (e) {
+          _fixPanel('bad',
+            '<strong>Could not restart.</strong><br>' +
+            _escape(String((e && e.message) || e)));
+        })
+        .restartWorker();
+    }
+
     // Exposed for inline onclick handlers.
     window.refresh = refresh;
     window.killJob = killJob;
     window.toggleLog = toggleLog;
     window.loadLogFor = loadLogFor;
     window.clearQueue = clearQueue;
+    window.fixStuckJobs = fixStuckJobs;
+    window.onHealToggle = onHealToggle;
+    window.restartWorkerClick = restartWorkerClick;
 
     refresh();
   </script>

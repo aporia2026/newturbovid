@@ -31,10 +31,14 @@ worker; the web process stays up) on either of two independent conditions:
 
 Two non-restarting duties round it out:
 
-  * a **lease sweep** returns PROCESSING rows stranded past
-    ``_SWEEP_AFTER_SECONDS`` back to PENDING (the strand that
+  * a **self-repair pass** (``repair.run_repairs``) corrects the stable wrong
+    states that used to need a human: it returns PROCESSING rows stranded past
+    ``repair.STRANDED_ROW_AFTER_SECONDS`` back to PENDING (the strand that
     ``runner_pending_record_giveup`` leaves behind would otherwise hold
-    ``processing > 0`` forever and silently disarm condition 2), and
+    ``processing > 0`` forever and silently disarm condition 2), finalizes jobs
+    whose every row has finished, promotes jobs whose rows have started, clears
+    rows orphaned under a dead parent, and recomputes progress counters that
+    drifted; and
   * **forensics**: every exit path dumps all thread stacks to stderr AND to the
     DB first, because the restart destroys the only process that knows why it
     wedged and HF retains no logs from before it.
@@ -58,7 +62,6 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -66,14 +69,24 @@ from bulkvid.logging import get_logger
 from bulkvid.orchestrator import db as _db
 from bulkvid.orchestrator import forensics
 from bulkvid.orchestrator.queue import (
+    REPAIR_SOURCE_AUTO,
     WorkerHeartbeat,
     count_active_queue,
     read_worker_heartbeat,
     record_wedge_forensics,
-    sweep_expired_processing_rows,
+)
+from bulkvid.orchestrator.repair import (
+    STRANDED_ROW_AFTER_SECONDS,
+    RepairReport,
+    run_repairs,
 )
 
 _log = get_logger("stuck queue watchdog")
+
+# Recorded as the ``actor`` on every automatic ``repair_audit`` row, so the
+# sidebar's self-heal pane can say "fixed automatically" rather than naming a
+# person who was not involved.
+_REPAIR_ACTOR = "worker-watchdog"
 
 
 def _enabled() -> bool:
@@ -123,18 +136,25 @@ _CHECK_INTERVAL_SECONDS = _positive_float(
 _PROBE_TIMEOUT_SECONDS = _positive_float(
     "BULKVID_STUCK_QUEUE_WATCHDOG_PROBE_TIMEOUT_SECONDS", 15.0
 )
-# Lease-sweep cadence, and the age past which a PROCESSING row is presumed
-# stranded rather than working. One hour is deliberately generous: it must clear
-# the LONGEST per-row budget (30 min for the heaviest tabs) with room for an
-# admin-raised timeout, because this thread reads the jobs DB and cannot see the
-# settings store where those overrides live. The sweep is the slow janitor for
-# strands; the heartbeat condition above is the fast net for real wedges. Raise
-# this if a per-tab row timeout is ever pushed past ~50 minutes.
-_SWEEP_INTERVAL_SECONDS = _positive_float(
+# Repair-pass cadence. This used to pace a standalone lease sweep; the sweep is
+# now ONE ACTION inside ``repair.run_repairs``, which also finalizes settled
+# jobs, promotes started ones, clears orphan rows and resyncs progress counters
+# (Plan ``_plans/2026-08-17-stuck-jobs-selfheal-and-restart.md``). Same env var,
+# same 5-minute default: one janitor on one clock beats two on two. The repair
+# pass is the slow janitor for stable wrong states; the heartbeat condition above
+# is the fast net for real wedges.
+#
+# The stranded-row age lives in ``repair.STRANDED_ROW_AFTER_SECONDS`` (still read
+# from ``BULKVID_STUCK_ROW_SWEEP_AFTER_SECONDS``) so the pass and its one
+# money-costing action are configured in the same place.
+_REPAIR_INTERVAL_SECONDS = _positive_float(
     "BULKVID_STUCK_QUEUE_WATCHDOG_SWEEP_INTERVAL_SECONDS", 300.0
 )
-_SWEEP_AFTER_SECONDS = _positive_float(
-    "BULKVID_STUCK_ROW_SWEEP_AFTER_SECONDS", 3600.0
+# Wall-clock budget for one repair pass. Looser than the probe's because the pass
+# issues a handful of statements rather than one, and unlike the probe its result
+# feeds no restart decision — a pass that times out just runs again next tick.
+_REPAIR_TIMEOUT_SECONDS = _positive_float(
+    "BULKVID_REPAIR_TIMEOUT_SECONDS", 60.0
 )
 # Budget for persisting the pre-exit autopsy. Short: the restart is the priority
 # and the stderr dump has already landed by this point.
@@ -214,20 +234,30 @@ def _probe_active_queue(
             conn.close()
 
 
-def _sweep_stale_processing(
+def _repair_pass(
     db_path: Path | str,
     sync_url: str,
     auth_token: str,
     sync_interval_seconds: float,
-) -> int:
-    """Release PROCESSING rows stranded past ``_SWEEP_AFTER_SECONDS``, on a
-    fresh connection. Returns how many were released."""
-    cutoff_iso = (
-        datetime.now(UTC) - timedelta(seconds=_SWEEP_AFTER_SECONDS)
-    ).isoformat(timespec="seconds")
+) -> RepairReport:
+    """Run the full self-repair pass on a FRESH connection.
+
+    This thread is the right home for it, and the only good one. It already holds
+    the two properties the pass needs — its own short-lived connection (so it
+    reads ground truth rather than the worker's possibly-stale view) and complete
+    isolation from the shared DB pool (so it cannot wedge along with it) — and it
+    is already the thread that runs unattended while nobody is watching, which is
+    exactly when these states need fixing. Adding a second timer thread, or
+    putting writes on the web app's read path, would buy nothing and cost
+    supervision surface.
+
+    Fleet-wide (``user_email=None``): the worker serves every user, and a repair
+    scoped to one of them would leave the rest stranded."""
     conn = _fresh_connection(db_path, sync_url, auth_token, sync_interval_seconds)
     try:
-        return sweep_expired_processing_rows(conn, cutoff_iso=cutoff_iso)
+        return run_repairs(
+            conn, source=REPAIR_SOURCE_AUTO, actor=_REPAIR_ACTOR, user_email=None
+        )
     finally:
         with suppress(Exception):
             conn.close()
@@ -306,20 +336,23 @@ def _probe_time_boxed(
     )
 
 
-def _sweep_time_boxed(
+def _repair_time_boxed(
     db_path: Path | str,
     sync_url: str,
     auth_token: str,
     sync_interval_seconds: float,
-) -> int:
-    """``_sweep_stale_processing`` under ``_PROBE_TIMEOUT_SECONDS`` (same shape
-    of single-statement remote call, so the same budget applies)."""
+) -> RepairReport:
+    """``_repair_pass`` under ``_REPAIR_TIMEOUT_SECONDS``.
+
+    Gets a looser budget than the probe because the pass is a handful of
+    statements rather than one, and unlike the probe its result feeds no restart
+    decision — a pass that times out simply retries on the next tick."""
     return _run_time_boxed(
-        "sweep",
-        lambda: _sweep_stale_processing(
+        "repair",
+        lambda: _repair_pass(
             db_path, sync_url, auth_token, sync_interval_seconds
         ),
-        _PROBE_TIMEOUT_SECONDS,
+        _REPAIR_TIMEOUT_SECONDS,
     )
 
 
@@ -373,8 +406,8 @@ def _watch(
     auth_token: str,
     sync_interval_seconds: float,
 ) -> None:
-    """Daemon-thread loop: sweep strands, probe ground truth, restart a worker
-    that is provably not doing its job.
+    """Daemon-thread loop: run the repair pass, probe ground truth, restart a
+    worker that is provably not doing its job.
 
     ``stuck_since`` is the monotonic time the CURRENT uninterrupted idle-stuck
     streak began, or ``None`` when the last poll was not-stuck (or could not be
@@ -382,35 +415,37 @@ def _watch(
     CONTINUOUS stretch past ``_STUCK_SECONDS`` fires."""
     stuck_since: float | None = None
     started_monotonic = time.monotonic()
-    last_sweep_monotonic = time.monotonic()
+    last_repair_monotonic = time.monotonic()
     warned_missing_heartbeat = False
 
     while True:
         time.sleep(_CHECK_INTERVAL_SECONDS)
 
-        # ── Janitor: release stranded PROCESSING rows ───────────────────────
-        # Runs BEFORE the probe so the counts below reflect post-sweep truth,
-        # and on its own cadence so it is independent of any restart decision.
-        if time.monotonic() - last_sweep_monotonic >= _SWEEP_INTERVAL_SECONDS:
-            last_sweep_monotonic = time.monotonic()
+        # ── Janitor: the self-repair pass ───────────────────────────────────
+        # Runs BEFORE the probe so the counts below reflect post-repair truth
+        # (releasing a stranded row turns ``processing`` into ``pending``, which
+        # is exactly the distinction the restart conditions weigh), and on its own
+        # cadence so it is independent of any restart decision.
+        if time.monotonic() - last_repair_monotonic >= _REPAIR_INTERVAL_SECONDS:
+            last_repair_monotonic = time.monotonic()
             try:
-                released = _sweep_time_boxed(
+                report = _repair_time_boxed(
                     db_path, sync_url, auth_token, sync_interval_seconds
                 )
-                if released:
+                if report.changed:
                     _log.warning(
-                        "stale_processing_rows_swept",
-                        released=released,
-                        stranded_after_s=_SWEEP_AFTER_SECONDS,
+                        "auto_repair_applied",
+                        changed=report.changed,
+                        elapsed_ms=report.elapsed_ms,
+                        detail=" | ".join(report.lines)[:1000],
                         note=(
-                            "rows sat in PROCESSING with nothing working on "
-                            "them; returned to PENDING for a clean re-claim"
+                            "states that used to need a human were corrected "
+                            "automatically; see repair_audit / the sidebar's "
+                            "self-heal pane"
                         ),
                     )
             except Exception as e:    # noqa: BLE001 — janitor must not sink the loop
-                _log.warning(
-                    "stale_processing_sweep_failed", error=str(e)[:200]
-                )
+                _log.warning("auto_repair_failed", error=str(e)[:200])
 
         try:
             probe = _probe_time_boxed(
@@ -574,7 +609,7 @@ def start_stuck_queue_watchdog(
         heartbeat_stale_seconds=_HEARTBEAT_STALE_SECONDS,
         check_interval_seconds=_CHECK_INTERVAL_SECONDS,
         probe_timeout_seconds=_PROBE_TIMEOUT_SECONDS,
-        sweep_interval_seconds=_SWEEP_INTERVAL_SECONDS,
-        sweep_after_seconds=_SWEEP_AFTER_SECONDS,
+        repair_interval_seconds=_REPAIR_INTERVAL_SECONDS,
+        stranded_row_after_seconds=STRANDED_ROW_AFTER_SECONDS,
     )
     return True
