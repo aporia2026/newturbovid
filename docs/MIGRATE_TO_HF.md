@@ -88,6 +88,26 @@ The tokens are long JWT strings.
 
 ## 3 — Add Space Secrets (~15 min)
 
+> **Never copy `.env` wholesale into a Space.** A Space secret **overrides the
+> Dockerfile's `ENV`**, so three local-dev values in `.env` will break the
+> deploy if they come along for the ride:
+>
+> | Do NOT set as a Space secret | local value | what it does to the Space |
+> |---|---|---|
+> | `BULKVID_PORT` | `8788` | uvicorn binds the dev port while HuggingFace probes 7860 (`EXPOSE 7860`, `app_port: 7860`). The Space builds fine and then sits in **APP_STARTING forever** with no error anywhere. |
+> | `BULKVID_HOST` | `127.0.0.1` | inert today (supervisord hardcodes `--host 0.0.0.0`) but one edit away from binding loopback-only |
+> | `BULKVID_DATA_DIR` | `./data` | overrides the container's `/tmp/data` with a relative path |
+>
+> Also never set `BULKVID_DEV_AUTH_BYPASS_EMAIL`. It is present in local `.env`
+> because dev needs it, and it makes **every** `/jobs` route accept requests with
+> no bearer token at all, as that email. On a public Space that is a complete
+> authentication bypass. Verify after deploying: `curl <space>/jobs` must return
+> 401, not a job list.
+>
+> Copy only what the tables below list. Everything else has a working default in
+> `config.py` (`GCS_BUCKET_NAME`, `AWS_BUCKET_NAME`, `AWS_REGION`,
+> `VERTEX_AI_LOCATION` all resolve without being set).
+
 In the new Space: **Settings → Variables and secrets → New secret**.
 
 Add each of the following. The first two blocks are the new Turso vars
@@ -191,6 +211,45 @@ git remote add hf https://huggingface.co/spaces/<owner>/aporia-bulkvid
 # Every deploy:
 git push hf main
 ```
+
+**If `git push` fails on LFS** with `(missing) apps_script/template_previews/…`,
+some historical LFS objects are not in your local cache, and a full-history push
+needs every one of them. Push a single-commit snapshot of the current tree
+instead — it only needs the objects the current tree references, and it never
+touches your working tree:
+
+```bash
+SNAP=$(git commit-tree main^{tree} \
+  -m "deploy: aporia-bulkvid backend (single-commit snapshot of $(git rev-parse --short main))")
+git push <remote> "$SNAP:refs/heads/main" --force
+```
+
+This is how `hf2` and `hf3` are deployed. `hf` still carries full history.
+
+### Multiple Spaces, one repo
+
+One sheet per Space, and **each Space needs its OWN Turso database pair.** They
+cannot share one:
+
+* `_recover_orphaned_rows_sync` resets **every** `processing` row on worker boot,
+  with no scoping — so any Space restarting would knock the others' in-flight
+  rows back to `pending` and re-render them, paying twice.
+* `worker_heartbeat` is a single row (`id=1`), so two workers overwrite each
+  other's liveness and the restart watchdog cannot tell which one is alive.
+* `count_active_queue` is global, so each Space's watchdog would restart itself
+  over another Space's backlog.
+
+Current deploys:
+
+| remote | Space | sheet | visibility |
+|---|---|---|---|
+| `hf` | `yoavaporia/aporia-bulkvid` | Bulk Videos | public |
+| `hf2` | `yoavaporia/aporia-bulkvid2` | Bulk Videos 2 | private |
+| `hf3` | `yoavaporia/aporia-bulkvid3` | Bulk Videos 3 | public |
+
+Prefer **public**: every `/jobs` route is Google-OAuth + allowlist gated, and a
+private Space's `*.hf.space` URL demands HuggingFace credentials at the edge,
+which Apps Script cannot supply (it sends a Google identity token, not an HF one).
 
 HF immediately starts building the Docker image — watch progress in the
 Space's **Logs** tab.
