@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from bulkvid.pipeline.market import effective_country
+from bulkvid.pipeline.urls import normalize_url
 
 # Status codes — one per failure mode the orchestrator can return.
 STATUS_SUCCESS = "SUCCESS"
@@ -36,7 +37,14 @@ STATUS_KILLED_BY_USER = "KILLED_BY_USER"
 
 
 class _MarketRow:
-    """Fills a blank ``country`` from the article URL's ``locale=`` region.
+    """Normalizes a row's article URL, and fills a blank ``country`` from it.
+
+    The URL is scheme-corrected first (``www.x.com/p`` -> ``https://www.x.com/p``).
+    A pasted cell routinely has no scheme because browsers add it silently, and
+    ``ArticleFetcher.fetch`` rejected those outright — chat 2026-08-17, a whole
+    batch failed with ``Invalid URL: 'www.drexur.com/dsr?q=...'`` and produced
+    no video at all. Doing it here means the stored payload, the logs and every
+    consumer see the same corrected URL, not just the fetcher.
 
     A row pasted as ``...?q=seized%20cars%20ireland&locale=en_IE`` with the
     Country column left empty is still an Irish row, but nothing downstream
@@ -62,6 +70,7 @@ class _MarketRow:
     country: str
 
     def __post_init__(self) -> None:
+        self.article_url = normalize_url(self.article_url)
         self.country = effective_country(self.article_url, self.country)
 
 

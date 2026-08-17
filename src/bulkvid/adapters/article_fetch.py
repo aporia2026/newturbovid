@@ -31,6 +31,7 @@ import httpx
 
 from bulkvid.config import Settings, get_settings
 from bulkvid.logging import get_logger
+from bulkvid.pipeline.urls import normalize_url
 
 _log = get_logger("article")
 
@@ -210,7 +211,14 @@ class ArticleFetcher:
     # ── Public entrypoint ───────────────────────────────────────────────
 
     async def fetch(self, url: str) -> ArticleResult:
-        """Fetch full article content. ScrapingBee first, direct-HTTP fallback."""
+        """Fetch full article content. ScrapingBee first, direct-HTTP fallback.
+
+        A scheme-less but otherwise valid URL (``www.example.com/p``) is
+        normalized rather than rejected — sheet cells are pasted by hand and a
+        browser fills the scheme in silently, so the cell looks correct to the
+        operator. Free text still fails here, with the value in the message.
+        """
+        url = normalize_url(url)
         if not url or not url.startswith(("http://", "https://")):
             raise ArticleFetchError(f"Invalid URL: {url!r}")
 
