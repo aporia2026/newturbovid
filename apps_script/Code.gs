@@ -307,6 +307,8 @@ function onOpen() {
     .addItem('Active models & sizes…', 'showActiveModels')
     .addItem('Pick avatar for current row…', 'pickAvatarForCurrentRow')
     .addSeparator()
+    .addItem('Restart the video worker', 'restartWorkerFromMenu')
+    .addSeparator()
     .addItem('Migrate simple x4 columns…', 'migrateSimpleX4Columns')
     .addItem('Update size dropdowns on all tabs', 'applySizeDropdowns')
     .addItem('Apply yt-cartoon dropdowns', 'applyYtCartoonDropdowns')
@@ -315,6 +317,7 @@ function onOpen() {
     .addItem('Preview Hook_Card music…', 'showHookCardMusicPreview')
     .addItem('Add "use this script" tips', 'applyOpenCommentsTips')
     .addItem('Configure backend URL', 'configureBackendUrl')
+    .addItem('Configure worker restart', 'configureWorkerRestart')
     .addToUi();
 }
 
@@ -2443,6 +2446,277 @@ function killAllJobs() {
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   }
+}
+
+
+// ─── Self-repair ─────────────────────────────────────────────────────────────
+//
+// One button that fixes the stuck states that used to need an engineer, plus the
+// log of everything the backend's automatic pass fixed on its own. Same code
+// path either way — the button only changes WHEN it runs, never WHAT it does.
+// Plan _plans/2026-08-17-stuck-jobs-selfheal-and-restart.md.
+
+/** Called from Sidebar.html: run the repair pass now.
+ *  Returns { ok, changed, summary, log } — ``summary`` is one plain sentence to
+ *  show immediately, ``log`` is the per-action detail for the Details pane.
+ *  Not retried: the pass is idempotent, so a retry would be harmless, but a
+ *  second 20 s wait on a slow backend just looks like a broken button. The
+ *  automatic pass picks up anything this misses within a few minutes. */
+function repairJobs() {
+  try {
+    const r = _fetchJson('/jobs/repair', { method: 'post' }, { maxAttempts: 1 });
+    return {
+      ok: true,
+      changed: (r && r.changed) || 0,
+      summary: (r && r.summary) || 'Nothing needed fixing.',
+      log: (r && r.log) || [],
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+
+/** Called from Sidebar.html: recent repair passes, newest first.
+ *  Returns { ok, runs: [{ ts, source, actor, changed, log }] }. An older backend
+ *  without this route 404s, which surfaces as ok:false and a one-line note in
+ *  the pane rather than an exception. */
+function getRepairLog() {
+  try {
+    const r = _fetchJson('/jobs/repair-log?limit=20', { method: 'get' });
+    return { ok: true, runs: (r && r.runs) || [] };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e), runs: [] };
+  }
+}
+
+
+// ─── Restart the worker on HuggingFace ───────────────────────────────────────
+//
+// Calls the HuggingFace Spaces API DIRECTLY, not through our own backend. That
+// is the whole point: the moment you most need this button is the moment our
+// backend is the thing that stopped answering, and an endpoint hosted inside the
+// wedged container cannot restart it.
+//
+// Verified 2026-08-17 against huggingface_hub's own client (hf_api.py,
+// restart_space / get_space_runtime):
+//   POST https://huggingface.co/api/spaces/<owner>/<space>/restart   (?factory=true)
+//   GET  https://huggingface.co/api/spaces/<owner>/<space>/runtime
+// both with an ``Authorization: Bearer <token>`` header.
+//
+// The token belongs in a FINE-GRAINED HuggingFace token with write access to
+// that ONE Space and nothing else. Script Properties are readable by anyone who
+// can open this script, which for a bound script means sheet editors — so the
+// blast radius of a leak has to be "can restart a Space they can already reach",
+// not "can touch the account". See apps_script/README.md.
+
+const HF_API_BASE = 'https://huggingface.co/api/spaces/';
+
+// Minimum gap between restarts. A restart takes ~30-60 s to come back; without a
+// floor, an impatient double-click restarts a Space that was already restarting
+// and makes the outage longer. Deliberately client-side and forgiving — it is a
+// guard against mashing, not a security control.
+const RESTART_COOLDOWN_MS = 60 * 1000;
+
+
+function _getHfRestartConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const spaceId = (props.getProperty('HF_SPACE_ID') || '').trim();
+  const token = (props.getProperty('HF_TOKEN') || '').trim();
+  if (!spaceId || !token) {
+    throw new Error(
+      'Worker restart is not set up yet. Use "Aporia Bulk Video → ' +
+      'Configure worker restart" first.'
+    );
+  }
+  return { spaceId: spaceId.replace(/^\/+|\/+$/g, ''), token: token };
+}
+
+
+function _hfFetch_(cfg, path, method) {
+  const resp = UrlFetchApp.fetch(HF_API_BASE + cfg.spaceId + path, {
+    method: method,
+    headers: { Authorization: 'Bearer ' + cfg.token },
+    muteHttpExceptions: true,
+  });
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code < 200 || code >= 300) {
+    // 401/403 is nearly always the token: expired, or lacking write scope on
+    // this Space. Say so, because "HTTP 403" tells the operator nothing.
+    if (code === 401 || code === 403) {
+      throw new Error(
+        'HuggingFace refused the token (HTTP ' + code + '). It needs WRITE ' +
+        'access to ' + cfg.spaceId + '. Re-create it and run "Configure ' +
+        'worker restart" again.'
+      );
+    }
+    if (code === 404) {
+      throw new Error(
+        'HuggingFace has no Space called "' + cfg.spaceId + '" (HTTP 404). ' +
+        'Expected the form owner/space-name.'
+      );
+    }
+    throw new Error('HTTP ' + code + ': ' + text.substring(0, 200));
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+
+function _hfStage_(payload) {
+  // ``stage`` is the field the HF client reads for RUNNING / SLEEPING /
+  // BUILDING / RUNTIME_ERROR. Nested under ``runtime`` on some responses.
+  if (!payload) return 'unknown';
+  if (payload.stage) return String(payload.stage);
+  if (payload.runtime && payload.runtime.stage) {
+    return String(payload.runtime.stage);
+  }
+  return 'unknown';
+}
+
+
+/** Called from Sidebar.html and the menu: restart the Space that runs the
+ *  worker. Returns { ok, stage, cooldown } so the caller can tell "restarting"
+ *  apart from "you just did that". */
+function restartWorker() {
+  try {
+    const cfg = _getHfRestartConfig_();
+    const props = PropertiesService.getScriptProperties();
+    const last = parseInt(props.getProperty('LAST_RESTART_MS') || '0', 10);
+    const sinceMs = Date.now() - last;
+    if (last && sinceMs < RESTART_COOLDOWN_MS) {
+      const waitS = Math.ceil((RESTART_COOLDOWN_MS - sinceMs) / 1000);
+      return {
+        ok: false,
+        cooldown: true,
+        error:
+          'A restart was already sent ' + Math.round(sinceMs / 1000) +
+          's ago. Give it ' + waitS + 's more to come back before trying again.',
+      };
+    }
+    // Cooldown is stamped only AFTER HuggingFace accepts the restart. Stamping
+    // it first would lock the operator out for a minute over a bad token or a
+    // typo'd Space id — punishing them for a misconfiguration they still need to
+    // fix. The guard exists to stop double-clicks on SUCCESSFUL restarts.
+    const payload = _hfFetch_(cfg, '/restart', 'post');
+    props.setProperty('LAST_RESTART_MS', String(Date.now()));
+    return {
+      ok: true,
+      space: cfg.spaceId,
+      stage: _hfStage_(payload),
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+
+/** Called from Sidebar.html: is the Space up? Returns { ok, stage }.
+ *  Read-only and cheap, but NOT called on the poll cycle — it is an extra
+ *  external request per call, and the sidebar only needs it when the operator is
+ *  actually deciding whether to restart. */
+function getWorkerStatus() {
+  try {
+    const cfg = _getHfRestartConfig_();
+    const payload = _hfFetch_(cfg, '/runtime', 'get');
+    return { ok: true, space: cfg.spaceId, stage: _hfStage_(payload) };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
+
+/** Menu entry: restart the worker, with a confirmation and a plain-language
+ *  result. Mirrors the sidebar button so the operator can reach it without
+ *  opening the sidebar (useful when the sidebar itself cannot load). */
+function restartWorkerFromMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const confirmed = ui.alert(
+    'Restart the video worker?',
+    'This restarts the HuggingFace Space that generates the videos.\n\n' +
+    'Rows already in progress are picked up again automatically after the ' +
+    'restart, so nothing is lost. It takes about a minute to come back.\n\n' +
+    'Use this when jobs are stuck and "Fix stuck jobs" did not help.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (confirmed !== ui.Button.OK) return;
+  const r = restartWorker();
+  if (!r.ok) {
+    ui.alert('Could not restart', String(r.error || 'unknown error'), ui.ButtonSet.OK);
+    return;
+  }
+  ui.alert(
+    'Restarting',
+    'Restart sent to ' + r.space + '.\n\n' +
+    'Give it about a minute, then reopen the sidebar. Queued rows resume on ' +
+    'their own.',
+    ui.ButtonSet.OK
+  );
+}
+
+
+/** Menu entry: store the Space id + HuggingFace token used by the restart
+ *  button. Mirrors ``configureBackendUrl`` so there is one obvious place to set
+ *  things up. The token is never echoed back, only its presence. */
+function configureWorkerRestart() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const currentSpace = props.getProperty('HF_SPACE_ID') || '(none)';
+  const hasToken = !!(props.getProperty('HF_TOKEN') || '').trim();
+
+  const spaceResp = ui.prompt(
+    'Worker restart — step 1 of 2',
+    'HuggingFace Space id, as owner/space-name.\n' +
+    'Current: ' + currentSpace + '\n\n' +
+    'Leave blank to keep the current value.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (spaceResp.getSelectedButton() !== ui.Button.OK) return;
+  const spaceId = spaceResp.getResponseText().trim();
+  if (spaceId) props.setProperty('HF_SPACE_ID', spaceId);
+
+  const tokenResp = ui.prompt(
+    'Worker restart — step 2 of 2',
+    'HuggingFace access token' + (hasToken ? ' (one is already saved)' : '') +
+    '.\n\nCreate it at huggingface.co → Settings → Access Tokens as a ' +
+    'FINE-GRAINED token with write access to that one Space only.\n\n' +
+    'Leave blank to keep the saved token.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (tokenResp.getSelectedButton() !== ui.Button.OK) return;
+  const token = tokenResp.getResponseText().trim();
+  if (token) props.setProperty('HF_TOKEN', token);
+
+  const savedSpace = props.getProperty('HF_SPACE_ID') || '(none)';
+  const savedToken = !!(props.getProperty('HF_TOKEN') || '').trim();
+  if (savedSpace === '(none)' || !savedToken) {
+    ui.alert(
+      'Not finished',
+      'Still missing: ' +
+      (savedSpace === '(none)' ? 'the Space id' : '') +
+      (savedSpace === '(none)' && !savedToken ? ' and ' : '') +
+      (!savedToken ? 'the token' : '') +
+      '. The restart button stays disabled until both are set.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+  // Prove it works now rather than during the next incident.
+  const check = getWorkerStatus();
+  if (!check.ok) {
+    ui.alert(
+      'Saved, but the check failed',
+      String(check.error || 'unknown error'),
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+  ui.alert(
+    'Ready',
+    'Restart is set up for ' + savedSpace + '.\nThe Space is currently: ' +
+    check.stage + '.',
+    ui.ButtonSet.OK
+  );
 }
 
 

@@ -9,7 +9,7 @@ Plan: [_plans/2026-06-02-aporia-bulk-video-tool.md](../_plans/2026-06-02-aporia-
 
 | File | Purpose |
 |---|---|
-| `Code.gs` | Menu, row parsers, OAuth ID token flow, job submit, sidebar bridge |
+| `Code.gs` | Menu, row parsers, OAuth ID token flow, job submit, sidebar bridge, HuggingFace restart |
 | `Sidebar.html` | Live job status — polls `/jobs/{id}` every 5 seconds |
 | `appsscript.json` | Manifest: OAuth scopes + V8 runtime + Jerusalem timezone |
 
@@ -56,6 +56,61 @@ real time without refreshing.
 ### Kill a running job
 **Sidebar → Kill job button** → confirms → calls `/jobs/{id}/kill`.
 
+### When something looks stuck
+Work down the sidebar's recovery buttons in order. Each one disturbs more than
+the last, so stop as soon as things look right.
+
+1. **Refresh now** — the sidebar may just be showing a stale poll.
+2. **Fix stuck jobs** — runs the backend's repair pass immediately instead of
+   waiting for the automatic one. Safe to click as often as you like: every
+   action is idempotent and none of them can lose a video. You get one plain
+   sentence saying what changed, with the full detail behind **Details**.
+3. **Stop all jobs** — cancels everything still waiting. Rows already rendering
+   are aborted too.
+4. **Restart the worker** — last resort. Restarts the HuggingFace Space that
+   generates the videos. Queued rows resume by themselves; it takes about a
+   minute to come back.
+
+**Self-heal log** (collapsed section) lists problems the backend found and fixed
+on its own, newest first. Worth opening after a few days away — it is the only
+place that record survives, because HuggingFace keeps no container logs from
+before a restart.
+
+## Configure worker restart (one-time)
+
+The **Restart the worker** button talks to the HuggingFace API *directly*, not
+through our backend. That is deliberate: the moment you most need it is the
+moment the backend is the thing that stopped answering, and an endpoint running
+inside the stuck container cannot restart that container.
+
+1. Go to **huggingface.co → Settings → Access Tokens → Create new token**
+2. Pick **Fine-grained**, and grant **write** access to the ONE Space that runs
+   the backend, nothing else
+3. Copy the token
+4. In the sheet: **Aporia Bulk Video → Configure worker restart**
+5. Step 1 asks for the Space id in `owner/space-name` form
+6. Step 2 asks for the token
+7. It immediately checks the Space and reports its current state, so you find out
+   now rather than during an incident
+
+**Why the token must be fine-grained and Space-scoped:** Script Properties are
+readable by anyone who can open this Apps Script project, which for a
+sheet-bound script includes anyone with edit access to the spreadsheet. Scoped
+that way, the worst a leak allows is restarting a Space that person can already
+reach. A broad write token would hand over the whole account, so do not use one.
+
+The token is never sent to our backend and never written to a log. To rotate it,
+run **Configure worker restart** again and paste the new one.
+
+Restarts are rate-limited to one per minute in the script. A restart takes
+30-60 seconds to come back, and restarting a Space that is already restarting
+only makes the outage longer.
+
+**On mobile:** custom menus and sidebars do not appear in the Google Sheets phone
+app, so this button is desktop-only. From a phone, restart the Space from its
+page on huggingface.co instead. The backend's own automatic recovery does not
+need you present either way.
+
 ## Authentication
 
 `Code.gs` calls `ScriptApp.getIdentityToken()` to get a Google-signed JWT
@@ -95,3 +150,15 @@ your Aporia account.
 
 **Job stuck in "queued" forever** — the worker isn't running. Check the
 worker logs on the host (PythonAnywhere always-on task / Hetzner Docker).
+
+**A job shows "running" but its videos are already in the sheet** — click
+**Fix stuck jobs**. This was a real bug (a lost database write left the job's
+progress counter one short, so it could never finish); the backend now repairs it
+automatically within a few minutes, and the button does it on the spot.
+
+**"Worker restart is not set up yet"** — run **Configure worker restart** first,
+see the section above.
+
+**"HuggingFace refused the token"** — the token expired, or it lacks write
+access to that Space. Create a new fine-grained token and run **Configure worker
+restart** again.

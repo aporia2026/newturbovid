@@ -43,6 +43,8 @@ from bulkvid.models.row import (
     TextOnImgRow,
     YtCartoonRow,
 )
+from bulkvid.orchestrator import queue as _queue_mod
+from bulkvid.orchestrator import repair as _repair
 from bulkvid.orchestrator.queue import (
     JOB_QUEUED,
     JOB_RUNNING,
@@ -1479,6 +1481,171 @@ async def list_avatars_for_picker(
         avatars=[AvatarPickerEntry(**a) for a in avatars],
         source=source,
         error=error,
+    )
+
+
+# ── Self-repair (Plan 2026-08-17) ────────────────────────────────────────────
+#
+# The operator-facing half of ``orchestrator/repair.py``: one button that fixes
+# the states which used to need an engineer, and a log of everything the
+# unattended pass fixed while nobody was watching.
+#
+# IMPORTANT: both routes MUST be declared BEFORE ``GET /{job_id}``, for the same
+# reason ``/avatars`` is — the dynamic path would otherwise swallow
+# ``GET /jobs/repair-log`` and answer "job not found".
+
+
+class RepairActionOut(BaseModel):
+    name: str
+    changed: int
+    notes: list[str] = []
+
+
+class RepairOut(BaseModel):
+    """Result of one repair pass.
+
+    ``summary`` is the plain sentence the sidebar shows by default ("2 finished
+    jobs that still showed as running are now marked done. No videos were
+    lost."); ``log`` is the full per-action detail behind the Details expander.
+    Both come from the same pass — the operator should never have to read the
+    log to know whether the button worked."""
+
+    ok: bool = True
+    changed: int
+    summary: str
+    log: list[str]
+    actions: list[RepairActionOut] = []
+    scope: str = ""
+
+
+class RepairRunOut(BaseModel):
+    ts: str
+    source: str          # "auto" (watchdog) | "manual" (operator)
+    actor: str
+    changed: int
+    log: str
+
+
+class RepairLogOut(BaseModel):
+    runs: list[RepairRunOut]
+
+
+# Hard timeout around the repair pass. It is a handful of set-based statements,
+# each an HTTP round-trip, so it needs more headroom than a single read but must
+# still return well inside the Apps Script's 30 s UrlFetch cap — the operator
+# clicked a button and is watching it.
+_REPAIR_CALL_TIMEOUT_SECONDS = float(
+    os.environ.get("BULKVID_REPAIR_CALL_TIMEOUT_SECONDS") or 20.0
+)
+
+
+@router.post("/repair", response_model=RepairOut)
+async def repair_jobs(
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> RepairOut:
+    """Fix stuck job state now, instead of waiting for the automatic pass.
+
+    Same implementation the worker's watchdog runs every few minutes, so the
+    button can never diverge from the unattended behaviour — it only changes WHEN
+    it happens. Bulk users are scoped to their own jobs; admins get the fleet,
+    mirroring ``kill_all_jobs``.
+
+    Every action is idempotent and none can invent or destroy work (see
+    ``orchestrator/repair.py``), which is what makes this safe to expose as a
+    button a lazy user is expected to mash when something looks wrong.
+    """
+    scope = None if identity.is_admin else identity.email
+    try:
+        report = await asyncio.wait_for(
+            queue.run_on_connection(
+                _repair.run_repairs,
+                source=_repair.REPAIR_SOURCE_MANUAL,
+                actor=identity.email,
+                user_email=scope,
+                op="run_repairs",
+            ),
+            timeout=_REPAIR_CALL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as e:
+        _log.warning(
+            "repair_call_timeout",
+            user_email=identity.email,
+            timeout_s=_REPAIR_CALL_TIMEOUT_SECONDS,
+        )
+        raise HTTPException(
+            504,
+            "the repair took too long to finish. The automatic repair runs "
+            "every few minutes and will pick this up.",
+        ) from e
+    except QueueBusy as e:
+        _log.warning(
+            "queue_busy_503",
+            endpoint="repair_jobs",
+            user_email=identity.email,
+            original_error=str(e),
+        )
+        raise HTTPException(
+            503, "queue temporarily busy", headers={"Retry-After": "5"}
+        ) from e
+    _log.info(
+        "jobs_repair",
+        by=identity.email,
+        scope=scope or "ALL",
+        changed=report.changed,
+        elapsed_ms=report.elapsed_ms,
+    )
+    return RepairOut(
+        changed=report.changed,
+        summary=report.summary(),
+        log=report.lines,
+        actions=[
+            RepairActionOut(name=a.name, changed=a.changed, notes=a.notes)
+            for a in report.actions
+        ],
+        scope=report.scope,
+    )
+
+
+@router.get("/repair-log", response_model=RepairLogOut)
+async def repair_log(
+    limit: int = 20,
+    identity: Identity = Depends(get_identity),
+    queue: JobQueue = Depends(get_queue),
+) -> RepairLogOut:
+    """Recent repair passes, newest first — the "what fixed itself while I was
+    away" view.
+
+    This is the reason the audit table exists: HF Spaces keeps no container logs
+    from before a restart, so without a durable record a week of unattended
+    self-heals is invisible. Failures degrade to an empty list rather than an
+    error, because a missing log must never make the sidebar look broken."""
+    limit = max(1, min(limit, 100))
+    scope = None if identity.is_admin else identity.email
+    try:
+        runs = await asyncio.wait_for(
+            queue.run_on_connection(
+                _queue_mod.list_repair_runs,
+                limit=limit,
+                user_email=scope,
+                op="list_repair_runs",
+            ),
+            timeout=_POLL_DB_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception as e:    # noqa: BLE001 — an empty log beats a broken pane
+        _log.warning("repair_log_failed", user_email=identity.email, err=str(e)[:200])
+        return RepairLogOut(runs=[])
+    return RepairLogOut(
+        runs=[
+            RepairRunOut(
+                ts=r.ts,
+                source=r.source,
+                actor=r.actor,
+                changed=r.changed,
+                log=r.log,
+            )
+            for r in runs
+        ]
     )
 
 

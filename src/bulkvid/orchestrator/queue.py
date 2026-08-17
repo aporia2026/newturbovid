@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -118,6 +118,19 @@ KILL_OUTCOME_ERROR = "error"              # any other unexpected failure
 # opportunistically on every record insert (same shape as the idempotency
 # prune above).
 KILL_AUDIT_TTL_SECONDS = 90 * 86_400
+
+# Who triggered a repair pass: the worker's watchdog thread, or an operator
+# clicking the sidebar button. Recorded on every ``repair_audit`` row so
+# "it healed itself" is distinguishable from "someone had to intervene" — the
+# metric that tells us whether the automatic pass is actually earning its keep.
+REPAIR_SOURCE_AUTO = "auto"
+REPAIR_SOURCE_MANUAL = "manual"
+
+# Repair-audit retention. One row per pass that CHANGED something (a quiet pass
+# writes nothing), so this table stays tiny even at a 2-minute cadence. 30 days
+# comfortably covers "what happened while I was on vacation", which is the
+# question the table exists to answer. Pruned opportunistically on insert.
+REPAIR_AUDIT_TTL_SECONDS = 30 * 86_400
 
 
 # ── DB resilience (Turso flap hardening) — shared by web AND worker ──────────
@@ -217,12 +230,24 @@ CREATE TABLE IF NOT EXISTS wedge_forensics (
     stacks           TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS repair_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    created_ts   REAL NOT NULL,
+    source       TEXT NOT NULL,
+    actor        TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    changed      INTEGER NOT NULL DEFAULT 0,
+    log          TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_row_queue_status      ON row_queue(status);
 CREATE INDEX IF NOT EXISTS idx_row_queue_job         ON row_queue(job_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status           ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_idempotency_keys_ts   ON idempotency_keys(created_ts);
 CREATE INDEX IF NOT EXISTS idx_kill_audit_ts         ON kill_audit(created_ts);
 CREATE INDEX IF NOT EXISTS idx_wedge_forensics_ts    ON wedge_forensics(created_ts);
+CREATE INDEX IF NOT EXISTS idx_repair_audit_ts        ON repair_audit(created_ts);
 """
 
 
@@ -326,6 +351,24 @@ class WedgeForensics:
     stacks: str
 
 
+@dataclass
+class RepairRun:
+    """One recorded repair pass — automatic or operator-triggered.
+
+    ``log`` is the human-readable, newline-joined report the sidebar renders
+    verbatim, so the operator sees exactly what the pass did without needing the
+    action names decoded for them. ``changed`` is the total across all actions,
+    which is what makes "did anything actually happen here" a glance."""
+
+    id: int
+    ts: str
+    source: str
+    actor: str
+    scope: str
+    changed: int
+    log: str
+
+
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -369,6 +412,28 @@ def _hydrate_simple_x4(data: dict[str, Any]) -> SimpleX4Row:
         for c in raw_cards
     ]
     return SimpleX4Row(cards=cards, **data)
+
+
+def _job_scope_sql(
+    *, job_id: str | None, user_email: str | None,
+) -> tuple[str, list[Any]]:
+    """Build the ``AND ...`` scope predicate shared by the sweep and every
+    reconciliation helper, plus its bound values.
+
+    One place for the scoping rule so a caller can never accidentally widen its
+    blast radius: a single job, one user's jobs, or (admin/worker only) the whole
+    fleet. Values stay parameterized — the SQL text is fixed, only the presence
+    of each clause varies, so there is no injection surface. Every query using
+    it aliases the jobs table as ``j``."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if job_id is not None:
+        clauses.append("AND j.job_id = ?")
+        params.append(job_id)
+    if user_email is not None:
+        clauses.append("AND j.user_email = ?")
+        params.append(user_email)
+    return (" " + " ".join(clauses)) if clauses else "", params
 
 
 def count_active_queue(conn: Any) -> tuple[int, int]:
@@ -449,9 +514,15 @@ def read_worker_heartbeat(conn: Any) -> WorkerHeartbeat | None:
     )
 
 
-def sweep_expired_processing_rows(conn: Any, *, cutoff_iso: str) -> int:
+def sweep_expired_processing_rows(
+    conn: Any, *, cutoff_iso: str, user_email: str | None = None,
+) -> int:
     """Release PROCESSING rows of still-active jobs whose ``started_at`` predates
     ``cutoff_iso`` back to PENDING. Returns how many were released.
+
+    ``user_email`` bounds the sweep to one user's jobs. The watchdog omits it
+    (fleet-wide, as it always has); the operator-triggered repair pass passes it
+    so a bulk user's button cannot release rows belonging to anyone else.
 
     The runtime twin of ``_recover_orphaned_rows_sync`` (which only ever runs at
     boot). A row can be stranded in PROCESSING with nothing working on it —
@@ -466,13 +537,335 @@ def sweep_expired_processing_rows(conn: Any, *, cutoff_iso: str) -> int:
     Restricted to active jobs so killed/completed jobs are never resurrected.
     ISO-8601 UTC strings from ``_now_iso`` compare correctly with ``<`` because
     they are fixed-width and same-offset."""
+    scope, params = _job_scope_sql(job_id=None, user_email=user_email)
     cur = conn.execute(
         "UPDATE row_queue SET status = ?, started_at = NULL "
         "WHERE status = ? AND started_at IS NOT NULL AND started_at < ? "
-        "AND job_id IN (SELECT job_id FROM jobs WHERE status IN (?, ?))",
-        (ROW_PENDING, ROW_PROCESSING, cutoff_iso, JOB_QUEUED, JOB_RUNNING),
+        "AND job_id IN (SELECT j.job_id FROM jobs j "
+        f"              WHERE j.status IN (?, ?){scope})",
+        (
+            ROW_PENDING, ROW_PROCESSING, cutoff_iso,
+            JOB_QUEUED, JOB_RUNNING,
+            *params,
+        ),
     )
     return int(cur.rowcount or 0)
+
+
+# ── Aborted-row result JSON ──────────────────────────────────────────────────
+#
+# A row aborted by the system (killed by the operator, or orphaned under a job
+# that already finished) still needs a ``result`` payload, because
+# ``_list_rows_sync`` and the sidebar's error renderer read the same shape they
+# read for a real failure. Two statuses, one shape.
+#
+# Each one exists TWICE on purpose: once as a Python builder (the readable
+# definition, and what tests assert against) and once as a SQL expression, so a
+# kill can write EVERY row in a single statement instead of one round-trip per
+# row. Under the HTTP transport that per-row loop is what made killing a 100-row
+# job exceed the route's 10s budget and surface as "Could not kill" — see
+# ``_abort_rows_for_kill_sync``. ``test_queue_repair.py`` runs the SQL and
+# compares it to the builder, so the two cannot drift apart silently.
+#
+# Only ``row_num`` — an INTEGER column — is interpolated into the SQL, so there
+# is no quoting or escaping surface and no injection vector; every other byte is
+# a literal. That is also why ``||`` is used rather than ``json_object()``, which
+# would add an unverified dependency on the JSON1 extension being compiled into
+# Turso's build.
+ROW_RESULT_KILLED_BY_USER = "KILLED_BY_USER"
+ROW_RESULT_ORPHANED = "ORPHANED_JOB_FINISHED"
+
+
+def _aborted_result_json(row_num: int, *, status: str, error: str) -> str:
+    """The result payload written to a row the system aborted."""
+    return json.dumps(
+        {
+            "row_num": row_num,
+            "status": status,
+            "video_urls": [],
+            "cost_usd": 0.0,
+            "elapsed_seconds": 0.0,
+            "error": error,
+            "metadata": {},
+        },
+        ensure_ascii=False,
+    )
+
+
+def killed_result_json(row_num: int) -> str:
+    """Result payload for a row the operator killed."""
+    return _aborted_result_json(
+        row_num, status=ROW_RESULT_KILLED_BY_USER, error="killed by user",
+    )
+
+
+def orphan_result_json(row_num: int) -> str:
+    """Result payload for a row left behind under an already-finished job."""
+    return _aborted_result_json(
+        row_num,
+        status=ROW_RESULT_ORPHANED,
+        error="cancelled because the job had already finished",
+    )
+
+
+# SQL twins of the two builders above. Byte-identical output, asserted by test.
+_KILLED_RESULT_JSON_SQL = (
+    """'{"row_num": ' || row_num || ', "status": "KILLED_BY_USER", """
+    """"video_urls": [], "cost_usd": 0.0, "elapsed_seconds": 0.0, """
+    """"error": "killed by user", "metadata": {}}'"""
+)
+_ORPHAN_RESULT_JSON_SQL = (
+    """'{"row_num": ' || row_num || ', "status": "ORPHANED_JOB_FINISHED", """
+    """"video_urls": [], "cost_usd": 0.0, "elapsed_seconds": 0.0, """
+    """"error": "cancelled because the job had already finished", "metadata": {}}'"""
+)
+
+
+# ── Job-state reconciliation (Plan 2026-08-17) ───────────────────────────────
+#
+# There are NO transactions in production. ``db.py`` translates
+# BEGIN/COMMIT/ROLLBACK to no-ops on both remote transports (autocommit was
+# forced 2026-06-04 to kill stale reads), and the Hrana transport makes every
+# statement an independent HTTP request with its own deadline. A ``with
+# self._tx():`` block is therefore a SEQUENCE OF INDEPENDENTLY-FAILING
+# STATEMENTS, and ``_run_db`` re-runs the whole helper on any failure.
+#
+# That combination used to strand jobs at ``running`` forever. The old
+# ``_record_result_sync`` incremented ``completed_rows`` and then finalized on
+# ``completed_rows + failed_rows >= row_count``; if the row's own UPDATE landed
+# and the counter UPDATE did not, the retry hit the "row is already terminal"
+# guard and returned before ever bumping the counter. The counter was then
+# permanently one short, so the finalize condition could never be met again —
+# every row done, card pinned at ``running``, Kill the only way out.
+#
+# The cure is to stop STORING what can be DERIVED. The helpers below recompute
+# from ``row_queue`` (the authoritative table) instead of accumulating, so
+# running them twice is identical to running them once and a retry after a
+# partial write CONVERGES instead of drifting. They are connection-agnostic
+# (take ``conn``, touch no ``self``) exactly like ``count_active_queue``, so the
+# repair pass can reuse them on its own fresh connection — see ``repair.py``.
+
+# Grace period before a job whose ``row_count`` exceeds the rows actually
+# present may be finalized. ``row_count`` is set at enqueue and the rows land in
+# a LATER statement, so a job mid-insert legitimately has fewer rows than its
+# count; finalizing it then would mark a job complete with rows that are about
+# to arrive. Past this age the gap is not a race, it is a submit that partially
+# failed, and refusing to finalize would leave the job stuck forever — the very
+# bug we are fixing. 120s is far past any plausible enqueue (a 500-row submit is
+# ~5 chunked round-trips) and far below an operator's patience.
+REPAIR_MIN_JOB_AGE_SECONDS = float(
+    os.environ.get("BULKVID_REPAIR_MIN_JOB_AGE_SECONDS") or 120.0
+)
+
+
+def resync_job_counters(
+    conn: Any, *, job_id: str | None = None, user_email: str | None = None,
+) -> int:
+    """Recompute ``completed_rows`` / ``failed_rows`` from ``row_queue``.
+
+    THE fix for the counter drift described above: idempotent by construction,
+    because it assigns a COUNT rather than adding one. Returns the number of jobs
+    whose counters were actually WRONG and got corrected.
+
+    The write set is narrowed to jobs that genuinely disagree with their rows,
+    which does two jobs at once: ``rowcount`` becomes a truthful "repaired"
+    figure for the repair report (rather than "rows matched"), and the common
+    case — everything already consistent — writes nothing at all, so this is
+    cheap enough to call on the kill path and on every ``record_result``. The
+    correlated counts are index lookups via ``idx_row_queue_job``.
+
+    Applies to jobs in EVERY status, deliberately. An earlier version skipped
+    terminal jobs, which left two holes: ``abort_orphan_rows`` changes rows under
+    an already-COMPLETED parent (so its counters must be recomputed afterwards),
+    and any job that reached a terminal status with drifted counters could never
+    be corrected at all. The counts are derived from rows, so they are correct
+    regardless of what the parent's status happens to be.
+
+    Deliberately does NOT touch ``cost_usd`` — deriving it would mean
+    ``json_extract`` over ``row_queue.result``, an unverified dependency on the
+    JSON1 extension in Turso's build, and an under-reported cost on a lost
+    statement is the safe direction anyway.
+
+    Deliberately does NOT touch ``row_count`` either. It is the only column here
+    that CANNOT be reconstructed — rows a failed submit never inserted are simply
+    gone — so a mismatch is reported (``count_row_count_drift``) and left alone.
+    A finished job honestly reading ``3 / 5`` is information; a silently
+    rewritten denominator is a lie."""
+    scope, params = _job_scope_sql(job_id=job_id, user_email=user_email)
+    cur = conn.execute(
+        "UPDATE jobs SET "
+        "completed_rows = (SELECT COUNT(*) FROM row_queue rq "
+        "                  WHERE rq.job_id = jobs.job_id AND rq.status = ?), "
+        "failed_rows    = (SELECT COUNT(*) FROM row_queue rq "
+        "                  WHERE rq.job_id = jobs.job_id AND rq.status = ?) "
+        "WHERE job_id IN ("
+        "  SELECT j.job_id FROM jobs j"
+        "  WHERE (j.completed_rows <> (SELECT COUNT(*) FROM row_queue rq"
+        "                             WHERE rq.job_id = j.job_id"
+        "                               AND rq.status = ?)"
+        "     OR j.failed_rows     <> (SELECT COUNT(*) FROM row_queue rq"
+        "                             WHERE rq.job_id = j.job_id"
+        "                               AND rq.status = ?))"
+        f"   {scope})",
+        (
+            ROW_DONE, ROW_FAILED,
+            ROW_DONE, ROW_FAILED,
+            *params,
+        ),
+    )
+    return int(cur.rowcount or 0)
+
+
+def finalize_settled_jobs(
+    conn: Any,
+    *,
+    job_id: str | None = None,
+    user_email: str | None = None,
+    min_age_seconds: float = REPAIR_MIN_JOB_AGE_SECONDS,
+) -> int:
+    """Mark active jobs COMPLETED once no non-terminal rows remain.
+
+    Replaces the old counter arithmetic with the only question that actually
+    matters — "is there anything left to do?" — so a drifted counter can no
+    longer pin a finished job at ``running``.
+
+    Two guards, both load-bearing:
+
+      * ``EXISTS`` any row. A job created milliseconds ago whose ``row_queue``
+        rows have not been inserted yet has no non-terminal rows and would
+        otherwise be marked complete with zero output. This is the failure mode
+        that makes a naive "no pending rows" check dangerous, and it is why the
+        check lives HERE rather than being re-implemented per call site.
+      * ``row_count`` agreement OR ``min_age_seconds`` elapsed. Same race from
+        the other side: a partially-inserted batch has fewer rows than
+        ``row_count``, and those rows can all be terminal while the rest are
+        still arriving. Waiting out the grace period distinguishes "still
+        inserting" from "the submit partially failed", and the age escape hatch
+        is what lets an inflated ``row_count`` still be finalized instead of
+        wedging forever.
+
+    Returns the number of jobs finalized."""
+    scope, params = _job_scope_sql(job_id=job_id, user_email=user_email)
+    now = _now_iso()
+    cutoff = (
+        datetime.now(UTC) - timedelta(seconds=max(0.0, min_age_seconds))
+    ).isoformat(timespec="seconds")
+    cur = conn.execute(
+        "UPDATE jobs SET status = ?, finished_at = COALESCE(finished_at, ?) "
+        "WHERE job_id IN ("
+        "  SELECT j.job_id FROM jobs j"
+        "  WHERE j.status IN (?, ?)"
+        "    AND EXISTS (SELECT 1 FROM row_queue rq WHERE rq.job_id = j.job_id)"
+        "    AND NOT EXISTS (SELECT 1 FROM row_queue rq"
+        "                    WHERE rq.job_id = j.job_id AND rq.status IN (?, ?))"
+        "    AND ("
+        "      (SELECT COUNT(*) FROM row_queue rq WHERE rq.job_id = j.job_id)"
+        "        >= j.row_count"
+        "      OR j.created_at < ?"
+        "    )"
+        f"   {scope})",
+        (
+            JOB_COMPLETED, now,
+            JOB_QUEUED, JOB_RUNNING,
+            ROW_PENDING, ROW_PROCESSING,
+            cutoff,
+            *params,
+        ),
+    )
+    return int(cur.rowcount or 0)
+
+
+def promote_started_jobs(
+    conn: Any, *, job_id: str | None = None, user_email: str | None = None,
+) -> int:
+    """Move a job from QUEUED to RUNNING when its rows have provably started.
+
+    ``_claim_next_row_sync`` marks the row PROCESSING and THEN promotes the
+    parent job — two independent statements. When the second one is lost the job
+    sits at ``queued`` while its rows run, and because ``poll_jobs`` fetches
+    per-row detail only for RUNNING jobs, the card reads "waiting in queue"
+    with no visible progress until the whole batch ends.
+
+    Returns the number of jobs promoted."""
+    scope, params = _job_scope_sql(job_id=job_id, user_email=user_email)
+    now = _now_iso()
+    cur = conn.execute(
+        "UPDATE jobs SET status = ?, started_at = COALESCE(started_at, ?) "
+        "WHERE job_id IN ("
+        "  SELECT j.job_id FROM jobs j"
+        "  WHERE j.status = ?"
+        "    AND EXISTS (SELECT 1 FROM row_queue rq WHERE rq.job_id = j.job_id"
+        "                AND rq.status IN (?, ?, ?))"
+        f"   {scope})",
+        (
+            JOB_RUNNING, now,
+            JOB_QUEUED,
+            ROW_PROCESSING, ROW_DONE, ROW_FAILED,
+            *params,
+        ),
+    )
+    return int(cur.rowcount or 0)
+
+
+def abort_orphan_rows(
+    conn: Any, *, job_id: str | None = None, user_email: str | None = None,
+) -> int:
+    """Fail every PENDING/PROCESSING row whose parent job is already terminal.
+
+    Such a row is unreachable: ``_claim_next_row_sync`` only claims rows under an
+    active job, and ``sweep_expired_processing_rows`` only touches active jobs
+    too, so nothing else in the system will ever move it. It is left behind
+    when a kill's row-abort statement is lost after the job's own status
+    UPDATE landed.
+
+    Returns the number of rows aborted."""
+    scope, params = _job_scope_sql(job_id=job_id, user_email=user_email)
+    cur = conn.execute(
+        "UPDATE row_queue SET status = ?, finished_at = ?, "
+        f"result = {_ORPHAN_RESULT_JSON_SQL} "
+        "WHERE status IN (?, ?) AND job_id IN ("
+        "  SELECT j.job_id FROM jobs j"
+        f"  WHERE j.status IN (?, ?, ?){scope})",
+        (
+            ROW_FAILED, _now_iso(),
+            ROW_PENDING, ROW_PROCESSING,
+            JOB_COMPLETED, JOB_FAILED, JOB_KILLED,
+            *params,
+        ),
+    )
+    return int(cur.rowcount or 0)
+
+
+def count_row_count_drift(
+    conn: Any, *, user_email: str | None = None,
+) -> list[tuple[str, int, int]]:
+    """Read-only: ``(job_id, row_count, rows_present)`` for finished jobs whose
+    ``row_count`` exceeds the rows actually in ``row_queue``.
+
+    Reported rather than repaired, for the reason spelled out in
+    ``resync_job_counters``: the missing rows are gone, so the only honest thing
+    to do is surface the gap. A hit here means a submit partially failed —
+    worth an operator's attention because those sheet rows were never processed
+    and need resubmitting."""
+    scope, params = _job_scope_sql(job_id=None, user_email=user_email)
+    cur = conn.execute(
+        "SELECT j.job_id AS job_id, j.row_count AS row_count,"
+        "  (SELECT COUNT(*) FROM row_queue rq WHERE rq.job_id = j.job_id)"
+        "    AS rows_present "
+        "FROM jobs j "
+        f"WHERE j.status NOT IN (?, ?){scope} "
+        "  AND j.row_count > (SELECT COUNT(*) FROM row_queue rq"
+        "                     WHERE rq.job_id = j.job_id) "
+        "ORDER BY j.created_at DESC LIMIT 20",
+        (JOB_QUEUED, JOB_RUNNING, *params),
+    )
+    out: list[tuple[str, int, int]] = []
+    for r in cur.fetchall():
+        try:
+            out.append((str(r["job_id"]), int(r["row_count"]), int(r["rows_present"])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
 
 
 def record_wedge_forensics(
@@ -527,6 +920,76 @@ def list_wedge_forensics(conn: Any, *, limit: int = 10) -> list[WedgeForensics]:
             processing=int(r[5]),
             heartbeat_age_s=(None if r[6] is None else float(r[6])),
             stacks=str(r[7]),
+        )
+        for r in cur.fetchall()
+    ]
+
+
+def record_repair_run(
+    conn: Any,
+    *,
+    source: str,
+    actor: str,
+    scope: str,
+    changed: int,
+    log: str,
+) -> None:
+    """Persist one repair pass, then prune past the TTL.
+
+    This table exists because the unattended pass runs while NOBODY IS WATCHING —
+    that is its entire purpose. Without a durable record, a week of self-heals
+    leaves no evidence of what broke: HF Spaces keeps no container logs from
+    before a restart, and the operator comes back to a queue that looks fine with
+    no way to know it wasn't. Same shape as ``kill_audit`` / ``wedge_forensics``,
+    including the prune-after-insert ordering so a slow prune can never cost us
+    the recording we came for.
+
+    ``source`` is ``auto`` (watchdog) or ``manual`` (operator button); ``scope``
+    is the user_email the pass was limited to, or ``""`` for fleet-wide."""
+    conn.execute(
+        "INSERT INTO repair_audit "
+        "(ts, created_ts, source, actor, scope, changed, log) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (_now_iso(), time.time(), source, actor, scope, int(changed), log),
+    )
+    with suppress(Exception):    # a failed prune must never mask the record
+        conn.execute(
+            "DELETE FROM repair_audit WHERE created_ts < ?",
+            (time.time() - REPAIR_AUDIT_TTL_SECONDS,),
+        )
+
+
+def list_repair_runs(
+    conn: Any, *, limit: int = 20, user_email: str | None = None,
+) -> list[RepairRun]:
+    """Newest-first repair passes for the sidebar's self-heal pane.
+
+    ``user_email=None`` is the admin view. A bulk user sees their OWN manual
+    passes plus every automatic pass — the automatic ones are fleet-wide but log
+    only action names and counts (never job ids), so there is nothing of another
+    user's to leak. See ``repair.run_repairs``."""
+    if user_email is None:
+        cur = conn.execute(
+            "SELECT id, ts, source, actor, scope, changed, log "
+            "FROM repair_audit ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT id, ts, source, actor, scope, changed, log "
+            "FROM repair_audit WHERE scope = ? OR source = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (user_email, REPAIR_SOURCE_AUTO, limit),
+        )
+    return [
+        RepairRun(
+            id=int(r["id"]),
+            ts=str(r["ts"]),
+            source=str(r["source"]),
+            actor=str(r["actor"]),
+            scope=str(r["scope"]),
+            changed=int(r["changed"]),
+            log=str(r["log"]),
         )
         for r in cur.fetchall()
     ]
@@ -908,38 +1371,39 @@ class JobQueue:
             row = cur.fetchone()
             if row is None:
                 return
-            current_status = row["status"]
-            if current_status in (ROW_DONE, ROW_FAILED):
-                # Already terminal — either a duplicate retry of
-                # record_result (Plan §A) or a kill landed between
-                # processor start and result hand-back. Either way the
-                # row is settled; do nothing.
-                return
             job_id = row["job_id"]
-            self._conn.execute(
-                "UPDATE row_queue "
-                "SET status = ?, finished_at = ?, result = ? WHERE id = ?",
-                (ROW_DONE if ok else ROW_FAILED, _now_iso(), result_json, queue_id),
-            )
-            if ok:
+            # Already terminal — either a duplicate retry of record_result
+            # (Plan §A) or a kill landed between processor start and result
+            # hand-back. The ROW is settled, so its own state and the money it
+            # spent are left exactly as they are.
+            #
+            # What must NOT be skipped is the job-level reconciliation below.
+            # Returning early here is precisely what pinned finished jobs at
+            # ``running`` forever: with no transactions, the row UPDATE can land
+            # while the job UPDATE that follows it does not, and the retry then
+            # took this branch and never re-attempted the job half. Plan
+            # ``_plans/2026-08-17-stuck-jobs-selfheal-and-restart.md``.
+            already_terminal = row["status"] in (ROW_DONE, ROW_FAILED)
+            if not already_terminal:
                 self._conn.execute(
-                    "UPDATE jobs SET completed_rows = completed_rows + 1, "
-                    "cost_usd = cost_usd + ? WHERE job_id = ?",
+                    "UPDATE row_queue "
+                    "SET status = ?, finished_at = ?, result = ? WHERE id = ?",
+                    (ROW_DONE if ok else ROW_FAILED, _now_iso(), result_json, queue_id),
+                )
+                # Cost still ACCUMULATES (it cannot be derived without
+                # ``json_extract``, an unverified dependency on Turso's JSON1
+                # build) and so stays behind the terminal-row guard: a lost
+                # statement under-reports spend, which is the safe direction.
+                self._conn.execute(
+                    "UPDATE jobs SET cost_usd = cost_usd + ? WHERE job_id = ?",
                     (result.cost_usd, job_id),
                 )
-            else:
-                self._conn.execute(
-                    "UPDATE jobs SET failed_rows = failed_rows + 1, "
-                    "cost_usd = cost_usd + ? WHERE job_id = ?",
-                    (result.cost_usd, job_id),
-                )
-            # Maybe finalize the job.
-            self._conn.execute(
-                "UPDATE jobs SET status = ?, finished_at = ? "
-                "WHERE job_id = ? AND completed_rows + failed_rows >= row_count "
-                "AND status = ?",
-                (JOB_COMPLETED, _now_iso(), job_id, JOB_RUNNING),
-            )
+            # Both statements below are idempotent — they DERIVE from
+            # ``row_queue`` rather than incrementing — so they are safe to run on
+            # every call, including a retry that found the row already settled.
+            # That is what makes the drift self-correcting instead of permanent.
+            resync_job_counters(self._conn, job_id=job_id)
+            finalize_settled_jobs(self._conn, job_id=job_id)
 
     def _get_job_sync(self, job_id: str) -> Job | None:
         cur = self._conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,))
@@ -1185,9 +1649,17 @@ class JobQueue:
         §B.
 
         Rows already DONE/FAILED are left alone — the kill only resolves
-        in-flight uncertainty, not historical state. Bumps the parent
+        in-flight uncertainty, not historical state. Refreshes the parent
         job's ``failed_rows`` so the sidebar archive shows the right
         total ("75/100 killed by user" not "0 failed").
+
+        Resumable on retry (Plan 2026-08-17): with no transactions, the job's
+        status UPDATE can land while the row abort that follows it does not, and
+        ``_run_db`` then re-runs this whole helper. The old version bailed at
+        ``if not jobs_killed`` on that second pass, reporting "nothing to kill"
+        and leaving the rows stranded PROCESSING under a killed parent — where
+        nothing else in the system would ever touch them. So a pass that finds
+        the job ALREADY killed now carries on and finishes the work.
         """
         try:
             with self._tx():
@@ -1197,14 +1669,39 @@ class JobQueue:
                     (JOB_KILLED, _now_iso(), job_id, JOB_QUEUED, JOB_RUNNING),
                 )
                 jobs_killed = cur.rowcount > 0
-                if not jobs_killed:
+                if not jobs_killed and not self._job_has_status_sync(
+                    job_id, JOB_KILLED
+                ):
+                    # Genuinely nothing to kill — unknown job, or one that
+                    # already finished on its own.
                     return False, 0
                 rows_aborted = self._abort_rows_for_kill_sync(
                     job_id_filter=job_id, user_filter=None,
                 )
-                return True, rows_aborted
+                # Unconditional: a prior attempt may have aborted the rows and
+                # then lost this statement.
+                resync_job_counters(self._conn, job_id=job_id)
+                # ``jobs_killed`` stays "THIS call performed the transition", not
+                # "the job is killed" — the kill audit's ``no_active_job`` outcome
+                # is defined that way (Plan 2026-07-05) and an investigator reading
+                # ``no_active_job rows_aborted=2`` learns exactly the right thing:
+                # a previous attempt had already flipped the status and this pass
+                # finished the row cleanup it never got to.
+                return jobs_killed, rows_aborted
         except sqlite3.OperationalError as e:
             raise QueueBusy(str(e)) from e
+
+    def _job_has_status_sync(self, job_id: str, status: str) -> bool:
+        """Whether ``job_id`` currently sits at ``status``.
+
+        One extra round-trip, taken ONLY when a kill's UPDATE matched nothing —
+        the path where we must tell "already killed by my own lost attempt"
+        (carry on) apart from "never active" (stop)."""
+        cur = self._conn.execute(
+            "SELECT 1 FROM jobs WHERE job_id = ? AND status = ?",
+            (job_id, status),
+        )
+        return cur.fetchone() is not None
 
     def _kill_all_sync(
         self, user_email: str | None = None
@@ -1212,7 +1709,12 @@ class JobQueue:
         """Kill every active (queued/running) job — for one user, or all when
         ``user_email`` is None (admin) — AND abort their PENDING/PROCESSING
         rows. Returns ``(jobs_killed_count, rows_aborted_count)``. Plan
-        ``_plans/2026-06-14-stuck-processing-rows.md`` §B."""
+        ``_plans/2026-06-14-stuck-processing-rows.md`` §B.
+
+        Like ``_kill_job_sync``, the row abort now runs even when this pass
+        killed nothing, so a retry after a partially-applied kill — or a strand
+        left by an older one — is cleaned up rather than left permanently
+        in-flight under a dead parent (Plan 2026-08-17)."""
         try:
             with self._tx():
                 if user_email:
@@ -1227,12 +1729,12 @@ class JobQueue:
                         "WHERE status IN (?, ?)",
                         (JOB_KILLED, _now_iso(), JOB_QUEUED, JOB_RUNNING),
                     )
-                jobs_killed = cur.rowcount
-                if jobs_killed == 0:
-                    return 0, 0
+                jobs_killed = max(0, int(cur.rowcount or 0))
                 rows_aborted = self._abort_rows_for_kill_sync(
                     job_id_filter=None, user_filter=user_email,
                 )
+                if jobs_killed or rows_aborted:
+                    resync_job_counters(self._conn, user_email=user_email)
                 return jobs_killed, rows_aborted
         except sqlite3.OperationalError as e:
             raise QueueBusy(str(e)) from e
@@ -1240,98 +1742,48 @@ class JobQueue:
     def _abort_rows_for_kill_sync(
         self, *, job_id_filter: str | None, user_filter: str | None,
     ) -> int:
-        """Mark every PENDING/PROCESSING row whose parent job is now KILLED
-        as FAILED with a ``killed by user`` result payload. Caller is
-        already inside ``_tx()``. Returns the count of rows touched.
+        """Mark every PENDING/PROCESSING row whose parent job is KILLED as
+        FAILED with a ``killed by user`` result payload, in ONE statement.
+        Caller is already inside ``_tx()``. Returns the count of rows touched.
 
         Mirrors the result-JSON shape ``_record_result_sync`` writes so
-        ``_list_rows_sync`` and the sidebar's error renderer ("killed by
-        user") read it without a second code path. Bumps ``failed_rows``
-        on each parent job in the same UPDATE pass so the archive's
-        ``done/total`` count adds up.
+        ``_list_rows_sync`` and the sidebar's error renderer ("killed by user")
+        read it without a second code path — see ``killed_result_json``, whose
+        SQL twin is used here.
 
-        The ``job_id_filter`` / ``user_filter`` mutually-exclusive pair
-        mirrors ``_kill_job_sync`` vs ``_kill_all_sync`` — passing the
-        same filter the parent UPDATE used means we only touch rows for
-        jobs that JUST moved to KILLED in this transaction.
+        ONE statement is the whole point (Plan 2026-08-17). This used to issue
+        one UPDATE per row plus one per job, because each row's ``row_num`` is
+        baked into its result JSON. Under the Hrana HTTP transport every one of
+        those is a separate round-trip, so killing a 100-row batch cost 100+
+        sequential round-trips — comfortably past the kill route's 10s budget,
+        which surfaced to the operator as a 504 and "Could not kill" on exactly
+        the big jobs they most wanted stopped. Building the JSON in SQL makes the
+        cost independent of batch size. Counter refresh is the caller's job
+        (``resync_job_counters``), so it happens even when this returns 0.
+
+        The ``job_id_filter`` / ``user_filter`` pair mirrors ``_kill_job_sync``
+        vs ``_kill_all_sync``. Rows are matched through their parent's KILLED
+        status rather than by ids read in a prior statement, which is what makes
+        a retry idempotent: re-running it can only ever abort rows that are
+        still non-terminal under a killed parent.
         """
-        # Fetch row ids + numbers first so the UPDATE can embed each row's
-        # ``row_num`` into the per-row result JSON. Cheap: indexed lookup
-        # on ``rq.status`` + the parent join.
-        now = _now_iso()
-        if job_id_filter is not None:
-            cur = self._conn.execute(
-                "SELECT rq.id, rq.row_num FROM row_queue rq "
-                "WHERE rq.job_id = ? AND rq.status IN (?, ?)",
-                (job_id_filter, ROW_PENDING, ROW_PROCESSING),
-            )
-        elif user_filter is not None:
-            cur = self._conn.execute(
-                "SELECT rq.id, rq.row_num, rq.job_id FROM row_queue rq "
-                "JOIN jobs j ON j.job_id = rq.job_id "
-                "WHERE j.user_email = ? AND j.status = ? "
-                "AND rq.status IN (?, ?)",
-                (user_filter, JOB_KILLED, ROW_PENDING, ROW_PROCESSING),
-            )
-        else:
-            cur = self._conn.execute(
-                "SELECT rq.id, rq.row_num, rq.job_id FROM row_queue rq "
-                "JOIN jobs j ON j.job_id = rq.job_id "
-                "WHERE j.status = ? AND rq.status IN (?, ?)",
-                (JOB_KILLED, ROW_PENDING, ROW_PROCESSING),
-            )
-        affected_ids: list[tuple[int, int, str]] = []
-        for r in cur.fetchall():
-            try:
-                row_id = int(r["id"])
-                row_num = int(r["row_num"])
-            except (TypeError, ValueError, IndexError):
-                continue
-            # ``job_id_filter`` path didn't select rq.job_id (we already
-            # have it as the filter). Fall back to it explicitly.
-            if job_id_filter is not None:
-                jid = job_id_filter
-            else:
-                try:
-                    jid = str(r["job_id"])
-                except (TypeError, ValueError, IndexError):
-                    continue
-            affected_ids.append((row_id, row_num, jid))
-        if not affected_ids:
-            return 0
-        # Per-row UPDATE with the row's own row_num baked into the result
-        # JSON. executemany would be cleaner but the result string varies
-        # per row — and the typical kill touches O(10–100) rows, well
-        # inside one libsql roundtrip's budget.
-        per_job_failed_increment: dict[str, int] = {}
-        for row_id, row_num, jid in affected_ids:
-            result_json = json.dumps(
-                {
-                    "row_num": row_num,
-                    "status": "KILLED_BY_USER",
-                    "video_urls": [],
-                    "cost_usd": 0.0,
-                    "elapsed_seconds": 0.0,
-                    "error": "killed by user",
-                    "metadata": {},
-                },
-                ensure_ascii=False,
-            )
-            self._conn.execute(
-                "UPDATE row_queue SET status = ?, finished_at = ?, "
-                "result = ? WHERE id = ?",
-                (ROW_FAILED, now, result_json, row_id),
-            )
-            per_job_failed_increment[jid] = (
-                per_job_failed_increment.get(jid, 0) + 1
-            )
-        for jid, n in per_job_failed_increment.items():
-            self._conn.execute(
-                "UPDATE jobs SET failed_rows = failed_rows + ? "
-                "WHERE job_id = ?",
-                (n, jid),
-            )
-        return len(affected_ids)
+        scope, params = _job_scope_sql(
+            job_id=job_id_filter, user_email=user_filter
+        )
+        cur = self._conn.execute(
+            "UPDATE row_queue SET status = ?, finished_at = ?, "
+            f"result = {_KILLED_RESULT_JSON_SQL} "
+            "WHERE status IN (?, ?) AND job_id IN ("
+            "  SELECT j.job_id FROM jobs j"
+            f"  WHERE j.status = ?{scope})",
+            (
+                ROW_FAILED, _now_iso(),
+                ROW_PENDING, ROW_PROCESSING,
+                JOB_KILLED,
+                *params,
+            ),
+        )
+        return max(0, int(cur.rowcount or 0))
 
     def _record_kill_attempt_sync(
         self, *, endpoint: str, job_id: str | None, user_email: str,
@@ -1511,6 +1963,27 @@ class JobQueue:
             )
         raise QueueUnavailable(
             f"{op} failed after {_DB_MAX_ATTEMPTS} attempts: {last_exc}"
+        )
+
+    async def run_on_connection(
+        self, fn: Callable[..., _T], *args: Any, op: str, **kwargs: Any
+    ) -> _T:
+        """Run a connection-agnostic helper on this queue's connection, through
+        the full ``_run_db`` resilience cycle (time-box, discard-and-reconnect,
+        retry, ``QueueUnavailable`` → 503).
+
+        The seam for module-level helpers that take ``conn`` as their first
+        argument — ``resync_job_counters``, ``list_repair_runs``, the repair pass.
+        Those live outside this class precisely so the watchdog thread can call
+        them on its OWN fresh connection, and this method lets the web path reach
+        the same code without duplicating a wrapper per helper (and without
+        ``repair.py`` importing ``JobQueue``, which would be circular).
+
+        Callers get the same guarantees as any built-in method here: the shared
+        connection is never touched outside ``self._lock``, and a reconnect can
+        never race a concurrent op."""
+        return await self._run_db(
+            lambda *a, **k: fn(self._conn, *a, **k), *args, op=op, **kwargs
         )
 
     async def enqueue(
