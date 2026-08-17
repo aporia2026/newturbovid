@@ -335,6 +335,31 @@ function _getBackendUrl() {
 }
 
 
+/** Convert a HuggingFace Space PAGE url into the app url the API lives on.
+ *
+ *  ``https://huggingface.co/spaces/<owner>/<name>`` is the human-facing repo
+ *  page and serves HTML; the running app answers on
+ *  ``https://<owner>-<name>.hf.space``. Pasting the former is an easy and very
+ *  costly mistake: every poll fetches HTML, JSON.parse throws, and the sidebar
+ *  sits on "Reconnecting…" forever without ever hinting that the URL is wrong
+ *  (2026-08-17, setting up Space 3). Silently fixing it beats explaining it.
+ *
+ *  Returns the corrected url, or '' when the input is not a Space page url. */
+function _spacePageUrlToAppUrl_(raw) {
+  const m = String(raw || '').match(
+    /^https?:\/\/(?:www\.)?huggingface\.co\/spaces\/([^/\s]+)\/([^/?#\s]+)/i
+  );
+  if (!m) return '';
+  // HF lowercases the host and joins owner + name with a hyphen. A name that
+  // already contains a dot would not survive that, so leave those alone rather
+  // than guess wrong.
+  const owner = m[1].toLowerCase();
+  const name = m[2].toLowerCase();
+  if (owner.indexOf('.') !== -1 || name.indexOf('.') !== -1) return '';
+  return 'https://' + owner + '-' + name + '.hf.space';
+}
+
+
 function configureBackendUrl() {
   const ui = SpreadsheetApp.getUi();
   const current = PropertiesService.getScriptProperties()
@@ -342,14 +367,51 @@ function configureBackendUrl() {
   const response = ui.prompt(
     'Backend URL',
     'Enter the backend URL (current: ' + current + '):\n' +
-    'e.g. https://<owner>-aporia-bulkvid.hf.space',
+    'e.g. https://<owner>-aporia-bulkvid.hf.space\n\n' +
+    'Tip: pasting the huggingface.co/spaces/... page link also works — it gets ' +
+    'converted for you.',
     ui.ButtonSet.OK_CANCEL
   );
   if (response.getSelectedButton() !== ui.Button.OK) return;
-  const newUrl = response.getResponseText().trim();
+  let newUrl = response.getResponseText().trim();
   if (!newUrl) return;
+
+  const corrected = _spacePageUrlToAppUrl_(newUrl);
+  const wasCorrected = !!corrected;
+  if (wasCorrected) newUrl = corrected;
   PropertiesService.getScriptProperties().setProperty('BACKEND_URL', newUrl);
-  ui.alert('Backend URL set to: ' + newUrl);
+
+  // Prove it answers before declaring success, so a typo surfaces here rather
+  // than as an unexplained "Reconnecting…" in the sidebar. /health is open and
+  // cheap, so this needs no auth.
+  let reachable = false;
+  let detail = '';
+  try {
+    const resp = UrlFetchApp.fetch(newUrl + '/health', {
+      method: 'get', muteHttpExceptions: true,
+    });
+    const code = resp.getResponseCode();
+    reachable = code >= 200 && code < 300
+                && resp.getContentText().indexOf('"status"') !== -1;
+    detail = reachable ? '' : ('the backend answered HTTP ' + code);
+  } catch (e) {
+    detail = String((e && e.message) || e).substring(0, 200);
+  }
+
+  ui.alert(
+    reachable ? 'Backend URL set' : 'Saved, but it did not answer',
+    'Backend URL: ' + newUrl +
+    (wasCorrected
+      ? '\n\n(That was a huggingface.co Space page link. The API lives on ' +
+        'the .hf.space host, so it was converted for you.)'
+      : '') +
+    (reachable
+      ? '\n\nIt responded to a health check, so the sidebar should connect.'
+      : '\n\nHealth check failed: ' + detail +
+        '\n\nIf the Space was asleep this can just be a cold start — wait a ' +
+        'minute and reopen the sidebar. Otherwise re-check the URL.'),
+    ui.ButtonSet.OK
+  );
 }
 
 
