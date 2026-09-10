@@ -46,6 +46,7 @@ from bulkvid.orchestrator.queue import (
     TAB_IMAGE_RESIZE,
     TAB_IMAGE_VO,
     TAB_MOTION_ADS,
+    TAB_ONE_CLICK_IMAGE_VID,
     TAB_SIMPLE,
     TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
@@ -152,8 +153,35 @@ class _FourImagesCols:
     ready_video_start: int = 13   # N = 0-indexed col 13
 
 
+@dataclass(frozen=True)
+class _OneClickImageVidCols:
+    """Layout for the ``1-click-image-vid`` tab (2026-09-10).
+
+    Image-VO columns A-H (one Manual Image = the source), then the cartoon-style
+    CTA pair (I = CTA Yes/No, J = CTA Text), then Open Comments + one Ready Video.
+    The row produces exactly ONE video, written to Ready Video (col L). The
+    write-back resolves the column by header name first, but this positional
+    value is the fallback AND the gate that lets the write run at all. Plan
+    ``_plans/2026-09-10-one-click-image-vid-tab.md``.
+    """
+
+    country: int = 0          # A
+    vertical: int = 1         # B
+    article: int = 2          # C
+    manual_image: int = 3     # D  (source image — blank → row is invalid)
+    voice_over: int = 4       # E
+    zapcap: int = 5           # F
+    aspect_ratio: int = 6     # G
+    script_pattern: int = 7   # H
+    cta_enabled: int = 8      # I  (Yes/No dropdown)
+    cta_text: int = 9         # J
+    open_comments: int = 10   # K
+    ready_video_start: int = 11   # L = 0-indexed col 11
+
+
 IMAGE_VO_COLS = _ImageVOCols()
 FOUR_IMAGES_COLS = _FourImagesCols()
+ONE_CLICK_IMAGE_VID_COLS = _OneClickImageVidCols()
 
 
 @dataclass(frozen=True)
@@ -472,6 +500,7 @@ _HEADER_ROWS_BY_TAB: dict[str, int] = {
     TAB_MOTION_ADS: 1,
     TAB_HOOK_CARD: 1,
     TAB_IMAGE_RESIZE: 1,
+    TAB_ONE_CLICK_IMAGE_VID: 1,
 }
 
 
@@ -674,6 +703,8 @@ class SheetsClient:
             col = MOTION_ADS_COLS.ready_video_start
         elif layout == TAB_HOOK_CARD:
             col = HOOK_CARD_COLS.ready_video_start
+        elif layout == TAB_ONE_CLICK_IMAGE_VID:
+            col = ONE_CLICK_IMAGE_VID_COLS.ready_video_start
         else:
             return set()
         return await self._to_thread_with_retry(
@@ -1088,6 +1119,8 @@ class SheetsClient:
                 if tab_type == TAB_MOTION_ADS
                 else HOOK_CARD_COLS.ready_video_start
                 if tab_type == TAB_HOOK_CARD
+                else ONE_CLICK_IMAGE_VID_COLS.ready_video_start
+                if tab_type == TAB_ONE_CLICK_IMAGE_VID
                 else None
             )
             if positional_fallback is None:

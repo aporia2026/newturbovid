@@ -91,6 +91,35 @@ class ImageVORow(_MarketRow):
 
 
 @dataclass
+class OneClickImageVidRow(_MarketRow):
+    """``1-click-image-vid`` tab input row.
+
+    One source image in, one captioned still-image video out. The processor
+    generates a 4-panel story collage from ``manual_image_url`` (nano-banana-2,
+    the same image_vo front-half), splits it into 4 quadrants, sequences them
+    into ONE video sized to the voiceover, and burns in ZapCap captions. Exactly
+    one ``Ready Video`` is written back (col L).
+
+    Same input columns as :class:`ImageVORow` plus the cartoon-style CTA pair
+    (``cta_enabled`` / ``cta_text``) — an optional yellow pill on the final
+    video. Plan ``_plans/2026-09-10-one-click-image-vid-tab.md``.
+    """
+
+    row_num: int
+    country: str
+    vertical: str
+    article_url: str
+    manual_image_url: str
+    voice_over: bool                  # default True
+    zapcap: bool                      # default False
+    aspect_ratio: str                 # e.g. "9:16"
+    script_pattern: str
+    open_comments: str
+    cta_enabled: bool = False         # mirrors simple-motion — yellow pill at bottom
+    cta_text: str = ""                # operator text; empty = per-language default
+
+
+@dataclass
 class CardChoice:
     """Per-video card-template selection on the ``simple x4`` tab.
 
