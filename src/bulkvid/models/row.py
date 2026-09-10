@@ -94,11 +94,14 @@ class ImageVORow(_MarketRow):
 class OneClickImageVidRow(_MarketRow):
     """``1-click-image-vid`` tab input row.
 
-    One source image in, one captioned still-image video out. The processor
-    generates a 4-panel story collage from ``manual_image_url`` (nano-banana-2,
-    the same image_vo front-half), splits it into 4 quadrants, sequences them
-    into ONE video sized to the voiceover, and burns in ZapCap captions. Exactly
-    one ``Ready Video`` is written back (col L).
+    One captioned still-image video out. The processor generates a 4-panel story
+    collage (nano-banana-2), splits it into 4 quadrants, sequences them into ONE
+    video sized to the voiceover, and burns in ZapCap captions. Exactly one
+    ``Ready Video`` is written back (col L).
+
+    ``manual_image_url`` is OPTIONAL: filled → the 4 frames are generated FROM
+    that seed image (image-to-image); blank → they are generated from scratch
+    (text-to-image) grounded in the article + vertical + country.
 
     Same input columns as :class:`ImageVORow` plus the cartoon-style CTA pair
     (``cta_enabled`` / ``cta_text``) — an optional yellow pill on the final
