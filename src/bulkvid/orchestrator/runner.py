@@ -39,6 +39,7 @@ from bulkvid.models.row import (
     ImageResizeRow,
     ImageVORow,
     MotionAdsRow,
+    OneClickImageVidRow,
     RowResult,
     SimpleMotionRow,
     SimpleRow,
@@ -60,6 +61,9 @@ from bulkvid.orchestrator.row_processor_hook_card import process_hook_card_row
 from bulkvid.orchestrator.row_processor_image_resize import process_image_resize_row
 from bulkvid.orchestrator.row_processor_image_vo import process_image_vo_row
 from bulkvid.orchestrator.row_processor_motion_ads import process_motion_ads_row
+from bulkvid.orchestrator.row_processor_one_click_image_vid import (
+    process_one_click_image_vid_row,
+)
 from bulkvid.orchestrator.row_processor_simple import process_simple_row
 from bulkvid.orchestrator.row_processor_simple_motion import process_simple_motion_row
 from bulkvid.orchestrator.row_processor_simple_x4 import process_simple_x4_row
@@ -71,6 +75,7 @@ from bulkvid.orchestrator.runtime_settings import (
     SETTING_ROW_TIMEOUT_FAST_FURIOUS,
     SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION,
     SETTING_ROW_TIMEOUT_IMAGE_VO,
+    SETTING_ROW_TIMEOUT_ONE_CLICK_IMAGE_VID,
     SETTING_ROW_TIMEOUT_SIMPLE,
     SETTING_ROW_TIMEOUT_SIMPLE_MOTION,
     SETTING_ROW_TIMEOUT_YT_CARTOON,
@@ -108,6 +113,7 @@ _TAB_AVATAR = "avatar"
 _TAB_MOTION_ADS = "motion_ads"
 _TAB_HOOK_CARD = "hook_card"
 _TAB_IMAGE_RESIZE = "image_resize"
+_TAB_ONE_CLICK_IMAGE_VID = "one_click_image_vid"
 
 _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     _TAB_SIMPLE: 720.0,         # 12 min
@@ -151,6 +157,10 @@ _DEFAULT_ROW_TIMEOUTS_SECONDS: dict[str, float] = {
     # image_resize is one Nano Banana reframe + a Pillow crop/optimize (CPU,
     # sub-second). Same shape as image_vo's single gen — reuse its 15-min budget.
     _TAB_IMAGE_RESIZE: 900.0,
+    # one-click-image-vid: one nano-banana collage + split + TTS + ~5 Rendi
+    # commands (4 stills + 1 concat) + optional ZapCap — a single video, lighter
+    # than the N-video tabs. Image-gen dominates, so 15 min is ample.
+    _TAB_ONE_CLICK_IMAGE_VID: 900.0,
 }
 
 _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
@@ -174,6 +184,8 @@ _TIMEOUT_SETTING_KEY_BY_TAB: dict[str, str] = {
     _TAB_HOOK_CARD: SETTING_ROW_TIMEOUT_IMAGE_VO,
     # image_resize reuses the image_vo timeout — one image gen call.
     _TAB_IMAGE_RESIZE: SETTING_ROW_TIMEOUT_IMAGE_VO,
+    # one-click-image-vid has its own key (image_vo-shaped, single video).
+    _TAB_ONE_CLICK_IMAGE_VID: SETTING_ROW_TIMEOUT_ONE_CLICK_IMAGE_VID,
 }
 
 # Stuck-row detection: anything in flight longer than this is flagged in
@@ -345,6 +357,8 @@ def _tab_for_row(row: object) -> str:
         return _TAB_HOOK_CARD
     if isinstance(row, ImageResizeRow):
         return _TAB_IMAGE_RESIZE
+    if isinstance(row, OneClickImageVidRow):
+        return _TAB_ONE_CLICK_IMAGE_VID
     if isinstance(row, ImageVORow):
         return _TAB_IMAGE_VO
     if isinstance(row, FourImagesVO2Row):
@@ -462,6 +476,8 @@ async def _dispatch_to_processor(
         return await process_hook_card_row(row, clients, job_id=job_id)
     if isinstance(row, ImageResizeRow):
         return await process_image_resize_row(row, clients, job_id=job_id)
+    if isinstance(row, OneClickImageVidRow):
+        return await process_one_click_image_vid_row(row, clients, job_id=job_id)
     if isinstance(row, ImageVORow):
         return await process_image_vo_row(row, clients, job_id=job_id)
     if isinstance(row, FourImagesVO2Row):

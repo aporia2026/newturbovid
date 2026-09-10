@@ -25,6 +25,7 @@ const TAB_AVATAR = 'avatar';
 const TAB_MOTION_ADS = 'motion_ads';
 const TAB_HOOK_CARD = 'hook_card';
 const TAB_IMAGE_RESIZE = 'image_resize';
+const TAB_ONE_CLICK_IMAGE_VID = 'one_click_image_vid';
 
 // Card-template preview asset URLs. The PNGs live in the HF Space repo
 // (LFS-tracked) and are served directly by HuggingFace's resolver, which
@@ -137,6 +138,20 @@ const CARTOON_COLS = {
   ctaEnabled: 9, ctaText: 10,
   openComments: 11,
   readyVideo1: 12, readyVideo2: 13,
+  lastInputCol: 11,
+};
+
+// 1-click-image-vid tab (2026-09-10): one source image → a 4-panel story collage
+// → one captioned still-image video. IDENTICAL layout to CARTOON_COLS (Image-VO
+// A-H, CTA at I, CTA Text at J, Open Comments at K) but ONE video per row →
+// Ready Video at L. Read by HEADER NAME first with these positional values as
+// the fallback. Plan _plans/2026-09-10-one-click-image-vid-tab.md.
+const ONE_CLICK_IMAGE_VID_COLS = {
+  country: 1, vertical: 2, article: 3, manualImage: 4,
+  voiceOver: 5, zapcap: 6, aspectRatio: 7, scriptPattern: 8,
+  ctaEnabled: 9, ctaText: 10,
+  openComments: 11,
+  readyVideo1: 12,
   lastInputCol: 11,
 };
 
@@ -452,6 +467,17 @@ function _detectTabType(sheet) {
       || name.indexOf('image-resize') !== -1) {
     return TAB_IMAGE_RESIZE;
   }
+  // "1-click-image-vid" -> one source image → a 4-panel story collage → one
+  // captioned still-image video (2026-09-10). Detected by NAME before the generic
+  // "manual image" header fallback (which would otherwise misroute it to image_vo,
+  // since it shares the Manual Image header). The name contains no other tab's
+  // keyword, so order vs the other name checks is moot.
+  if (name.indexOf('1-click-image-vid') !== -1 || name.indexOf('1 click image') !== -1
+      || name.indexOf('1click') !== -1 || name.indexOf('one click image') !== -1
+      || name.indexOf('one-click-image') !== -1 || name.indexOf('image-vid') !== -1
+      || name.indexOf('image vid') !== -1) {
+    return TAB_ONE_CLICK_IMAGE_VID;
+  }
   // "simple x4" -> needs disambiguation: post-migration it has 2 header rows
   // and the new Template/CTA columns; pre-migration it's the legacy image_vo
   // shape. Must be checked BEFORE plain "simple" since the name contains it.
@@ -714,6 +740,46 @@ function _readSimpleMotionRow(sheet, rowNum) {
     article_url: _cell(values, cArticle),
     manual_image_1: _cell(values, cManualImage1),
     manual_image_2: _cell(values, cManualImage2),
+    voice_over: _yes(_cell(values, cVoiceOver), true),
+    zapcap: _yes(_cell(values, cZapcap), false),
+    aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
+    script_pattern: _cell(values, cScriptPat),
+    cta_enabled: _yes(_cell(values, cCtaEnabled), false),
+    cta_text: _cell(values, cCtaText).slice(0, 80),
+    open_comments: _cell(values, cOpenComments),
+  };
+}
+
+
+function _readOneClickImageVidRow(sheet, rowNum) {
+  // 1-click-image-vid: cartoon-style inputs with ONE Manual Image (the source
+  // seed). Every column is resolved by HEADER NAME first (mirrors
+  // _readSimpleMotionRow) so the operator can insert/move columns without
+  // breaking the read; the ONE_CLICK_IMAGE_VID_COLS positional index is the
+  // fallback. The source image is required (a blank cell fails the row cleanly).
+  const cols = ONE_CLICK_IMAGE_VID_COLS;
+  const headerMap = _buildHeaderColMap(sheet);
+  const lastCol = Math.max(cols.lastInputCol, sheet.getLastColumn());
+  const values = sheet.getRange(rowNum, 1, 1, lastCol).getValues()[0];
+
+  const cCountry      = _colForHeaders(headerMap, ['Country'], cols.country);
+  const cVertical     = _colForHeaders(headerMap, ['Vertical'], cols.vertical);
+  const cArticle      = _colForHeaders(headerMap, ['Article'], cols.article);
+  const cManualImage  = _colForHeaders(headerMap, ['Manual Image', 'Manual Image 1'], cols.manualImage);
+  const cVoiceOver    = _colForHeaders(headerMap, ['Voice Over', 'VoiceOver'], cols.voiceOver);
+  const cZapcap       = _colForHeaders(headerMap, ['ZapCap'], cols.zapcap);
+  const cAspectRatio  = _colForHeaders(headerMap, ['Change Size', 'Aspect Ratio'], cols.aspectRatio);
+  const cScriptPat    = _colForHeaders(headerMap, ['Script Pattern'], cols.scriptPattern);
+  const cCtaEnabled   = _colForHeaders(headerMap, ['CTA'], cols.ctaEnabled);
+  const cCtaText      = _colForHeaders(headerMap, ['CTA Text'], cols.ctaText);
+  const cOpenComments = _colForHeaders(headerMap, ['Open Comments', 'Open Comment'], cols.openComments);
+
+  return {
+    row_num: rowNum,
+    country: _cell(values, cCountry),
+    vertical: _cell(values, cVertical),
+    article_url: _cell(values, cArticle),
+    manual_image_url: _cell(values, cManualImage),
     voice_over: _yes(_cell(values, cVoiceOver), true),
     zapcap: _yes(_cell(values, cZapcap), false),
     aspect_ratio: _aspectCell(values, cAspectRatio) || '9:16',
@@ -1128,6 +1194,15 @@ function _validateSimpleMotion(r) {
 }
 
 
+function _validateOneClickImageVid(r) {
+  // Both the article (drives the voiceover) and the source image (the seed the
+  // story collage is generated FROM) are required — mirrors _validateImageVO.
+  if (!r.article_url) return 'article URL missing';
+  if (!r.manual_image_url) return 'manual image URL missing';
+  return null;
+}
+
+
 function _validateGoogleSimpleMotion(r) {
   // Only the article is required (it drives the subject + any generated scenes).
   // Manual images are optional (blank → generated). Number of Videos / Change
@@ -1323,6 +1398,7 @@ function generateAllUnprocessed() {
     : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
     : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
     : tabType === TAB_IMAGE_RESIZE ? IMAGE_RESIZE_COLS
+    : tabType === TAB_ONE_CLICK_IMAGE_VID ? ONE_CLICK_IMAGE_VID_COLS
     : IMAGE_VO_COLS
   );
   const rowNums = _unprocessedRowNumbers(sheet, cols.readyVideo1, tabType);
@@ -1356,6 +1432,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_MOTION_ADS ? _readMotionAdsRow
     : tabType === TAB_HOOK_CARD ? _readHookCardRow
     : tabType === TAB_IMAGE_RESIZE ? _readImageResizeRow
+    : tabType === TAB_ONE_CLICK_IMAGE_VID ? _readOneClickImageVidRow
     : _readImageVORow;
   const validate = tabType === TAB_FOUR_IMAGES ? _validateFourImages
     : tabType === TAB_CARTOON ? _validateCartoon
@@ -1369,6 +1446,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
     : tabType === TAB_MOTION_ADS ? _validateMotionAds
     : tabType === TAB_HOOK_CARD ? _validateHookCard
     : tabType === TAB_IMAGE_RESIZE ? _validateImageResize
+    : tabType === TAB_ONE_CLICK_IMAGE_VID ? _validateOneClickImageVid
     : _validateImageVO;
 
   let rows = [];
@@ -1405,6 +1483,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
       : tabType === TAB_MOTION_ADS ? MOTION_ADS_COLS
       : tabType === TAB_HOOK_CARD ? HOOK_CARD_COLS
       : tabType === TAB_IMAGE_RESIZE ? IMAGE_RESIZE_COLS
+      : tabType === TAB_ONE_CLICK_IMAGE_VID ? ONE_CLICK_IMAGE_VID_COLS
       : IMAGE_VO_COLS
     ).readyVideo1;
     const withVideo = rows.filter(function (r) {
@@ -1454,6 +1533,7 @@ function _submitJobForRowNums(sheet, tabType, rowNums, checkExisting) {
   else if (tabType === TAB_MOTION_ADS) payload.rows_motion_ads = rows;
   else if (tabType === TAB_HOOK_CARD) payload.rows_hook_card = rows;
   else if (tabType === TAB_IMAGE_RESIZE) payload.rows_image_resize = rows;
+  else if (tabType === TAB_ONE_CLICK_IMAGE_VID) payload.rows_one_click_image_vid = rows;
   else payload.rows_image_vo = rows;
 
   const body = _submitJobWithRetry_(payload);
@@ -2411,7 +2491,8 @@ function _rowCountForPayload_(payload) {
     || payload.rows_cartoon
     || payload.rows_yt_cartoon || payload.rows_simple_x4 || payload.rows_text_on_img
     || payload.rows_avatar || payload.rows_motion_ads
-    || payload.rows_hook_card || payload.rows_image_resize || []).length;
+    || payload.rows_hook_card || payload.rows_image_resize
+    || payload.rows_one_click_image_vid || []).length;
 }
 
 

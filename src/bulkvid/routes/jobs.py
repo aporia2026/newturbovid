@@ -37,6 +37,7 @@ from bulkvid.models.row import (
     ImageResizeRow,
     ImageVORow,
     MotionAdsRow,
+    OneClickImageVidRow,
     SimpleMotionRow,
     SimpleRow,
     SimpleX4Row,
@@ -64,6 +65,7 @@ from bulkvid.orchestrator.queue import (
     TAB_IMAGE_VO,
     TAB_GOOGLE_SIMPLE_MOTION,
     TAB_MOTION_ADS,
+    TAB_ONE_CLICK_IMAGE_VID,
     TAB_SIMPLE,
     TAB_SIMPLE_MOTION,
     TAB_SIMPLE_X4,
@@ -178,6 +180,26 @@ class SimpleMotionRowIn(BaseModel):
     article_url: str
     manual_image_1: str = ""     # col D — blank → generate; filled → as-is
     manual_image_2: str = ""     # col E — blank → generate; filled → as-is
+    voice_over: bool = True
+    zapcap: bool = False
+    aspect_ratio: str = "9:16"
+    script_pattern: str = ""
+    cta_enabled: bool = False
+    cta_text: str = ""
+    open_comments: str = ""
+
+
+class OneClickImageVidRowIn(BaseModel):
+    """Wire shape for the ``1-click-image-vid`` tab — ImageVORowIn plus one CTA
+    pair (mirrors simple-motion). One source image, one captioned still-image
+    video out. ``cta_text`` is bounded server-side. Plan
+    ``_plans/2026-09-10-one-click-image-vid-tab.md``."""
+
+    row_num: int = Field(ge=1)
+    country: str = ""
+    vertical: str = ""
+    article_url: str
+    manual_image_url: str
     voice_over: bool = True
     zapcap: bool = False
     aspect_ratio: str = "9:16"
@@ -422,6 +444,8 @@ class SubmitJobIn(BaseModel):
     rows_text_on_img: list[TextOnImgRowIn] | None = None
     # video with avatar: 2-shot kie/Seedance + TikTok avatar overlay (plan 2026-06-09).
     rows_avatar: list[AvatarRowIn] | None = None
+    # 1-click-image-vid: one source image → 4-panel story → one captioned video (plan 2026-09-10).
+    rows_one_click_image_vid: list[OneClickImageVidRowIn] | None = None
     # Motion_Ads: silent motion-ad video + Headline/Description copy (plan 2026-07-08).
     rows_motion_ads: list[MotionAdsRowIn] | None = None
     # Hook_Card: 9:16 hook-box slideshow + background music (plan 2026-07-13).
@@ -610,6 +634,33 @@ def _build_simple_motion_row(r: SimpleMotionRowIn) -> SimpleMotionRow:
         cta_enabled=r.cta_enabled,
         cta_text=(r.cta_text or "")[:80],
         open_comments=r.open_comments,
+    )
+
+
+def _build_one_click_image_vid_row(
+    r: OneClickImageVidRowIn,
+) -> OneClickImageVidRow:
+    """Coerce a OneClickImageVidRowIn into a OneClickImageVidRow.
+
+    Server-side hardening mirrors simple-motion: the source image URL is trimmed
+    and passed through (downloaded + re-uploaded by the processor, same as the
+    image_vo / avatar tabs); ``cta_text`` bounded at 80 chars. A blank
+    ``manual_image_url`` flows through and fails the row cleanly at
+    IMAGE_DOWNLOAD_FAILED (this tab needs a seed image).
+    """
+    return OneClickImageVidRow(
+        row_num=r.row_num,
+        country=r.country,
+        vertical=r.vertical,
+        article_url=r.article_url,
+        manual_image_url=(r.manual_image_url or "").strip(),
+        voice_over=r.voice_over,
+        zapcap=r.zapcap,
+        aspect_ratio=r.aspect_ratio,
+        script_pattern=r.script_pattern,
+        open_comments=r.open_comments,
+        cta_enabled=r.cta_enabled,
+        cta_text=(r.cta_text or "")[:80],
     )
 
 
@@ -1112,6 +1163,17 @@ async def submit_job(
                 400, "rows_image_resize is required for tab_type=image_resize"
             )
         rows = [_build_image_resize_row(r) for r in payload.rows_image_resize]
+    elif payload.tab_type == TAB_ONE_CLICK_IMAGE_VID:
+        if not payload.rows_one_click_image_vid:
+            raise HTTPException(
+                400,
+                "rows_one_click_image_vid is required for "
+                "tab_type=one_click_image_vid",
+            )
+        rows = [
+            _build_one_click_image_vid_row(r)
+            for r in payload.rows_one_click_image_vid
+        ]
     else:
         raise HTTPException(400, f"unknown tab_type: {payload.tab_type}")
 

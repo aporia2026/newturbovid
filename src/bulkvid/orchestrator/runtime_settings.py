@@ -360,6 +360,9 @@ SETTING_ROW_TIMEOUT_GOOGLE_SIMPLE_MOTION = "row_timeout_google_simple_motion_sec
 # fast-and-furious renders up to 4 Gen-Z variations per row (same shape as
 # google-simple-motion), so it gets the same larger budget.
 SETTING_ROW_TIMEOUT_FAST_FURIOUS = "row_timeout_fast_furious_seconds"
+# one-click-image-vid is image_vo-shaped (one nano-banana collage + split + TTS +
+# a still-image stitch + optional ZapCap) so it gets its own image_vo-sized key.
+SETTING_ROW_TIMEOUT_ONE_CLICK_IMAGE_VID = "row_timeout_one_click_image_vid_seconds"
 SETTING_STUCK_ROW_THRESHOLD = "stuck_row_threshold_seconds"
 
 # Default script template library + master enable-switch.
@@ -565,6 +568,18 @@ SETTINGS_REGISTRY: tuple[SettingDef, ...] = (
             "variations, each 2 shots with image-gen + Seedance + ZapCap, sharing "
             "provider rate limits). Same headroom as google-simple-motion. Env "
             "BULKVID_ROW_TIMEOUT_SECONDS_FAST_FURIOUS overrides."
+        ),
+    ),
+    SettingDef(
+        key=SETTING_ROW_TIMEOUT_ONE_CLICK_IMAGE_VID,
+        label="Row timeout: 1-click-image-vid (seconds)",
+        default="900",
+        multiline=False,
+        description=(
+            "Hard wall-clock budget for a 1-click-image-vid-tab row (one "
+            "nano-banana story collage + split + TTS + still-image stitch + "
+            "optional ZapCap — a single video). Env "
+            "BULKVID_ROW_TIMEOUT_SECONDS_ONE_CLICK_IMAGE_VID overrides."
         ),
     ),
     SettingDef(
