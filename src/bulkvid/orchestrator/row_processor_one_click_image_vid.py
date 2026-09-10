@@ -69,7 +69,7 @@ from bulkvid.orchestrator.clients import PipelineClients
 from bulkvid.orchestrator.runtime_settings import SETTING_SIMPLE_X4_SCRIPT_PROMPT
 from bulkvid.pipeline.cartoon_cta import render_cartoon_cta_overlay_bytes
 from bulkvid.pipeline.cta_defaults import default_cta_for_language
-from bulkvid.pipeline.image_gen import edit_with_fallback
+from bulkvid.pipeline.image_gen import edit_with_fallback, generate_with_fallback
 from bulkvid.pipeline.image_prompt import build_collage_prompt, describe_source_image
 from bulkvid.pipeline.language import detect_language, reconcile_language
 from bulkvid.pipeline.open_comments import classify_open_comments
@@ -98,6 +98,21 @@ def _slug(row_num: int, job_id: str | None = None) -> str:
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+def _context_brief(country: str, vertical: str) -> str:
+    """The 'description' the story collage prompt expects when there is NO source
+    image — a short context brief from the row's market + topic. The article
+    excerpt (passed separately to ``build_collage_prompt``) supplies the concrete
+    subject; this line steers the market and framing so the invented scenes fit
+    the audience. Used for the from-scratch (text-to-image) path."""
+    market = (country or "").strip() or "an unspecified market"
+    topic = (vertical or "").strip() or "the article's topic"
+    return (
+        f"There is NO source photo. Invent a fitting, realistic photographic "
+        f"scene for the {topic} vertical, aimed at the {market} market, grounded "
+        f"in the article below. Use natural, believable people and settings."
+    )
 
 
 def _optimize_pil_bytes(quadrant_bytes: bytes) -> bytes:
@@ -223,8 +238,15 @@ async def process_one_click_image_vid_row(
             except Exception as e:
                 return e
 
-        async def _prep_source_image() -> tuple[str, str] | Exception:
-            """Download source image, upload to storage, return (url, b64)."""
+        async def _prep_source_image() -> tuple[str | None, str | None] | Exception:
+            """Download the source image (if any), upload it, return (url, b64).
+
+            Blank Manual Image → ``(None, None)``: the 4 story frames are then
+            generated from scratch (text-to-image) grounded in the article,
+            vertical, and country instead of derived from a seed photo.
+            """
+            if not (row.manual_image_url or "").strip():
+                return None, None
             try:
                 raw = await download_image(row.manual_image_url, timeout=60.0)
             except Exception as e:
@@ -254,6 +276,7 @@ async def process_one_click_image_vid_row(
                 row, STATUS_IMAGE_DOWNLOAD_FAILED, str(source_result), t0, costs, metadata
             )
         source_url, source_b64 = source_result
+        metadata["from_scratch"] = source_url is None
 
         # ─── Sensitive-apparel safeguard (per row) ───
 
@@ -267,8 +290,18 @@ async def process_one_click_image_vid_row(
 
         async def _image_side() -> list[bytes] | Exception:
             try:
-                description, c1 = await describe_source_image(clients.openai, source_b64)
-                costs.vision += c1
+                # With a seed image → describe it and generate FROM it (image-to-
+                # image). Blank Manual Image → build a context brief from the
+                # market + topic and generate the collage from scratch (text-to-
+                # image); the article excerpt grounds the concrete subject.
+                if source_url is not None and source_b64 is not None:
+                    description, c1 = await describe_source_image(
+                        clients.openai, source_b64
+                    )
+                    costs.vision += c1
+                else:
+                    description = _context_brief(row.country, row.vertical)
+
                 # STORY mode: 4 sequential narrative beats, one recurring subject,
                 # NO baked text (captions are added by ZapCap afterwards).
                 collage_prompt, c2 = await build_collage_prompt(
@@ -281,13 +314,21 @@ async def process_one_click_image_vid_row(
                 )
                 costs.collage_prompt += c2
 
-                collage_url, c3 = await edit_with_fallback(
-                    kie=clients.kie,
-                    atlas=clients.atlas,
-                    source_image_url=source_url,
-                    prompt=collage_prompt,
-                    aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
-                )
+                if source_url is not None:
+                    collage_url, c3 = await edit_with_fallback(
+                        kie=clients.kie,
+                        atlas=clients.atlas,
+                        source_image_url=source_url,
+                        prompt=collage_prompt,
+                        aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+                    )
+                else:
+                    collage_url, c3 = await generate_with_fallback(
+                        kie=clients.kie,
+                        atlas=clients.atlas,
+                        prompt=collage_prompt,
+                        aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
+                    )
                 costs.image_gen += c3
 
                 # Upscale is a quality boost, not a hard requirement — a transient

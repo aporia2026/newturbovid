@@ -1195,10 +1195,11 @@ function _validateSimpleMotion(r) {
 
 
 function _validateOneClickImageVid(r) {
-  // Both the article (drives the voiceover) and the source image (the seed the
-  // story collage is generated FROM) are required — mirrors _validateImageVO.
+  // Only the article is required — it drives the voiceover AND grounds the
+  // generated story frames. Manual Image is OPTIONAL: blank → the 4 story
+  // frames are generated from scratch (text-to-image) using the article,
+  // vertical, and country; filled → the frames are generated FROM that image.
   if (!r.article_url) return 'article URL missing';
-  if (!r.manual_image_url) return 'manual image URL missing';
   return null;
 }
 

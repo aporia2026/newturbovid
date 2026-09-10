@@ -25,6 +25,7 @@ import wave
 from types import SimpleNamespace
 
 import httpx
+import pytest
 import respx
 from PIL import Image
 
@@ -324,11 +325,12 @@ def _build_clients(
 
 
 def _row(*, zapcap: bool = False, vo: bool = True, cta: bool = False,
-         cta_text: str = "") -> OneClickImageVidRow:
+         cta_text: str = "",
+         manual_image_url: str = "https://example.com/seed.png") -> OneClickImageVidRow:
     return OneClickImageVidRow(
         row_num=2, country="MX", vertical="cars",
         article_url="https://example.com/article",
-        manual_image_url="https://example.com/seed.png",
+        manual_image_url=manual_image_url,
         voice_over=vo, zapcap=zapcap, aspect_ratio="9:16",
         script_pattern="How To", open_comments="",
         cta_enabled=cta, cta_text=cta_text,
@@ -355,6 +357,8 @@ async def test_happy_path_returns_one_video_url() -> None:
     assert result.cost_usd > 0
     # VO 12s → sized to the voice (floor is 8s), no dead-air tail.
     assert result.metadata["oci_total_seconds"] == 12.5
+    # Seed image present → image-to-image, not from-scratch.
+    assert result.metadata["from_scratch"] is False
 
 
 @respx.mock
@@ -378,6 +382,88 @@ async def test_collage_prompt_requested_in_story_mode(monkeypatch) -> None:
 
     assert result.status == STATUS_SUCCESS
     assert captured.get("story") is True
+
+
+# ── From-scratch: no manual image → text-to-image ────────────────────────────
+
+
+@respx.mock
+async def test_from_scratch_when_no_manual_image() -> None:
+    _register_default_openai_routes()
+    _register_default_kie_routes()
+    _register_default_rendi_routes()
+    _register_downloads(_make_collage_png(200))
+
+    clients = _build_clients()
+    result = await process_one_click_image_vid_row(
+        _row(manual_image_url=""), clients, job_id="j"
+    )
+
+    assert result.status == STATUS_SUCCESS
+    assert len(result.video_urls) == 1
+    assert result.metadata["from_scratch"] is True
+
+
+@respx.mock
+async def test_from_scratch_does_not_describe_a_source_image(monkeypatch) -> None:
+    # No seed → describe_source_image must NOT be called (nothing to describe);
+    # the collage is generated from the context brief + article instead.
+    _register_default_openai_routes()
+    _register_default_kie_routes()
+    _register_default_rendi_routes()
+    _register_downloads(_make_collage_png(200))
+
+    async def _boom(*a, **k):
+        raise AssertionError("describe_source_image called on the from-scratch path")
+
+    monkeypatch.setattr(mod, "describe_source_image", _boom)
+
+    clients = _build_clients()
+    result = await process_one_click_image_vid_row(
+        _row(manual_image_url=""), clients, job_id="j"
+    )
+    assert result.status == STATUS_SUCCESS
+    assert result.metadata["from_scratch"] is True
+
+
+def test_context_brief_mentions_market_and_topic() -> None:
+    brief = mod._context_brief("MX", "cars")
+    assert "MX" in brief and "cars" in brief
+    assert "no source photo" in brief.lower()
+
+
+async def test_generate_with_fallback_uses_atlas_when_kie_fails(monkeypatch) -> None:
+    from bulkvid.adapters.kie import KieError
+    from bulkvid.pipeline import image_gen
+
+    async def _fail_t2i(kie, prompt, aspect_ratio, resolution="2K", **_):
+        raise KieError("kie t2i down")
+
+    monkeypatch.setattr(image_gen, "nano_banana_2_text_to_image", _fail_t2i)
+
+    class _Atlas:
+        async def text_to_image(self, prompt, aspect_ratio, **_):
+            return "https://atlas.test/img.png", 0.05
+
+    url, cost = await image_gen.generate_with_fallback(
+        kie=SimpleNamespace(), atlas=_Atlas(), prompt="p", aspect_ratio="9:16"
+    )
+    assert url == "https://atlas.test/img.png"
+    assert cost == 0.05
+
+
+async def test_generate_with_fallback_raises_without_atlas(monkeypatch) -> None:
+    from bulkvid.adapters.kie import KieError
+    from bulkvid.pipeline import image_gen
+
+    async def _fail_t2i(kie, prompt, aspect_ratio, resolution="2K", **_):
+        raise KieError("kie t2i down")
+
+    monkeypatch.setattr(image_gen, "nano_banana_2_text_to_image", _fail_t2i)
+    with pytest.raises(KieError):
+        await image_gen.generate_with_fallback(
+            kie=SimpleNamespace(), atlas=None, prompt="p", aspect_ratio="9:16"
+        )
 
 
 # ── Assembly shape + VO sizing (fake Rendi) ──────────────────────────────────

@@ -23,6 +23,7 @@ from bulkvid.adapters.kie import (
     KieError,
     gpt_image_2,
     nano_banana_2,
+    nano_banana_2_text_to_image,
 )
 from bulkvid.logging import get_logger
 
@@ -83,4 +84,47 @@ async def edit_with_fallback(
                 f"All image backends failed. "
                 f"nano-banana-2 + gpt-image-2 (kie) and AtlasCloud. "
                 f"gpt-image-2={gpt_err!s} | atlas={atlas_err!s}"
+            ) from atlas_err
+
+
+async def generate_with_fallback(
+    *,
+    kie: KieClient,
+    atlas: AtlasCloudClient | None,
+    prompt: str,
+    aspect_ratio: str,
+    resolution: str = "2K",
+) -> tuple[str, float]:
+    """Generate the 2x2 story collage from TEXT ONLY (no seed image).
+
+    Primary: Nano Banana 2 (kie). Fallback: AtlasCloud text-to-image when
+    configured. The text-to-image sibling of :func:`edit_with_fallback`, used by
+    the 1-click-image-vid tab when the operator left Manual Image blank — the 4
+    story frames are invented from the article + vertical + country instead of
+    derived from a seed photo. Returns ``(url, cost_usd)``. Raises if every
+    backend fails.
+    """
+    try:
+        return await nano_banana_2_text_to_image(
+            kie,
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+    except KieError as nb2_err:
+        if atlas is None:
+            raise
+        _log.warning(
+            "nano_banana_2_t2i_failed_falling_back_to_atlas", error=str(nb2_err)[:200]
+        )
+        try:
+            url, cost = await atlas.text_to_image(
+                prompt=prompt, aspect_ratio=aspect_ratio
+            )
+            _log.info("atlas_t2i_fallback_used", source="nano_banana_2_t2i_failure")
+            return url, cost
+        except AtlasError as atlas_err:
+            raise KieError(
+                f"All text-to-image backends failed. nano-banana-2 (kie) and "
+                f"AtlasCloud. nano-banana-2={nb2_err!s} | atlas={atlas_err!s}"
             ) from atlas_err
