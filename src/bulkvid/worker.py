@@ -25,6 +25,7 @@ from bulkvid.adapters import article_fetch as article_mod
 from bulkvid.adapters import atlascloud as atlas_mod
 from bulkvid.adapters import gemini_tts as tts_mod
 from bulkvid.adapters import kie as kie_mod
+from bulkvid.adapters import muapi as muapi_mod
 from bulkvid.adapters import openai_client as openai_mod
 from bulkvid.adapters import rendi as rendi_mod
 from bulkvid.adapters import storage as storage_mod
@@ -96,6 +97,8 @@ def build_pipeline_clients(settings: Settings) -> PipelineClients:
     # AtlasCloud is an optional fallback for kie.ai. Returns None when no
     # key is configured.
     atlas = atlas_mod.build_client_from_settings(settings)
+    # MuAPI is an optional text-to-image fallback for the from-scratch path.
+    muapi = muapi_mod.build_client_from_settings(settings)
 
     return PipelineClients(
         openai=openai,
@@ -106,6 +109,7 @@ def build_pipeline_clients(settings: Settings) -> PipelineClients:
         article=article,
         zapcap=zapcap,
         atlas=atlas,
+        muapi=muapi,
         kie_router=kie_router,
     )
 

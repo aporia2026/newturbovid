@@ -82,7 +82,7 @@ def test_deep_health_admin_returns_full_status(client: TestClient) -> None:
     # Vendor block has expected keys.
     vendors = body["vendors"]
     for name in (
-        "openai", "kie_ai", "vertex_ai", "rendi", "zapcap",
+        "openai", "muapi", "kie_ai", "vertex_ai", "rendi", "zapcap",
         "scrapingbee", "aws_s3", "gcs", "sheets",
     ):
         assert name in vendors
