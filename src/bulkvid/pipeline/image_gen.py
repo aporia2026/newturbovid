@@ -1,10 +1,10 @@
-"""Image generation with kie.ai primary, AtlasCloud fallback.
+"""Image generation with kie.ai primary and configured fallbacks.
 
 Wraps the two image-gen adapters into one function that the row processor
 calls. If kie.ai fails for any reason (rate limit, task failure, timeout,
 auth, all keys cooled down), we transparently fall back to AtlasCloud
-when configured. The caller never sees the fallback — they get back
-``(url, cost)`` like before.
+when configured. Text-only generation can also use MuAPI as a final fallback;
+the caller always gets back ``(url, cost)`` like before.
 
 The fallback is opt-out via ``atlas`` being ``None``. When kie.ai succeeds,
 AtlasCloud is never invoked.
@@ -25,6 +25,7 @@ from bulkvid.adapters.kie import (
     nano_banana_2,
     nano_banana_2_text_to_image,
 )
+from bulkvid.adapters.muapi import MuAPIClient, MuAPIError
 from bulkvid.logging import get_logger
 
 _log = get_logger("imagegen")
@@ -91,18 +92,19 @@ async def generate_with_fallback(
     *,
     kie: KieClient,
     atlas: AtlasCloudClient | None,
+    muapi: MuAPIClient | None = None,
     prompt: str,
     aspect_ratio: str,
     resolution: str = "2K",
 ) -> tuple[str, float]:
     """Generate the 2x2 story collage from TEXT ONLY (no seed image).
 
-    Primary: Nano Banana 2 (kie). Fallback: AtlasCloud text-to-image when
-    configured. The text-to-image sibling of :func:`edit_with_fallback`, used by
-    the 1-click-image-vid tab when the operator left Manual Image blank — the 4
-    story frames are invented from the article + vertical + country instead of
-    derived from a seed photo. Returns ``(url, cost_usd)``. Raises if every
-    backend fails.
+    Primary: Nano Banana 2 (kie). Fallbacks: AtlasCloud, then MuAPI when
+    configured. MuAPI is intentionally used only here because its current
+    OpenAI-compatible surface supports generation without a source image. This
+    function is used by the 1-click-image-vid tab when Manual Image is blank —
+    the four story frames are invented from the article + vertical + country.
+    Returns ``(url, cost_usd)``. Raises if every configured backend fails.
     """
     try:
         return await nano_banana_2_text_to_image(
@@ -112,19 +114,36 @@ async def generate_with_fallback(
             resolution=resolution,
         )
     except KieError as nb2_err:
-        if atlas is None:
-            raise
-        _log.warning(
-            "nano_banana_2_t2i_failed_falling_back_to_atlas", error=str(nb2_err)[:200]
-        )
-        try:
-            url, cost = await atlas.text_to_image(
-                prompt=prompt, aspect_ratio=aspect_ratio
-            )
-            _log.info("atlas_t2i_fallback_used", source="nano_banana_2_t2i_failure")
-            return url, cost
-        except AtlasError as atlas_err:
+        _log.warning("nano_banana_2_t2i_failed_falling_back", error=str(nb2_err)[:200])
+
+        atlas_err: AtlasError | None = None
+        if atlas is not None:
+            try:
+                url, cost = await atlas.text_to_image(prompt=prompt, aspect_ratio=aspect_ratio)
+                _log.info("atlas_t2i_fallback_used", source="nano_banana_2_t2i_failure")
+                return url, cost
+            except AtlasError as exc:
+                atlas_err = exc
+                _log.warning("atlas_t2i_failed_falling_back_to_muapi", error=str(exc)[:200])
+
+        if muapi is None:
+            if atlas_err is None:
+                raise
             raise KieError(
                 f"All text-to-image backends failed. nano-banana-2 (kie) and "
                 f"AtlasCloud. nano-banana-2={nb2_err!s} | atlas={atlas_err!s}"
             ) from atlas_err
+
+        try:
+            url, cost = await muapi.text_to_image(prompt=prompt, aspect_ratio=aspect_ratio)
+            _log.info(
+                "muapi_t2i_fallback_used",
+                source=("atlas_t2i_failure" if atlas_err is not None else "kie_t2i_failure"),
+            )
+            return url, cost
+        except MuAPIError as muapi_err:
+            raise KieError(
+                f"All text-to-image backends failed. nano-banana-2 (kie), "
+                f"AtlasCloud, and MuAPI. nano-banana-2={nb2_err!s} | "
+                f"atlas={atlas_err!s} | muapi={muapi_err!s}"
+            ) from muapi_err

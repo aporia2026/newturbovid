@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     ATLAS_DEFAULT_QUALITY: str = "low"          # low | medium | high
     ATLAS_DEFAULT_OUTPUT_FORMAT: str = "jpeg"   # jpeg | png
 
+    # ── MuAPI (text-to-image fallback for from-scratch collages) ────────
+    MUAPI_API_KEY: str = ""
+    MUAPI_BASE_URL: str = "https://api.muapi.ai/v1"
+    MUAPI_DEFAULT_MODEL: str = "flux-schnell"
+    MUAPI_CONNECT_TIMEOUT_SECONDS: float = 10.0
+    MUAPI_TIMEOUT_SECONDS: float = 60.0
+    # Current public flux-schnell metadata; update when selecting another model.
+    MUAPI_COST_PER_IMAGE_USD: float = 0.003
+
     # ── Google Cloud ─────────────────────────────────────────────────────
     # Option A (file path): GOOGLE_APPLICATION_CREDENTIALS = /path/to/json
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
@@ -268,4 +277,4 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    return Settings()

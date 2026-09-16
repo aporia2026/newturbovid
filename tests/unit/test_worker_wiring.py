@@ -65,6 +65,12 @@ def test_build_pipeline_clients_full_config_succeeds() -> None:
     assert clients.storage is not None
     assert clients.article is not None
     assert clients.zapcap is not None
+    assert clients.muapi is None
+
+
+def test_build_pipeline_clients_wires_muapi_when_configured() -> None:
+    clients = build_pipeline_clients(_full_settings(MUAPI_API_KEY="muapi-test"))
+    assert clients.muapi is not None
 
 
 def test_build_pipeline_clients_attaches_kie_router() -> None:

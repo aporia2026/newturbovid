@@ -326,6 +326,7 @@ async def process_one_click_image_vid_row(
                     collage_url, c3 = await generate_with_fallback(
                         kie=clients.kie,
                         atlas=clients.atlas,
+                        muapi=clients.muapi,
                         prompt=collage_prompt,
                         aspect_ratio=normalize_aspect_ratio(row.aspect_ratio),
                     )

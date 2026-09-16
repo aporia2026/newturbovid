@@ -130,6 +130,7 @@ async def deep_health(
         "worker": worker_info,
         "vendors": {
             "openai": _present(settings.OPENAI_API_KEY),
+            "muapi": _present(settings.MUAPI_API_KEY),
             "kie_ai": {
                 "configured": len(settings.kie_key_list) > 0,
                 "key_count": len(settings.kie_key_list),

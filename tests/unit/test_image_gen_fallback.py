@@ -1,17 +1,17 @@
-"""Tests for the kie→atlas image-gen fallback wrapper."""
+"""Tests for the kie.ai, AtlasCloud, and MuAPI image-gen fallbacks."""
 
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import respx
 
 from bulkvid.adapters.atlascloud import AtlasCloudClient, AtlasTaskFailedError
-from bulkvid.adapters.kie import KieClient, KiePool, KieError
-from bulkvid.pipeline.image_gen import edit_with_fallback
+from bulkvid.adapters.kie import KieClient, KieError, KiePool
+from bulkvid.pipeline.image_gen import edit_with_fallback, generate_with_fallback
 
 KIE_BASE = "https://api.kie.ai"
 ATLAS_BASE = "https://api.atlascloud.ai"
@@ -167,3 +167,53 @@ async def test_both_fail_raises_with_combined_message() -> None:
     # Both errors mentioned so operator can debug.
     assert "kie" in str(exc.value).lower()
     assert "atlas" in str(exc.value).lower()
+
+
+async def test_text_generation_uses_muapi_after_kie_and_atlas_fail(monkeypatch) -> None:
+    from bulkvid.pipeline import image_gen
+
+    async def _fail_t2i(kie, prompt, aspect_ratio, resolution="2K", **_):
+        raise KieError("kie t2i down")
+
+    monkeypatch.setattr(image_gen, "nano_banana_2_text_to_image", _fail_t2i)
+
+    class _Atlas:
+        async def text_to_image(self, prompt, aspect_ratio, **_):
+            raise AtlasTaskFailedError("atlas t2i down")
+
+    class _MuAPI:
+        async def text_to_image(self, prompt, aspect_ratio, **_):
+            return "https://cdn.muapi.test/image.png", 0.003
+
+    url, cost = await generate_with_fallback(
+        kie=SimpleNamespace(),
+        atlas=_Atlas(),
+        muapi=_MuAPI(),
+        prompt="A valid prompt",
+        aspect_ratio="9:16",
+    )
+    assert url == "https://cdn.muapi.test/image.png"
+    assert cost == 0.003
+
+
+async def test_text_generation_uses_muapi_without_atlas(monkeypatch) -> None:
+    from bulkvid.pipeline import image_gen
+
+    async def _fail_t2i(kie, prompt, aspect_ratio, resolution="2K", **_):
+        raise KieError("kie t2i down")
+
+    monkeypatch.setattr(image_gen, "nano_banana_2_text_to_image", _fail_t2i)
+
+    class _MuAPI:
+        async def text_to_image(self, prompt, aspect_ratio, **_):
+            return "https://cdn.muapi.test/no-atlas.png", 0.003
+
+    url, cost = await generate_with_fallback(
+        kie=SimpleNamespace(),
+        atlas=None,
+        muapi=_MuAPI(),
+        prompt="A valid prompt",
+        aspect_ratio="9:16",
+    )
+    assert url == "https://cdn.muapi.test/no-atlas.png"
+    assert cost == 0.003

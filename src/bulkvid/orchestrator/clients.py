@@ -13,6 +13,7 @@ from bulkvid.adapters.article_fetch import ArticleFetcher
 from bulkvid.adapters.atlascloud import AtlasCloudClient
 from bulkvid.adapters.gemini_tts import GeminiTTSClient
 from bulkvid.adapters.kie import KieClient, KieClientRouter
+from bulkvid.adapters.muapi import MuAPIClient
 from bulkvid.adapters.openai_client import OpenAIClient
 from bulkvid.adapters.rendi import RendiClient
 from bulkvid.adapters.storage import StorageClient
@@ -30,6 +31,7 @@ class PipelineClients:
     article: ArticleFetcher
     zapcap: ZapCapClient | None = None       # may be unconfigured if no rows ever use it
     atlas: AtlasCloudClient | None = None    # fallback for kie.ai image generation
+    muapi: MuAPIClient | None = None          # text-to-image fallback for from-scratch rows
     settings_store: SettingsStore | None = None    # admin-editable runtime settings
     # Per-spreadsheet kie key routing. When set, the runner swaps ``kie`` for
     # ``kie_router.for_sheet(sheet_id)`` per row so a mapped sheet bills its own
