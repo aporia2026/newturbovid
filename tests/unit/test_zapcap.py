@@ -196,6 +196,71 @@ async def test_create_task_sends_expected_body() -> None:
 
 
 @respx.mock
+async def test_create_task_disables_broll_by_default() -> None:
+    # Regression: ZapCap's Auto B-Roll defaults to 50 and fires on videos
+    # >~8-10s, splicing stock footage in as a "double image". The adapter must
+    # send transcribeSettings.broll.brollPercent = 0 to switch it off. (Fails on
+    # the pre-fix adapter, which sent no transcribeSettings key at all.)
+    captured_body: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured_body.append(json.loads(request.content))
+        return httpx.Response(200, json={"taskId": "t1"})
+
+    respx.post(f"{BASE}/videos/v1/task").mock(side_effect=_handler)
+    async with ZapCapClient(api_key=API_KEY, template_id=TEMPLATE_ID, base_url=BASE) as c:
+        await c.create_task("v1", language="en")
+    assert captured_body[0]["transcribeSettings"]["broll"]["brollPercent"] == 0
+
+
+@respx.mock
+async def test_create_task_broll_percent_override_and_clamp() -> None:
+    # An explicit value is honoured, and out-of-range input is clamped to 0-100.
+    captured_body: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured_body.append(json.loads(request.content))
+        return httpx.Response(200, json={"taskId": "t1"})
+
+    respx.post(f"{BASE}/videos/v1/task").mock(side_effect=_handler)
+    async with ZapCapClient(api_key=API_KEY, template_id=TEMPLATE_ID, base_url=BASE) as c:
+        await c.create_task("v1", broll_percent=40)
+        await c.create_task("v1", broll_percent=250)   # over max → 100
+        await c.create_task("v1", broll_percent=-5)    # under min → 0
+    assert captured_body[0]["transcribeSettings"]["broll"]["brollPercent"] == 40
+    assert captured_body[1]["transcribeSettings"]["broll"]["brollPercent"] == 100
+    assert captured_body[2]["transcribeSettings"]["broll"]["brollPercent"] == 0
+
+
+@respx.mock
+async def test_caption_video_disables_broll_by_default() -> None:
+    # End-to-end: the caption_video convenience wrapper must also default the
+    # task it creates to b-roll off (this is the path every row processor uses).
+    captured_body: list[dict] = []
+
+    respx.post(f"{BASE}/videos").mock(
+        return_value=httpx.Response(201, json={"id": "v-b"})
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        captured_body.append(json.loads(request.content))
+        return httpx.Response(200, json={"taskId": "t-b"})
+
+    respx.post(f"{BASE}/videos/v-b/task").mock(side_effect=_handler)
+    respx.get(f"{BASE}/videos/v-b/task/t-b").mock(
+        return_value=httpx.Response(
+            200, json={"status": "completed", "downloadUrl": "https://zc/o.mp4"}
+        )
+    )
+    async with ZapCapClient(api_key=API_KEY, template_id=TEMPLATE_ID, base_url=BASE) as c:
+        await c.caption_video(
+            video_bytes=b"x", language="en",
+            video_duration_seconds=13.0, max_attempts=2, delay_seconds=0.0,
+        )
+    assert captured_body[0]["transcribeSettings"]["broll"]["brollPercent"] == 0
+
+
+@respx.mock
 async def test_create_task_missing_id_raises() -> None:
     respx.post(f"{BASE}/videos/v1/task").mock(
         return_value=httpx.Response(200, json={"foo": "bar"})
