@@ -43,6 +43,19 @@ _log = get_logger("zapcap")
 ZAPCAP_USD_PER_SECOND = 0.10 / 60.0
 
 
+# ZapCap's Auto B-Roll feature (transcribeSettings.broll.brollPercent) defaults
+# to 50 and fires on any video longer than ~8-10s, splicing unrelated stock
+# footage into the frame — which reads as a "double image" (inserted b-roll over
+# our own scene). We NEVER want ZapCap injecting third-party footage into brand,
+# finance, or health videos, so the adapter disables it by default (0 = none).
+# Longer flows (e.g. one_click_image_vid, whose VO-sized videos routinely exceed
+# the 8-10s trigger) were the first to surface it; shorter/motion tabs stayed
+# under the threshold and never tripped it. Field shape verified against
+# https://platform.zapcap.ai/docs/configuration/ (2026-09-16).
+ZAPCAP_DEFAULT_BROLL_PERCENT = 0
+
+
+
 # ── Errors ───────────────────────────────────────────────────────────────────
 
 
@@ -184,13 +197,21 @@ class ZapCapClient:
         language: str = "en",
         render_options: ZapCapRenderOptions | None = None,
         auto_approve: bool = True,
+        broll_percent: int = ZAPCAP_DEFAULT_BROLL_PERCENT,
     ) -> str:
-        """Create a captioning task. Returns the ZapCap ``task_id``."""
+        """Create a captioning task. Returns the ZapCap ``task_id``.
+
+        ``broll_percent`` (0-100) controls ZapCap's Auto B-Roll insertion; it
+        defaults to 0 (disabled) so ZapCap never splices unrelated stock footage
+        into our videos — see ``ZAPCAP_DEFAULT_BROLL_PERCENT``.
+        """
+        broll = max(0, min(100, int(broll_percent)))
         url = f"{self._base_url}/videos/{video_id}/task"
         body = {
             "templateId": self._template_id,
             "language": (language or "en").lower(),
             "autoApprove": auto_approve,
+            "transcribeSettings": {"broll": {"brollPercent": broll}},
             "renderOptions": _render_options_to_api(
                 render_options or ZapCapRenderOptions()
             ),
@@ -201,6 +222,7 @@ class ZapCapClient:
             video_id=video_id,
             language=body["language"],
             template_id=self._template_id,
+            broll_percent=broll,
         )
         resp = await self._client.post(url, json=body, headers=headers)
         if resp.status_code == 401:
@@ -291,6 +313,7 @@ class ZapCapClient:
         filename: str = "video.mp4",
         *,
         video_duration_seconds: float,
+        broll_percent: int = ZAPCAP_DEFAULT_BROLL_PERCENT,
         max_attempts: int = 60,
         delay_seconds: float = 10.0,
     ) -> tuple[str, float]:
@@ -301,10 +324,16 @@ class ZapCapClient:
         caller must supply it for an honest per-row cost. Cartoon flows pass
         the flat ``TARGET_VIDEO_SECONDS`` (8.0s); VO-driven flows pass
         ``tts.duration_seconds`` (or ``NO_VO_VIDEO_SECONDS`` when VO=False).
+
+        ``broll_percent`` defaults to 0 (Auto B-Roll off) so ZapCap never
+        splices unrelated stock footage into our videos.
         """
         video_id = await self.upload_video(video_bytes, filename=filename)
         task_id = await self.create_task(
-            video_id, language=language, render_options=render_options
+            video_id,
+            language=language,
+            render_options=render_options,
+            broll_percent=broll_percent,
         )
         download_url = await self.poll_task(
             video_id, task_id, max_attempts=max_attempts, delay_seconds=delay_seconds
